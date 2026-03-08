@@ -481,6 +481,34 @@ async function cmdStart(port) {
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  async function verifyAnchorFromChain(chain, txHash, traceRoot) {
+    try {
+      if (!txHash || !traceRoot) return { checked: false, verified: false, reason: 'missing_anchor_or_root' };
+      const c = (chain || 'solana').toLowerCase();
+      if (c === 'solana') {
+        const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+        const provider = new SolanaAnchorProvider({ rpcUrl });
+        const r = await provider.verify(traceRoot, txHash);
+        return { checked: true, verified: !!r?.valid, chain: 'solana' };
+      }
+      if (c === 'base') {
+        const rpcUrl = process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org';
+        const provider = new BaseAnchorProvider({ rpcUrl });
+        const r = await provider.verify(traceRoot, txHash);
+        return { checked: true, verified: !!r?.valid, chain: 'base' };
+      }
+      if (c === 'bsc') {
+        const rpcUrl = process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
+        const provider = new BSCAnchorProvider({ rpcUrl });
+        const r = await provider.verify(traceRoot, txHash);
+        return { checked: true, verified: !!r?.valid, chain: 'bsc' };
+      }
+      return { checked: false, verified: false, reason: `unsupported_chain:${c}` };
+    } catch (e) {
+      return { checked: true, verified: false, reason: e.message };
+    }
+  }
+
   async function pushResultOnce(task, taskId, resultPayload) {
     // Determine connection type and target
     let targetUrl = task.senderEndpoint;
@@ -835,7 +863,9 @@ async function cmdStart(port) {
       pendingTasks[orderId] = {
         from: requesterDid,
         action: capabilityType,
-        chain: chain,  // 保存 chain
+        chain: chain,
+        priceAmount: Number(priceAmount || 0),
+        payload: { orderId, priceAmount: Number(priceAmount || 0), text: description || '' },
         acceptedAt: new Date().toISOString(),
         encrypted: false
       };
@@ -1103,14 +1133,49 @@ async function cmdStart(port) {
       })();
     }
 
-    log({ event: 'task_completed', taskId, from: task.from, action: task.action, success: success !== false, proof_id: proof.proof_id, trace_root: proof.trace_root, anchor_tx: anchor?.txHash || null, duration_ms: durationMs, timestamp: new Date().toISOString() });
+    // ── Automatic execution audit summary (always-on) ──
+    const traceAudit = trace.verify();
+    const orderPrice = Number(task?.priceAmount ?? task?.payload?.priceAmount ?? 0);
+    const isPaidOrder = taskId.startsWith('ord-') && orderPrice > 0;
+    const anchorTx = anchor?.txHash || null;
+    let anchorAudit = { checked: false, verified: false, chain: task?.chain || anchor?.chain || null, reason: null };
+    if (anchorTx) {
+      anchorAudit = await verifyAnchorFromChain(task?.chain || anchor?.chain || 'solana', anchorTx, proof.trace_root);
+    }
+
+    const auditReasons = [];
+    if (!traceAudit.valid) auditReasons.push('trace_hash_chain_invalid');
+    if (isPaidOrder && !anchorTx) auditReasons.push('paid_order_anchor_missing');
+    if (anchorTx && anchorAudit.checked && !anchorAudit.verified) auditReasons.push('anchor_verify_failed');
+
+    const auditPassed = auditReasons.length === 0;
+    const auditSummary = {
+      passed: auditPassed,
+      trace_hash_chain_valid: traceAudit.valid,
+      trace_errors: traceAudit.errors,
+      events_count: trace.events.length,
+      trace_root: proof.trace_root,
+      order_price: orderPrice,
+      anchor_required: isPaidOrder,
+      anchor_tx: anchorTx,
+      anchor_verify: anchorAudit,
+      reasons: auditReasons,
+    };
+
+    log({ event: 'task_audit_summary', taskId, from: task.from, action: task.action, audit: auditSummary, timestamp: new Date().toISOString() });
+    if (!auditPassed) {
+      log({ event: 'task_audit_failed', taskId, from: task.from, action: task.action, reasons: auditReasons, timestamp: new Date().toISOString() });
+    }
+
+    log({ event: 'task_completed', taskId, from: task.from, action: task.action, success: success !== false, audit_passed: auditPassed, proof_id: proof.proof_id, trace_root: proof.trace_root, anchor_tx: anchorTx, duration_ms: durationMs, timestamp: new Date().toISOString() });
 
     // ── Notify owner (optional) ──
     if (ATEL_NOTIFY_GATEWAY && ATEL_NOTIFY_TARGET) {
       try {
         const resultText = typeof result === 'object' ? (result.response || JSON.stringify(result)).toString().slice(0, 300) : String(result).slice(0, 300);
-        const status = success !== false ? '✅' : '❌';
-        const msg = `${status} ATEL Task ${taskId}\nFrom: ${task.from.slice(-12)}\nAction: ${task.action}\nDuration: ${(durationMs/1000).toFixed(1)}s\nResult: ${resultText}`;
+        const status = (success !== false && auditPassed) ? '✅' : '❌';
+        const auditLine = auditPassed ? 'Audit: PASS' : `Audit: FAIL (${auditReasons.join(',')})`;
+        const msg = `${status} ATEL Task ${taskId}\nFrom: ${task.from.slice(-12)}\nAction: ${task.action}\nDuration: ${(durationMs/1000).toFixed(1)}s\n${auditLine}\nResult: ${resultText}`;
         const token = (() => { try { return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch { return ''; } })();
         if (token) {
           fetch(`${ATEL_NOTIFY_GATEWAY}/tools/invoke`, {
@@ -1143,11 +1208,12 @@ async function cmdStart(port) {
     if (task.senderCandidates || task.senderEndpoint) {
       const resultPayload = {
         taskId,
-        status: success !== false ? 'completed' : 'failed',
+        status: (success !== false && auditPassed) ? 'completed' : 'failed',
         result,
         proof: { proof_id: proof.proof_id, trace_root: proof.trace_root, events_count: trace.events.length },
         anchor: anchor ? { chain: 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
         execution: { duration_ms: durationMs, encrypted: task.encrypted },
+        audit: auditSummary,
         rollback: rollbackReport ? { total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed } : null,
       };
       try {
