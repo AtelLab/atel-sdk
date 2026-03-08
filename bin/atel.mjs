@@ -1608,11 +1608,37 @@ async function cmdRegister(name, capabilities, endpointUrl) {
   const caps = (capabilities || 'general').split(',').map(c => ({ type: c.trim(), description: c.trim() }));
   saveCapabilities(caps);
   let ep = endpointUrl;
-  if (!ep) { const net = loadNetwork(); ep = net?.endpoint || 'http://localhost:3100'; }
+  const net = loadNetwork();
+  if (!ep) { ep = net?.endpoint || 'http://localhost:3100'; }
   const discoverable = policy.discoverable !== false;
   const client = new RegistryClient({ registryUrl: REGISTRY_URL });
-  const entry = await client.register({ name: name || id.agent_id, capabilities: caps, endpoint: ep, discoverable }, id);
-  console.log(JSON.stringify({ status: 'registered', did: entry.did, name: entry.name, capabilities: caps.map(c => c.type), endpoint: ep, discoverable, registry: REGISTRY_URL }, null, 2));
+  const wallets = await getWalletAddresses();
+  const preferredChain = detectPreferredChain();
+  const registerPayload = {
+    name: name || id.agent_id,
+    capabilities: caps,
+    endpoint: ep,
+    discoverable,
+  };
+  if (net?.candidates?.length) registerPayload.candidates = net.candidates;
+  if (wallets) registerPayload.wallets = wallets;
+  if (preferredChain) registerPayload.metadata = { preferredChain };
+
+  const entry = await client.register(registerPayload, id);
+  if (!wallets || !preferredChain) {
+    console.error('[register] INFO: registered without published chain readiness. Yellow page registration still works. Free tasks can run normally. Paid orders require an anchoring key at execution time; re-register or restart later if you want wallets/preferredChain shown in the registry.');
+  }
+  console.log(JSON.stringify({
+    status: 'registered',
+    did: entry.did,
+    name: entry.name,
+    capabilities: caps.map(c => c.type),
+    endpoint: ep,
+    discoverable,
+    wallets: wallets || null,
+    preferredChain: preferredChain || null,
+    registry: REGISTRY_URL,
+  }, null, 2));
 }
 
 async function cmdSearch(capability) {
