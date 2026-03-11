@@ -61,6 +61,7 @@ const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
 const REGISTRY_URL = process.env.ATEL_REGISTRY || 'https://api.atelai.org';
 const ATEL_PLATFORM = process.env.ATEL_PLATFORM || 'https://api.atelai.org';
+const ATEL_RELAY = process.env.ATEL_RELAY || 'https://api.atelai.org';
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
 let EXECUTOR_URL = process.env.ATEL_EXECUTOR_URL || '';
