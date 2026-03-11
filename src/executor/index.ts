@@ -267,6 +267,32 @@ export class BuiltinExecutor {
 
       this.log({ event: 'task_completed', taskId });
 
+      // ── Extract thinking chain from result ──
+      const thinkingChain = this.extractThinkingChain(result);
+      if (thinkingChain) {
+        this.log({ event: 'thinking_chain_extracted', taskId, steps: thinkingChain.steps.length });
+        // Append thinking chain to trace via toolProxy
+        if (toolProxy) {
+          try {
+            await fetch(`${toolProxy}/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                taskId,
+                tool: 'thinking_chain',
+                endpoint: `http://127.0.0.1:${this.config.port}/internal/openclaw_agent`,
+              }),
+            });
+          } catch { /* best effort */ }
+        }
+        // Attach thinking to result
+        if (typeof result === 'object' && result !== null) {
+          (result as Record<string, unknown>).thinking = thinkingChain;
+        }
+      } else {
+        this.log({ event: 'thinking_chain_missing', taskId, warning: 'Model did not produce thinking chain' });
+      }
+
       // ── Save task history ──
       this.saveTaskHistory(taskId, from, action, payload, result, true);
 
@@ -312,6 +338,51 @@ export class BuiltinExecutor {
     return `Latest memory entry: ${key} = ${value} (at ${ts})`;
   }
 
+  private extractThinkingChain(result: unknown): { steps: string[]; reasoning: string; conclusion: string } | null {
+    if (!result || typeof result !== 'object') return null;
+    
+    const response = (result as Record<string, unknown>).response;
+    if (!response || typeof response !== 'string') return null;
+
+    // Method 1: Extract content between <thinking> tags
+    const match = response.match(/<thinking>([\s\S]*?)<\/thinking>/i);
+    let thinkingText = match ? match[1].trim() : '';
+
+    // Method 2: If no tags, look for Step patterns in the full response
+    if (!thinkingText) {
+      const hasSteps = response.match(/step\s*\d+|第\s*\d+\s*步|\d+[\.\)]\s*\S/gi);
+      if (hasSteps && hasSteps.length >= 2) {
+        thinkingText = response;
+      }
+    }
+
+    if (!thinkingText) return null;
+
+    // Parse steps
+    const lines = thinkingText.split('\n').map(l => l.trim()).filter(Boolean);
+    const steps: string[] = [];
+    let conclusion = '';
+
+    for (const line of lines) {
+      if (line.toLowerCase().startsWith('conclusion:') || line.startsWith('结论')) {
+        conclusion = line.replace(/^(conclusion:|结论[:：])\s*/i, '');
+      } else if (line.match(/^(step\s*\d+|第\s*\d+\s*步|\d+[\.\)、])/i)) {
+        steps.push(line.replace(/^(step\s*\d+[:：]\s*|第\s*\d+\s*步[:：]\s*|\d+[\.\)、]\s*)/i, ''));
+      } else if (steps.length > 0) {
+        // Continuation of previous step
+        steps[steps.length - 1] += ' ' + line;
+      }
+    }
+
+    if (steps.length < 2) return null;
+
+    return {
+      steps,
+      reasoning: thinkingText,
+      conclusion: conclusion || steps[steps.length - 1] || ''
+    };
+  }
+
   private buildPrompt(from: string, action: string, payload: Record<string, unknown>): string {
     const text = (payload.text || payload.message || payload.task || payload.query || JSON.stringify(payload)) as string;
 
@@ -340,12 +411,69 @@ export class BuiltinExecutor {
     }
 
     prompt += `## Task\n${guide}\n\n${text}\n\n`;
+    prompt += `## Thinking Chain (REQUIRED)\nBefore giving your final answer, you MUST show your thinking process inside <thinking> tags.\nFormat:\n<thinking>\nStep 1: [your first reasoning step]\nStep 2: [your second reasoning step]\n...\nConclusion: [your conclusion]\n</thinking>\nThen provide your final answer after the closing tag.\n\n`;
     prompt += `## Recall Rule\nIf memory values conflict, ONLY use the latest MEMKEY entry. Never use older values when a newer MEMKEY exists.`;
 
     return prompt;
   }
 
+  private async executeViaOllama(prompt: string, taskId: string): Promise<unknown | null> {
+    // Check if Ollama is available and audit config exists
+    const auditConfigPath = join(process.cwd(), '.atel', 'audit-config.json');
+    if (!existsSync(auditConfigPath)) return null;
+
+    let auditConfig: Record<string, any>;
+    try {
+      auditConfig = JSON.parse(readFileSync(auditConfigPath, 'utf-8'));
+    } catch { return null; }
+
+    const model = auditConfig.model || 'qwen2.5:0.5b';
+    const endpoint = auditConfig.ollama?.endpoint || 'http://localhost:11434';
+
+    // Check Ollama is running
+    try {
+      const healthResp = await fetch(`${endpoint}/api/version`, { signal: AbortSignal.timeout(2000) });
+      if (!healthResp.ok) return null;
+    } catch { return null; }
+
+    this.log({ event: 'ollama_executing', taskId, model, endpoint });
+
+    // Call Ollama API
+    const resp = await fetch(`${endpoint}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        prompt,
+        stream: false,
+        options: { temperature: 0.7 }
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Ollama generate failed: ${resp.status}`);
+    }
+
+    const data = await resp.json() as Record<string, any>;
+    const response = data.response || '';
+
+    this.log({ event: 'ollama_completed', taskId, model, responseLength: response.length });
+
+    return { done: true, response };
+  }
+
   private async executeDirect(prompt: string, taskId: string): Promise<unknown> {
+    // Try local Ollama first (if available)
+    try {
+      const ollamaResult = await this.executeViaOllama(prompt, taskId);
+      if (ollamaResult) return ollamaResult;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log({ event: 'ollama_fallback', taskId, reason: msg });
+    }
+
+    // Fallback to OpenClaw Gateway
     const { gatewayUrl, gatewayToken } = this.config;
 
     // Result file: sub-session writes result here, we poll for it

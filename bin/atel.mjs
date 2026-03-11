@@ -61,7 +61,6 @@ const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
 const REGISTRY_URL = process.env.ATEL_REGISTRY || 'https://api.atelai.org';
 const ATEL_PLATFORM = process.env.ATEL_PLATFORM || 'https://api.atelai.org';
-const ATEL_RELAY = process.env.ATEL_RELAY || 'https://api.atelai.org';
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
 let EXECUTOR_URL = process.env.ATEL_EXECUTOR_URL || '';
@@ -1150,6 +1149,23 @@ async function cmdStart(port) {
     if (isPaidOrder && !anchorTx) auditReasons.push('paid_order_anchor_missing');
     if (anchorTx && anchorAudit.checked && !anchorAudit.verified) auditReasons.push('anchor_verify_failed');
 
+    // ── Layer 0: Thinking chain audit ──
+    let thinkingAudit = { found: false, passed: false, steps: 0, reasoning_length: 0 };
+    const taskResult = typeof result === 'object' && result !== null ? result : {};
+    const thinking = taskResult.thinking || null;
+    if (thinking && thinking.steps && thinking.steps.length >= 2 && thinking.reasoning && thinking.reasoning.length >= 10) {
+      thinkingAudit = { found: true, passed: true, steps: thinking.steps.length, reasoning_length: thinking.reasoning.length };
+      log({ event: 'thinking_chain_audit', taskId, status: 'passed', steps: thinking.steps.length });
+    } else if (thinking) {
+      thinkingAudit = { found: true, passed: false, steps: thinking.steps?.length || 0, reasoning_length: thinking.reasoning?.length || 0 };
+      auditReasons.push('thinking_chain_insufficient');
+      log({ event: 'thinking_chain_audit', taskId, status: 'insufficient', steps: thinking.steps?.length || 0 });
+    } else {
+      thinkingAudit = { found: false, passed: false, steps: 0, reasoning_length: 0 };
+      auditReasons.push('thinking_chain_missing');
+      log({ event: 'thinking_chain_audit', taskId, status: 'missing', warning: 'Model may not support thinking' });
+    }
+
     const auditPassed = auditReasons.length === 0;
     const auditSummary = {
       passed: auditPassed,
@@ -1161,6 +1177,7 @@ async function cmdStart(port) {
       anchor_required: isPaidOrder,
       anchor_tx: anchorTx,
       anchor_verify: anchorAudit,
+      thinking_audit: thinkingAudit,
       reasons: auditReasons,
     };
 
@@ -1629,6 +1646,63 @@ async function cmdRegister(name, capabilities, endpointUrl) {
   if (!wallets || !preferredChain) {
     console.error('[register] INFO: registered without published chain readiness. Yellow page registration still works. Free tasks can run normally. Paid orders require an anchoring key at execution time; re-register or restart later if you want wallets/preferredChain shown in the registry.');
   }
+
+  // ── Thinking Capability Audit ──
+  let thinkingVerified = false;
+  try {
+    console.error('[register] Starting thinking capability audit...');
+    
+    // Step 1: Get challenge from platform
+    const challenge = await signedFetch('POST', '/registry/v1/thinking/challenge', {});
+    
+    if (challenge.status === 'already_verified') {
+      thinkingVerified = true;
+      console.error('[register] Thinking capability already verified.');
+    } else if (challenge.status === 'challenge') {
+      console.error(`[register] Platform asks: ${challenge.prompt}`);
+      
+      // Step 2: Use own model to answer (via local Ollama or executor)
+      let modelResponse = '';
+      const auditConfigPath = resolve(ATEL_DIR, 'audit-config.json');
+      
+      if (existsSync(auditConfigPath)) {
+        const auditConfig = JSON.parse(readFileSync(auditConfigPath, 'utf-8'));
+        const model = auditConfig.model || 'qwen2.5:0.5b';
+        const ollamaEndpoint = auditConfig.ollama?.endpoint || 'http://localhost:11434';
+        
+        try {
+          const resp = await fetch(`${ollamaEndpoint}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, prompt: challenge.prompt, stream: false }),
+            signal: AbortSignal.timeout(60000),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            modelResponse = data.response || '';
+          }
+        } catch (e) {
+          console.error(`[register] Model call failed: ${e.message}`);
+        }
+      }
+      
+      if (!modelResponse) {
+        console.error('[register] No model available. Run: node scripts/audit-setup.mjs');
+      } else {
+        // Step 3: Submit answer to platform
+        const result = await signedFetch('POST', '/registry/v1/thinking/verify', {
+          challenge_id: challenge.challenge_id,
+          response: modelResponse,
+        });
+        
+        thinkingVerified = result.passed === true;
+        console.error(`[register] Thinking audit: ${thinkingVerified ? '✅ PASSED' : '❌ FAILED'} (score: ${result.score})`);
+      }
+    }
+  } catch (e) {
+    console.error(`[register] Thinking audit error: ${e.message}`);
+  }
+
   console.log(JSON.stringify({
     status: 'registered',
     did: entry.did,
@@ -1638,6 +1712,7 @@ async function cmdRegister(name, capabilities, endpointUrl) {
     discoverable,
     wallets: wallets || null,
     preferredChain: preferredChain || null,
+    thinkingVerified,
     registry: REGISTRY_URL,
   }, null, 2));
 }
