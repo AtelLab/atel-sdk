@@ -1149,6 +1149,23 @@ async function cmdStart(port) {
     if (isPaidOrder && !anchorTx) auditReasons.push('paid_order_anchor_missing');
     if (anchorTx && anchorAudit.checked && !anchorAudit.verified) auditReasons.push('anchor_verify_failed');
 
+    // ── Layer 0: Thinking chain audit ──
+    let thinkingAudit = { found: false, passed: false, steps: 0, reasoning_length: 0 };
+    const taskResult = typeof result === 'object' && result !== null ? result : {};
+    const thinking = taskResult.thinking || null;
+    if (thinking && thinking.steps && thinking.steps.length >= 2 && thinking.reasoning && thinking.reasoning.length >= 10) {
+      thinkingAudit = { found: true, passed: true, steps: thinking.steps.length, reasoning_length: thinking.reasoning.length };
+      log({ event: 'thinking_chain_audit', taskId, status: 'passed', steps: thinking.steps.length });
+    } else if (thinking) {
+      thinkingAudit = { found: true, passed: false, steps: thinking.steps?.length || 0, reasoning_length: thinking.reasoning?.length || 0 };
+      auditReasons.push('thinking_chain_insufficient');
+      log({ event: 'thinking_chain_audit', taskId, status: 'insufficient', steps: thinking.steps?.length || 0 });
+    } else {
+      thinkingAudit = { found: false, passed: false, steps: 0, reasoning_length: 0 };
+      auditReasons.push('thinking_chain_missing');
+      log({ event: 'thinking_chain_audit', taskId, status: 'missing', warning: 'Model may not support thinking' });
+    }
+
     const auditPassed = auditReasons.length === 0;
     const auditSummary = {
       passed: auditPassed,
@@ -1160,6 +1177,7 @@ async function cmdStart(port) {
       anchor_required: isPaidOrder,
       anchor_tx: anchorTx,
       anchor_verify: anchorAudit,
+      thinking_audit: thinkingAudit,
       reasons: auditReasons,
     };
 
@@ -1628,6 +1646,77 @@ async function cmdRegister(name, capabilities, endpointUrl) {
   if (!wallets || !preferredChain) {
     console.error('[register] INFO: registered without published chain readiness. Yellow page registration still works. Free tasks can run normally. Paid orders require an anchoring key at execution time; re-register or restart later if you want wallets/preferredChain shown in the registry.');
   }
+
+  // ── Thinking Capability Audit ──
+  let thinkingVerified = false;
+  try {
+    console.error('[register] Starting thinking capability audit...');
+    console.error('[register] Starting thinking capability audit...');
+    
+    const auditResp = await signedFetch('POST', '/registry/v1/thinking/audit', {});
+    
+    if (auditResp.status === 'already_verified') {
+      thinkingVerified = true;
+      console.error('[register] Thinking capability already verified.');
+    } else if (auditResp.status === 'challenge') {
+      console.error(`[register] Platform asks: ${auditResp.prompt}`);
+      
+      // Call executor to get answer with thinking chain
+      const executorUrl = process.env.ATEL_EXECUTOR_URL || 'http://127.0.0.1:14003';
+      try {
+        const execResp = await fetch(`${executorUrl}/internal/openclaw_agent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tool: 'openclaw_agent',
+            input: {
+              prompt: auditResp.prompt,
+              taskId: auditResp.challenge_id,
+            },
+          }),
+        });
+        
+        if (execResp.ok) {
+          const result = await execResp.json();
+          
+          // Extract thinking chain if not already present
+          let thinking = result.thinking;
+          if (!thinking && result.response) {
+            // Try to extract steps from response text
+            const steps = [];
+            const lines = result.response.split('\n');
+            for (const line of lines) {
+              if (/^\d+[\.\)、]/.test(line.trim()) || /^(step|第.*步)/i.test(line.trim())) {
+                steps.push(line.trim());
+              }
+            }
+            if (steps.length >= 2) {
+              thinking = { steps, reasoning: result.response, conclusion: '' };
+            }
+          }
+          
+          // Submit answer to platform
+          const submitResp = await signedFetch('POST', '/registry/v1/thinking/submit', {
+            challenge_id: auditResp.challenge_id,
+            response: result.response || '',
+            thinking: thinking || null,
+          });
+          
+          thinkingVerified = submitResp.passed === true;
+          console.error(`[register] Thinking audit: ${thinkingVerified ? '✅ PASSED' : '❌ FAILED'} (steps: ${submitResp.steps || 0})`);
+        } else {
+          console.error(`[register] Executor failed: ${execResp.status}`);
+        }
+      } catch (e) {
+        console.error(`[register] Failed to answer challenge: ${e.message}`);
+      }
+    } else {
+      console.error(`[register] Unexpected audit response: ${auditResp.status}`);
+    }
+  } catch (e) {
+    console.error(`[register] Thinking audit error: ${e.message}`);
+  }
+
   console.log(JSON.stringify({
     status: 'registered',
     did: entry.did,
@@ -1637,6 +1726,7 @@ async function cmdRegister(name, capabilities, endpointUrl) {
     discoverable,
     wallets: wallets || null,
     preferredChain: preferredChain || null,
+    thinkingVerified,
     registry: REGISTRY_URL,
   }, null, 2));
 }
@@ -2197,6 +2287,8 @@ async function signedFetch(method, path, payload = {}) {
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
+
+// ─── Model API Call ──────────────────────────────────────────────
 
 // ─── Account Commands ────────────────────────────────────────────
 

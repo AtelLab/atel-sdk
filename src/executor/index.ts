@@ -21,6 +21,9 @@ import express from 'express';
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Server } from 'node:http';
+import { TieredAuditVerifier } from '../audit/tiered-verifier.js';
+import { LLMThinkingVerifier } from '../audit/llm-verifier.js';
+import type { Task } from '../schema/index.js';
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -39,6 +42,14 @@ export interface BuiltinExecutorConfig {
   toolProxyUrl?: string;
   /** Logger function */
   log?: (obj: Record<string, unknown>) => void;
+  /** Enable tiered thinking audit */
+  enableThinkingAudit?: boolean;
+  /** Ollama endpoint for LLM audit (optional) */
+  ollamaEndpoint?: string;
+  /** Ollama model for LLM audit (optional) */
+  ollamaModel?: string;
+  /** Require thinking capability from agent model */
+  requireThinkingCapability?: boolean;
 }
 
 export interface ExecutorAuditResult {
@@ -64,6 +75,7 @@ export class BuiltinExecutor {
   private agentContext: string = '';
   private taskHistoryPath: string = '';
   private log: (obj: Record<string, unknown>) => void;
+  private auditVerifier: TieredAuditVerifier | null = null;
 
   constructor(config: BuiltinExecutorConfig) {
     this.config = {
@@ -90,6 +102,19 @@ export class BuiltinExecutor {
 
     // Task history path
     this.taskHistoryPath = join(process.cwd(), '.atel', 'task-history.md');
+
+    // Initialize tiered audit verifier (enabled by default)
+    const enableAudit = config.enableThinkingAudit ?? true; // Default: enabled
+    if (enableAudit) {
+      const llmVerifier = new LLMThinkingVerifier({
+        endpoint: config.ollamaEndpoint || 'http://localhost:11434',
+        modelName: config.ollamaModel || 'qwen2.5:0.5b',
+      });
+      this.auditVerifier = new TieredAuditVerifier(llmVerifier, {
+        requireThinkingCapability: config.requireThinkingCapability ?? false, // Don't reject non-thinking models
+      });
+      this.log({ event: 'audit_verifier_initialized', ollama: config.ollamaEndpoint, model: config.ollamaModel });
+    }
 
     // Setup express
     this.app = express();
@@ -198,6 +223,46 @@ export class BuiltinExecutor {
         const prompt = input?.prompt || input?.text || JSON.stringify(input);
         const taskId = input?.taskId || `internal-${Date.now()}`;
         const result = await this.executeDirect(prompt, taskId);
+        
+        // ── Extract thinking chain and trigger audit (same as main flow) ──
+        const thinkingChain = this.extractThinkingChain(result);
+        if (thinkingChain) {
+          this.log({ event: 'thinking_chain_extracted', taskId, steps: thinkingChain.steps.length });
+          
+          // Async audit (non-blocking)
+          if (this.auditVerifier) {
+            (async () => {
+              try {
+                const task: Task = {
+                  task_id: taskId,
+                  version: 'task.v0.1',
+                  issuer: 'internal',
+                  intent: {
+                    type: 'internal_test',
+                    goal: prompt.substring(0, 100),
+                  },
+                  risk: { level: 'low' },
+                  nonce: Date.now().toString(),
+                };
+                
+                const modelInfo = { name: 'unknown', provider: 'gateway' };
+                const auditResult = await this.auditVerifier!.verify(task, thinkingChain, modelInfo);
+                
+                this.log({ 
+                  event: auditResult.passed ? 'thinking_audit_passed' : 'thinking_audit_failed',
+                  taskId, 
+                  passed: auditResult.passed,
+                  violations: auditResult.violations,
+                  confidence: auditResult.confidence 
+                });
+              } catch (error: unknown) {
+                const msg = error instanceof Error ? error.message : String(error);
+                this.log({ event: 'thinking_audit_error', taskId, error: msg });
+              }
+            })();
+          }
+        }
+        
         res.json(result);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -267,6 +332,92 @@ export class BuiltinExecutor {
 
       this.log({ event: 'task_completed', taskId });
 
+      // ── Extract thinking chain from result ──
+      const thinkingChain = this.extractThinkingChain(result);
+      if (thinkingChain) {
+        this.log({ event: 'thinking_chain_extracted', taskId, steps: thinkingChain.steps.length });
+        
+        // ── Async tiered audit (non-blocking) ──
+        if (this.auditVerifier) {
+          // Fire and forget - audit in background, don't block task completion
+          (async () => {
+            try {
+              // Construct Task object from request
+              const task: Task = {
+                task_id: taskId,
+                version: 'task.v0.1',
+                issuer: from,
+                intent: {
+                  type: action,
+                  goal: typeof payload === 'object' && payload !== null && 'goal' in payload 
+                    ? String(payload.goal) 
+                    : action,
+                },
+                risk: {
+                  level: (typeof payload === 'object' && payload !== null && 'risk' in payload
+                    ? String((payload as any).risk)
+                    : 'medium') as 'low' | 'medium' | 'high' | 'critical',
+                },
+                nonce: Date.now().toString(),
+              };
+
+              // Extract model info from result or config
+              const modelInfo = {
+                name: typeof result === 'object' && result !== null && 'agent' in result
+                  ? String((result as any).agent)
+                  : 'unknown',
+                hasThinking: true, // We already extracted thinking chain
+              };
+
+              const auditResult = await this.auditVerifier!.verify(task, thinkingChain, modelInfo);
+              
+              this.log({ 
+                event: auditResult.passed ? 'thinking_audit_passed' : 'thinking_audit_failed',
+                taskId, 
+                passed: auditResult.passed,
+                violations: auditResult.violations,
+                confidence: auditResult.confidence 
+              });
+            } catch (auditError: unknown) {
+              const msg = auditError instanceof Error ? auditError.message : String(auditError);
+              this.log({ event: 'thinking_audit_error', taskId, error: msg });
+            }
+          })();
+        }
+        
+        // Append thinking chain to trace via toolProxy
+        if (toolProxy) {
+          try {
+            await fetch(`${toolProxy}/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                taskId,
+                tool: 'thinking_chain',
+                endpoint: `http://127.0.0.1:${this.config.port}/internal/openclaw_agent`,
+              }),
+            });
+          } catch { /* best effort */ }
+        }
+        // Attach thinking to result
+        if (typeof result === 'object' && result !== null) {
+          (result as Record<string, unknown>).thinking = thinkingChain;
+        }
+      } else {
+        this.log({ event: 'thinking_chain_missing', taskId, warning: 'Model did not produce thinking chain' });
+        
+        // If thinking audit is enabled and required, reject tasks without thinking
+        if (this.auditVerifier && this.config.requireThinkingCapability) {
+          const errorMsg = 'Task rejected: Model did not produce required thinking chain';
+          this.log({ event: 'task_rejected', taskId, reason: errorMsg });
+          if (toolProxy) {
+            await this.finalizeTool(toolProxy, taskId, false, { error: errorMsg });
+          }
+          await this.callback(taskId, { error: errorMsg }, false);
+          return;
+        }
+      }
+
       // ── Save task history ──
       this.saveTaskHistory(taskId, from, action, payload, result, true);
 
@@ -312,6 +463,51 @@ export class BuiltinExecutor {
     return `Latest memory entry: ${key} = ${value} (at ${ts})`;
   }
 
+  private extractThinkingChain(result: unknown): { steps: string[]; reasoning: string; conclusion: string } | null {
+    if (!result || typeof result !== 'object') return null;
+    
+    const response = (result as Record<string, unknown>).response;
+    if (!response || typeof response !== 'string') return null;
+
+    // Method 1: Extract content between <thinking> tags
+    const match = response.match(/<thinking>([\s\S]*?)<\/thinking>/i);
+    let thinkingText = match ? match[1].trim() : '';
+
+    // Method 2: If no tags, look for Step patterns in the full response
+    if (!thinkingText) {
+      const hasSteps = response.match(/step\s*\d+|第\s*\d+\s*步|\d+[\.\)]\s*\S/gi);
+      if (hasSteps && hasSteps.length >= 2) {
+        thinkingText = response;
+      }
+    }
+
+    if (!thinkingText) return null;
+
+    // Parse steps
+    const lines = thinkingText.split('\n').map(l => l.trim()).filter(Boolean);
+    const steps: string[] = [];
+    let conclusion = '';
+
+    for (const line of lines) {
+      if (line.toLowerCase().startsWith('conclusion:') || line.startsWith('结论')) {
+        conclusion = line.replace(/^(conclusion:|结论[:：])\s*/i, '');
+      } else if (line.match(/^(step\s*\d+|第\s*\d+\s*步|\d+[\.\)、])/i)) {
+        steps.push(line.replace(/^(step\s*\d+[:：]\s*|第\s*\d+\s*步[:：]\s*|\d+[\.\)、]\s*)/i, ''));
+      } else if (steps.length > 0) {
+        // Continuation of previous step
+        steps[steps.length - 1] += ' ' + line;
+      }
+    }
+
+    if (steps.length < 2) return null;
+
+    return {
+      steps,
+      reasoning: thinkingText,
+      conclusion: conclusion || steps[steps.length - 1] || ''
+    };
+  }
+
   private buildPrompt(from: string, action: string, payload: Record<string, unknown>): string {
     const text = (payload.text || payload.message || payload.task || payload.query || JSON.stringify(payload)) as string;
 
@@ -340,12 +536,81 @@ export class BuiltinExecutor {
     }
 
     prompt += `## Task\n${guide}\n\n${text}\n\n`;
+    prompt += `## Thinking Chain (REQUIRED)\nBefore giving your final answer, you MUST show your thinking process inside <thinking> tags.\nFormat:\n<thinking>\nStep 1: [your first reasoning step]\nStep 2: [your second reasoning step]\n...\nConclusion: [your conclusion]\n</thinking>\nThen provide your final answer after the closing tag.\n\n`;
     prompt += `## Recall Rule\nIf memory values conflict, ONLY use the latest MEMKEY entry. Never use older values when a newer MEMKEY exists.`;
 
     return prompt;
   }
 
+  private async executeViaOllama(prompt: string, taskId: string): Promise<unknown | null> {
+    // Check if Ollama is available and audit config exists
+    const auditConfigPath = join(process.cwd(), '.atel', 'audit-config.json');
+    if (!existsSync(auditConfigPath)) return null;
+
+    let auditConfig: Record<string, any>;
+    try {
+      auditConfig = JSON.parse(readFileSync(auditConfigPath, 'utf-8'));
+    } catch { return null; }
+
+    const model = auditConfig.model || 'qwen2.5:0.5b';
+    const endpoint = auditConfig.ollama?.endpoint || 'http://localhost:11434';
+
+    // Check Ollama is running
+    try {
+      const healthResp = await fetch(`${endpoint}/api/version`, { signal: AbortSignal.timeout(2000) });
+      if (!healthResp.ok) return null;
+    } catch { return null; }
+
+    this.log({ event: 'ollama_executing', taskId, model, endpoint });
+
+    // Call Ollama API
+    const resp = await fetch(`${endpoint}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        prompt,
+        stream: false,
+        options: { temperature: 0.7 }
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Ollama generate failed: ${resp.status}`);
+    }
+
+    const data = await resp.json() as Record<string, any>;
+    const response = data.response || '';
+
+    this.log({ event: 'ollama_completed', taskId, model, responseLength: response.length });
+
+    return { done: true, response };
+  }
+
   private async executeDirect(prompt: string, taskId: string): Promise<unknown> {
+    // Prefer OpenClaw Gateway for better thinking chain extraction
+    // Try Gateway first
+    try {
+      return await this.executeViaGateway(prompt, taskId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log({ event: 'gateway_fallback', taskId, reason: msg });
+    }
+
+    // Fallback to local Ollama
+    try {
+      const ollamaResult = await this.executeViaOllama(prompt, taskId);
+      if (ollamaResult) return ollamaResult;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`Both Gateway and Ollama failed: ${msg}`);
+    }
+
+    throw new Error('No execution method available');
+  }
+
+  private async executeViaGateway(prompt: string, taskId: string): Promise<unknown> {
     const { gatewayUrl, gatewayToken } = this.config;
 
     // Result file: sub-session writes result here, we poll for it
@@ -407,7 +672,8 @@ Do not include any other text in the file. This is required for the result to be
               this.log({ event: 'result_received', taskId, method: 'file' });
               // Cleanup
               try { require('node:fs').unlinkSync(resultFile); } catch { /* ignore */ }
-              return { response: parsed.response, agent: 'builtin-executor', action: taskId.split('-')[0] || 'general' };
+              // Return the full parsed object so thinking chain can be extracted
+              return parsed;
             }
           } catch {
             // File exists but not valid JSON yet, keep polling

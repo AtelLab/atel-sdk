@@ -12,3 +12,4 @@ coverage/
 .atel/task-history.md
 docs/whitepaper-technical.md
 docs/whitepaper-commercial.md
+.atel/model-config.json
