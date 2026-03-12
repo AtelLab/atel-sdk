@@ -1652,51 +1652,48 @@ async function cmdRegister(name, capabilities, endpointUrl) {
   try {
     console.error('[register] Starting thinking capability audit...');
     
-    // Step 1: Get challenge from platform
-    const challenge = await signedFetch('POST', '/registry/v1/thinking/challenge', {});
-    
-    if (challenge.status === 'already_verified') {
-      thinkingVerified = true;
-      console.error('[register] Thinking capability already verified.');
-    } else if (challenge.status === 'challenge') {
-      console.error(`[register] Platform asks: ${challenge.prompt}`);
+    // Step 1: Load agent's model config
+    const modelConfigPath = resolve(ATEL_DIR, 'model-config.json');
+    if (!existsSync(modelConfigPath)) {
+      console.error('[register] ⚠️  No model-config.json found. Skipping thinking audit.');
+      console.error('[register] Create .atel/model-config.json with your model API info:');
+      console.error('[register] { "provider": "openai", "model": "gpt-4", "api_endpoint": "https://api.openai.com/v1/chat/completions", "api_key": "sk-xxx" }');
+    } else {
+      const modelConfig = JSON.parse(readFileSync(modelConfigPath, 'utf-8'));
       
-      // Step 2: Use own model to answer (via local Ollama or executor)
-      let modelResponse = '';
-      const auditConfigPath = resolve(ATEL_DIR, 'audit-config.json');
+      // Step 2: Get challenge from platform
+      const challenge = await signedFetch('POST', '/registry/v1/thinking/challenge', {});
       
-      if (existsSync(auditConfigPath)) {
-        const auditConfig = JSON.parse(readFileSync(auditConfigPath, 'utf-8'));
-        const model = auditConfig.model || 'qwen2.5:0.5b';
-        const ollamaEndpoint = auditConfig.ollama?.endpoint || 'http://localhost:11434';
+      if (challenge.status === 'already_verified') {
+        thinkingVerified = true;
+        console.error('[register] Thinking capability already verified.');
+      } else if (challenge.status === 'challenge') {
+        console.error(`[register] Platform asks: ${challenge.prompt}`);
+        console.error(`[register] Using model: ${modelConfig.model} (${modelConfig.provider})`);
         
+        // Step 3: Call agent's own model API
+        let modelResponse = '';
         try {
-          const resp = await fetch(`${ollamaEndpoint}/api/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model, prompt: challenge.prompt, stream: false }),
-            signal: AbortSignal.timeout(60000),
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            modelResponse = data.response || '';
-          }
+          modelResponse = await callModelAPI(modelConfig, challenge.prompt);
         } catch (e) {
-          console.error(`[register] Model call failed: ${e.message}`);
+          console.error(`[register] Model API call failed: ${e.message}`);
         }
-      }
-      
-      if (!modelResponse) {
-        console.error('[register] No model available. Run: node scripts/audit-setup.mjs');
-      } else {
-        // Step 3: Submit answer to platform
-        const result = await signedFetch('POST', '/registry/v1/thinking/verify', {
-          challenge_id: challenge.challenge_id,
-          response: modelResponse,
-        });
         
-        thinkingVerified = result.passed === true;
-        console.error(`[register] Thinking audit: ${thinkingVerified ? '✅ PASSED' : '❌ FAILED'} (score: ${result.score})`);
+        if (!modelResponse) {
+          console.error('[register] No response from model. Thinking audit failed.');
+        } else {
+          // Step 4: Submit answer to platform
+          const result = await signedFetch('POST', '/registry/v1/thinking/verify', {
+            challenge_id: challenge.challenge_id,
+            response: modelResponse,
+          });
+          
+          thinkingVerified = result.passed === true;
+          console.error(`[register] Thinking audit: ${thinkingVerified ? '✅ PASSED' : '❌ FAILED'} (score: ${result.score})`);
+          if (result.details) {
+            console.error(`[register] Details: steps=${result.details.has_steps}, reasoning=${result.details.has_reasoning}, answer=${result.details.has_answer}`);
+          }
+        }
       }
     }
   } catch (e) {
@@ -2272,6 +2269,75 @@ async function signedFetch(method, path, payload = {}) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
+}
+
+// ─── Model API Call ──────────────────────────────────────────────
+
+async function callModelAPI(config, prompt) {
+  const { provider, model, api_endpoint, api_key } = config;
+  
+  let reqBody;
+  switch (provider) {
+    case 'openai':
+    case 'deepseek':
+    case 'custom':
+      reqBody = {
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+      };
+      break;
+    case 'anthropic':
+      reqBody = {
+        model,
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: prompt }],
+      };
+      break;
+    case 'ollama':
+      reqBody = {
+        model,
+        prompt,
+        stream: false,
+      };
+      break;
+    default:
+      throw new Error(`Unsupported provider: ${provider}`);
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (api_key) {
+    if (provider === 'anthropic') {
+      headers['x-api-key'] = api_key;
+      headers['anthropic-version'] = '2023-06-01';
+    } else {
+      headers['Authorization'] = `Bearer ${api_key}`;
+    }
+  }
+
+  const resp = await fetch(api_endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(reqBody),
+    signal: AbortSignal.timeout(120000),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`API returned ${resp.status}: ${text.substring(0, 200)}`);
+  }
+
+  const data = await resp.json();
+
+  // Extract response text based on provider
+  switch (provider) {
+    case 'ollama':
+      return data.response || '';
+    case 'anthropic':
+      return data.content?.[0]?.text || '';
+    default: // openai-compatible
+      return data.choices?.[0]?.message?.content || '';
+  }
 }
 
 // ─── Account Commands ────────────────────────────────────────────
