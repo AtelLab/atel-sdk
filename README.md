@@ -195,7 +195,52 @@ const report = ProofVerifier.verify(bundle, { trace });
 // report.valid, report.checks, report.summary
 ```
 
-### Module 7: Score
+### Module 7: On-Chain Anchoring
+
+```typescript
+import { SolanaAnchorProvider, BaseAnchorProvider, BSCAnchorProvider } from '@lawrenceliang-btc/atel-sdk';
+
+// Anchor proof to Solana
+const solana = new SolanaAnchorProvider({ 
+  rpcUrl: 'https://api.mainnet-beta.solana.com',
+  privateKey: process.env.ATEL_SOLANA_PRIVATE_KEY 
+});
+const result = await solana.anchor(traceRoot, {
+  executorDid: 'did:atel:ed25519:...',
+  requesterDid: 'did:atel:ed25519:...',
+  taskId: 'task-123'
+});
+// result.txHash, result.blockNumber
+
+// Verify on-chain anchor
+const verified = await solana.verify(traceRoot, txHash);
+// verified.valid, verified.detail
+```
+
+**Supported Chains:**
+- Solana (Memo Program)
+- Base (L2)
+- BSC (Binance Smart Chain)
+
+**On-Chain Format (v2):**
+```
+ATEL:1:executorDID:requesterDID:taskId:traceRoot
+```
+
+Example:
+```
+ATEL:1:did:atel:ed25519:ABC...:did:atel:ed25519:XYZ...:task-123:6776dd40b1aa3e1cc8d4f713c83d13ecb6b92aade817c9ef073a7607c6fe63d0
+```
+
+**Environment Variables:**
+- `ATEL_SOLANA_PRIVATE_KEY` - Solana wallet private key (base58)
+- `ATEL_SOLANA_RPC_URL` - Solana RPC endpoint (default: mainnet-beta)
+- `ATEL_BASE_PRIVATE_KEY` - Base chain private key (hex)
+- `ATEL_BASE_RPC_URL` - Base RPC endpoint (default: https://mainnet.base.org)
+- `ATEL_BSC_PRIVATE_KEY` - BSC private key (hex)
+- `ATEL_BSC_RPC_URL` - BSC RPC endpoint (default: https://bsc-dataseed.binance.org)
+
+### Module 8: Score
 
 ```typescript
 import { TrustScoreClient } from '@lawrenceliang-btc/atel-sdk';
