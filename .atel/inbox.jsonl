@@ -85,3 +85,14 @@
 {"event":"relay_registered","relay":"http://47.251.8.19:9000"}
 {"event":"session_spawned","taskId":"audit-success-test","childKey":"agent:main:subagent:0804280b-2ebd-43f4-91ed-b6bb5f8b9e7c","resultFile":"/root/repos/atel-sdk/.atel/results/audit-success-test.json"}
 {"event":"result_received","taskId":"audit-success-test","method":"file"}
+{"event":"stopped"}
+{"event":"network_loaded","candidates":3}
+{"event":"tool_gateway_started","port":14002}
+{"event":"context_loaded","path":"/root/repos/atel-sdk/.atel/agent-context.md","size":396}
+{"event":"audit_verifier_initialized"}
+{"event":"started","port":14003,"gateway":"http://127.0.0.1:18789","callback":"http://127.0.0.1:14001/atel/v1/result","hasToken":true,"hasContext":true}
+{"event":"builtin_executor_started","port":14003,"url":"http://127.0.0.1:14003"}
+{"event":"auto_registered","registry":"https://api.atelai.org","candidates":3,"discoverable":true,"wallets":[],"preferredChain":null}
+{"event":"relay_registered","relay":"http://47.251.8.19:9000"}
+{"event":"session_spawned","taskId":"final-complete-test","childKey":"agent:main:subagent:11d3a6a2-13ec-4339-86ae-a1cf67fc0ab2","resultFile":"/root/repos/atel-sdk/.atel/results/final-complete-test.json"}
+{"event":"result_received","taskId":"final-complete-test","method":"file"}

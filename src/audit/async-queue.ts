@@ -61,7 +61,10 @@ export class AsyncAuditQueue {
 
     // Start processing if not already running
     if (!this.processing) {
-      this.processQueue();
+      this.processQueue().catch(err => {
+        console.error('[Audit Queue] Failed to start processing:', err);
+        // Don't throw - queue should continue working
+      });
     }
   }
 
@@ -95,12 +98,15 @@ export class AsyncAuditQueue {
         if (item.retries < this.config.maxRetries) {
           item.retries++;
           
-          // Re-enqueue with delay (fixed: ensure processing continues)
+          // Re-enqueue with delay (fixed: handle promise rejection)
           setTimeout(() => {
             this.queue.push(item);
             // Restart processing if it stopped
             if (!this.processing) {
-              this.processQueue();
+              this.processQueue().catch(err => {
+                console.error('[Audit Queue] Failed to restart processing:', err);
+                this.config.onError(item.task, err);
+              });
             }
           }, this.config.retryDelay);
         } else {

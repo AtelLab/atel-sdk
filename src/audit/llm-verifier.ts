@@ -1,9 +1,5 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import type { Task } from '../schema/index.js';
 import type { ThinkingChain, VerificationResult } from './types.js';
-
-const execAsync = promisify(exec);
 
 // ─── Constants ──────────────────────────────────────────────
 
@@ -58,6 +54,13 @@ export class LLMThinkingVerifier {
 
       return this.parseResponse(response);
     } catch (error: any) {
+      // Log error for debugging
+      console.error('[LLM Verifier] Audit failed:', {
+        taskId: task.task_id,
+        error: error.message,
+        stack: error.stack
+      });
+      
       return {
         passed: false,
         violations: [`LLM audit failed: ${error.message}`],
@@ -74,12 +77,31 @@ export class LLMThinkingVerifier {
   }
 
   private async callLocalLLM(prompt: string): Promise<string> {
-    const escapedPrompt = prompt.replace(/'/g, "'\\''");
-    const { stdout } = await execAsync(
-      `echo '${escapedPrompt}' | ollama run ${this.modelName}`,
-      { maxBuffer: MAX_BUFFER_SIZE }
-    );
-    return stdout;
+    // Use Ollama HTTP API instead of shell execution to prevent injection
+    const ollamaEndpoint = this.endpoint || 'http://localhost:11434';
+    
+    try {
+      const response = await fetch(`${ollamaEndpoint}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.modelName,
+          prompt: prompt,
+          stream: false
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Ollama API failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      return data.response || '';
+    } catch (error: any) {
+      // Log error for debugging
+      console.error('[LLM Verifier] Ollama API error:', error.message);
+      throw error;
+    }
   }
 
   private async callRemoteLLM(prompt: string): Promise<string> {
