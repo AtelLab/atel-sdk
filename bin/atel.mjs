@@ -1746,7 +1746,7 @@ async function cmdStart(port) {
       saveTrace(taskId, trace);
       const proofGen = new ProofGenerator(trace, id);
       const proof = proofGen.generate(capTypes.join(',') || 'no-policy', `task-from-${message.from}`, JSON.stringify(result));
-      const anchor = await anchorOnChain(proof.trace_root, { proof_id: proof.proof_id, task_from: message.from, action, taskId });
+      const anchor = await anchorOnChain(proof.trace_root, { proof_id: proof.proof_id, executorDid: id.did, requesterDid: message.from, action, taskId });
       const echoAcceptedAt = pendingTasks[taskId]?.acceptedAt;
       delete pendingTasks[taskId]; saveTasks(pendingTasks);
 
