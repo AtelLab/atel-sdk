@@ -549,16 +549,28 @@ export class BuiltinExecutor {
   }
 
   private async executeDirect(prompt: string, taskId: string): Promise<unknown> {
-    // Try local Ollama first (if available)
+    // Prefer OpenClaw Gateway for better thinking chain extraction
+    // Try Gateway first
+    try {
+      return await this.executeViaGateway(prompt, taskId);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log({ event: 'gateway_fallback', taskId, reason: msg });
+    }
+
+    // Fallback to local Ollama
     try {
       const ollamaResult = await this.executeViaOllama(prompt, taskId);
       if (ollamaResult) return ollamaResult;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      this.log({ event: 'ollama_fallback', taskId, reason: msg });
+      throw new Error(`Both Gateway and Ollama failed: ${msg}`);
     }
 
-    // Fallback to OpenClaw Gateway
+    throw new Error('No execution method available');
+  }
+
+  private async executeViaGateway(prompt: string, taskId: string): Promise<unknown> {
     const { gatewayUrl, gatewayToken } = this.config;
 
     // Result file: sub-session writes result here, we poll for it
@@ -620,7 +632,8 @@ Do not include any other text in the file. This is required for the result to be
               this.log({ event: 'result_received', taskId, method: 'file' });
               // Cleanup
               try { require('node:fs').unlinkSync(resultFile); } catch { /* ignore */ }
-              return { response: parsed.response, agent: 'builtin-executor', action: taskId.split('-')[0] || 'general' };
+              // Return the full parsed object so thinking chain can be extracted
+              return parsed;
             }
           } catch {
             // File exists but not valid JSON yet, keep polling
