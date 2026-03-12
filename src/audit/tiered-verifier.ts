@@ -42,11 +42,14 @@ class RuleBasedVerifier {
       thinking.conclusion
     ].join(' ').toLowerCase();
     
-    // Extract keywords from task (simple approach)
+    // Extract keywords from task
+    // For Chinese: split by punctuation and filter short words
+    // For English: split by whitespace
     const keywords = taskGoal
-      .split(/\s+/)
-      .filter(w => w.length > 2)
-      .filter(w => !STOPWORDS.includes(w));
+      .split(/[\s，。！？、；：""''（）【】《》\.,!?;:()\[\]<>]+/)
+      .filter(w => w.length > 1) // Allow 2+ chars (including Chinese)
+      .filter(w => !STOPWORDS.includes(w))
+      .filter(w => w.trim().length > 0);
     
     let matchedKeywords = 0;
     for (const keyword of keywords) {

@@ -223,6 +223,46 @@ export class BuiltinExecutor {
         const prompt = input?.prompt || input?.text || JSON.stringify(input);
         const taskId = input?.taskId || `internal-${Date.now()}`;
         const result = await this.executeDirect(prompt, taskId);
+        
+        // ── Extract thinking chain and trigger audit (same as main flow) ──
+        const thinkingChain = this.extractThinkingChain(result);
+        if (thinkingChain) {
+          this.log({ event: 'thinking_chain_extracted', taskId, steps: thinkingChain.steps.length });
+          
+          // Async audit (non-blocking)
+          if (this.auditVerifier) {
+            (async () => {
+              try {
+                const task: Task = {
+                  task_id: taskId,
+                  version: 'task.v0.1',
+                  issuer: 'internal',
+                  intent: {
+                    type: 'internal_test',
+                    goal: prompt.substring(0, 100),
+                  },
+                  risk: { level: 'low' },
+                  nonce: Date.now().toString(),
+                };
+                
+                const modelInfo = { name: 'unknown', provider: 'gateway' };
+                const auditResult = await this.auditVerifier!.verify(task, thinkingChain, modelInfo);
+                
+                this.log({ 
+                  event: auditResult.passed ? 'thinking_audit_passed' : 'thinking_audit_failed',
+                  taskId, 
+                  passed: auditResult.passed,
+                  violations: auditResult.violations,
+                  confidence: auditResult.confidence 
+                });
+              } catch (error: unknown) {
+                const msg = error instanceof Error ? error.message : String(error);
+                this.log({ event: 'thinking_audit_error', taskId, error: msg });
+              }
+            })();
+          }
+        }
+        
         res.json(result);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
