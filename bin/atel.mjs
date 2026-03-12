@@ -1514,7 +1514,7 @@ async function cmdStart(port) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ did: id.did, timestamp, signature, payload }),
-            signal: AbortSignal.timeout(10000),
+            signal: AbortSignal.timeout(30000),
           });
           
           log({ event: 'platform_complete_response', orderId: taskId, status: completeResp.status, ok: completeResp.ok });
