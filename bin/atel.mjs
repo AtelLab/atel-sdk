@@ -1682,6 +1682,11 @@ async function cmdTask(target, taskJson) {
 
   // Parse task payload and extract risk level
   const payload = typeof taskJson === 'string' ? JSON.parse(taskJson) : taskJson;
+  if (!payload || typeof payload !== 'object') {
+    console.error('Error: Task payload is required and must be a valid JSON object');
+    console.error('Usage: atel task <DID> \'{"action":"general","payload":{"prompt":"..."}}\'');
+    process.exit(1);
+  }
   const risk = payload._risk || 'low';
   delete payload._risk;
   const force = payload._force || false;
