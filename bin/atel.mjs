@@ -305,8 +305,9 @@ async function signTaskRequest(taskRequest, secretKey) {
 }
 
 // Verify task request signature
-async function verifyTaskSignature(taskRequest, signature, publicKeyHex) {
+async function verifyTaskSignature(taskRequest, signature, publicKeyBase58) {
   const { default: nacl } = await import('tweetnacl');
+  const bs58 = await import('bs58');
   
   // Canonical JSON for verification
   // IMPORTANT: Keys must be in alphabetical order to match signTaskRequest
@@ -322,7 +323,8 @@ async function verifyTaskSignature(taskRequest, signature, publicKeyHex) {
   });
   
   try {
-    const publicKey = Buffer.from(publicKeyHex, 'hex');
+    // Decode Base58 public key from DID
+    const publicKey = bs58.default.decode(publicKeyBase58);
     const sig = Buffer.from(signature, 'base64');
     return nacl.sign.detached.verify(Buffer.from(signable), sig, publicKey);
   } catch (e) {
