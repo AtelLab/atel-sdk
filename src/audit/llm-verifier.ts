@@ -60,14 +60,42 @@ export class LLMThinkingVerifier {
    */
   private async initialize(): Promise<void> {
     try {
-      this.log('Initializing LLM...');
+      this.log('');
+      this.log('╔════════════════════════════════════════════════════════════╗');
+      this.log('║          Initializing Audit System                        ║');
+      this.log('╚════════════════════════════════════════════════════════════╝');
+      this.log('');
+      
       this.ollamaManager = new OllamaManager({
         log: (msg) => this.log(msg),
       });
+      
       await this.ollamaManager.initialize();
+      
+      this.log('');
+      this.log('╔════════════════════════════════════════════════════════════╗');
+      this.log('║  ✅ Audit System Ready                                     ║');
+      this.log('╚════════════════════════════════════════════════════════════╝');
+      this.log('');
     } catch (error: any) {
-      this.log(`⚠️  Failed to initialize LLM: ${error.message}`);
-      this.log('   Audit will be skipped for tasks');
+      this.log('');
+      this.log('╔════════════════════════════════════════════════════════════╗');
+      this.log('║  ⚠️  Audit System Initialization Failed                    ║');
+      this.log('╚════════════════════════════════════════════════════════════╝');
+      this.log('');
+      this.log(`Error: ${error.message}`);
+      this.log('');
+      this.log('Impact:');
+      this.log('  - Tasks will continue to execute normally');
+      this.log('  - CoT reasoning audit will be skipped');
+      this.log('  - No quality verification will be performed');
+      this.log('');
+      this.log('To fix:');
+      this.log('  1. Check network connection (model download requires ~400MB)');
+      this.log('  2. Check disk space (need ~500MB free)');
+      this.log('  3. Restart agent to retry initialization');
+      this.log('');
+      
       this.ollamaManager = undefined;
     }
   }

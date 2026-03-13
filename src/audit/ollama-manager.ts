@@ -46,7 +46,10 @@ export class OllamaManager {
       await this.ensureModel();
 
       // 2. Load model
-      this.log('Loading model...');
+      this.log('');
+      this.log('🔄 Loading model into memory...');
+      this.log('   This may take 5-10 seconds...');
+      
       this.llama = await getLlama();
       this.model = await this.llama.loadModel({
         modelPath: this.modelPath,
@@ -62,9 +65,27 @@ export class OllamaManager {
         contextSequence: this.context.getSequence(),
       });
 
-      this.log('✅ Model ready');
+      this.log('');
+      this.log('✅ Model loaded successfully');
+      this.log('   Memory usage: ~500MB');
+      this.log('   Ready for audit tasks');
+      this.log('');
     } catch (error: any) {
-      this.log(`❌ Failed to initialize: ${error.message}`);
+      this.log('');
+      this.log('❌ Failed to load model');
+      this.log(`   Error: ${error.message}`);
+      this.log('');
+      this.log('Possible causes:');
+      this.log('  - Insufficient memory (~500MB required)');
+      this.log('  - Corrupted model file');
+      this.log('  - Incompatible system architecture');
+      this.log('');
+      this.log('To fix:');
+      this.log('  - Ensure sufficient RAM available');
+      this.log('  - Delete model and retry: rm -rf .atel/models/');
+      this.log('  - Check system requirements');
+      this.log('');
+      
       throw error;
     }
   }
@@ -74,12 +95,18 @@ export class OllamaManager {
    */
   private async ensureModel(): Promise<void> {
     if (existsSync(this.modelPath)) {
-      this.log('Model already downloaded');
+      this.log('✅ Model already downloaded');
+      this.log(`   Location: ${this.modelPath}`);
       return;
     }
 
-    this.log('📦 Downloading model (first time only, ~400MB)...');
-    this.log('   This may take a few minutes...');
+    this.log('');
+    this.log('📦 Model not found, downloading...');
+    this.log('   Model: qwen2.5-0.5b-instruct-q4_0.gguf');
+    this.log('   Size: ~400MB');
+    this.log('   Source: HuggingFace');
+    this.log('   This is a one-time download, please wait...');
+    this.log('');
     
     await this.downloadModel();
   }
@@ -122,13 +149,33 @@ export class OllamaManager {
       }
 
       fileStream.end();
+      
+      this.log('');
       this.log('✅ Model downloaded successfully');
+      this.log(`   Saved to: ${this.modelPath}`);
+      this.log('');
     } catch (error: any) {
       // Clean up partial download
       if (existsSync(this.modelPath)) {
         const fs = await import('node:fs/promises');
         await fs.unlink(this.modelPath);
       }
+      
+      this.log('');
+      this.log('❌ Model download failed');
+      this.log(`   Error: ${error.message}`);
+      this.log('');
+      this.log('Possible causes:');
+      this.log('  - Network connection issue');
+      this.log('  - Insufficient disk space (~400MB required)');
+      this.log('  - HuggingFace service unavailable');
+      this.log('');
+      this.log('To retry:');
+      this.log('  - Check network connection');
+      this.log('  - Ensure sufficient disk space');
+      this.log('  - Restart agent');
+      this.log('');
+      
       throw error;
     }
   }
