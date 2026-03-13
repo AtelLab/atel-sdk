@@ -305,23 +305,26 @@ async function signTaskRequest(taskRequest, secretKey) {
 }
 
 // Verify task request signature
-async function verifyTaskSignature(taskRequest, signature, publicKeyHex) {
+async function verifyTaskSignature(taskRequest, signature, publicKeyBase58) {
   const { default: nacl } = await import('tweetnacl');
+  const bs58 = await import('bs58');
   
   // Canonical JSON for verification
+  // IMPORTANT: Keys must be in alphabetical order to match signTaskRequest
   const signable = JSON.stringify({
-    version: taskRequest.version,
-    taskId: taskRequest.taskId,
-    requesterDid: taskRequest.requesterDid,
-    executorDid: taskRequest.executorDid,
     capability: taskRequest.capability,
     description: taskRequest.description,
+    executorDid: taskRequest.executorDid,
     payload: taskRequest.payload,
-    timestamp: taskRequest.timestamp
+    requesterDid: taskRequest.requesterDid,
+    taskId: taskRequest.taskId,
+    timestamp: taskRequest.timestamp,
+    version: taskRequest.version
   });
   
   try {
-    const publicKey = Buffer.from(publicKeyHex, 'hex');
+    // Decode Base58 public key from DID
+    const publicKey = bs58.default.decode(publicKeyBase58);
     const sig = Buffer.from(signature, 'base64');
     return nacl.sign.detached.verify(Buffer.from(signable), sig, publicKey);
   } catch (e) {
@@ -1695,7 +1698,7 @@ async function cmdStart(port) {
         status: (success !== false && auditPassed) ? 'completed' : 'failed',
         result,
         proof: { proof_id: proof.proof_id, trace_root: proof.trace_root, events_count: trace.events.length },
-        anchor: anchor ? { chain: 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
+        anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
         execution: { duration_ms: durationMs, encrypted: task.encrypted },
         audit: auditSummary,
         rollback: rollbackReport ? { total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed } : null,
@@ -1796,11 +1799,14 @@ async function cmdStart(port) {
         const taskRequest = payload._taskRequest;
         const taskSignature = payload._taskSignature;
         
+        // Extract public key from DID (did:atel:ed25519:PUBLIC_KEY)
+        const publicKey = message.from.split(':')[3];
+        
         // Verify signature
         const verified = await verifyTaskSignature(
           typeof taskRequest === 'string' ? JSON.parse(taskRequest) : taskRequest,
           taskSignature,
-          message.from
+          publicKey
         );
         
         if (!verified) {
@@ -2782,7 +2788,7 @@ async function cmdRotate() {
     newDid: newIdentity.did,
     backup: backupFile,
     proof_valid: verifyKeyRotation(proof),
-    anchor: anchor ? { chain: 'solana', txHash: anchor.txHash } : null,
+    anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash } : null,
     next: 'Restart endpoint: atel start [port]',
   }, null, 2));
 }
