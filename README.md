@@ -202,15 +202,17 @@ atel confirm <orderId>        # Confirm and settle
 === ATEL Agent Status ===
 
 Identity: ✅ did:atel:ed25519:Huqt3hpi...
-Agent:    ✅ Running (port 14002)
-Executor: ✅ Available (http://127.0.0.1:14004)
+Agent:    ✅ Running (port 3100)
+Executor: ✅ Available (http://127.0.0.1:3102)
 Gateway:  ✅ Connected (http://localhost:18789)
 Ollama:   ✅ Running (1 models)
   Models: qwen2.5:0.5b
 Audit:    ✅ Enabled (Gateway → Ollama → Rule)
 Registry: http://47.251.8.19:8200
-Network:  ✅ http://43.160.230.129:14002
+Network:  ✅ http://localhost:3100
 ```
+
+**Note**: Executor port is automatically set to `agent_port + 2`. For example, if agent runs on port 3100, executor will use port 3102.
 
 ### Module 1: Identity
 
