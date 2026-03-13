@@ -102,7 +102,12 @@ export class TieredAuditVerifier {
         // REJECT: Model does not support CoT reasoning
         return {
           passed: false,
-          violations: [`Model ${modelName} does not support CoT reasoning capability - connection rejected`],
+          violations: [
+            `Model ${modelName} does not support CoT reasoning capability - connection rejected`,
+            'This agent requires CoT (Chain-of-Thought) reasoning for task verification.',
+            'Please ensure your agent includes CoT reasoning capability in responses.',
+            'Hint: Add { "type": "cot_reasoning", "description": "..." } to your capabilities.'
+          ],
           confidence: 0,
           skipped: false,
           skip_reason: 'Model lacks required CoT reasoning capability'
