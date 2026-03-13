@@ -1698,7 +1698,7 @@ async function cmdStart(port) {
         status: (success !== false && auditPassed) ? 'completed' : 'failed',
         result,
         proof: { proof_id: proof.proof_id, trace_root: proof.trace_root, events_count: trace.events.length },
-        anchor: anchor ? { chain: 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
+        anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
         execution: { duration_ms: durationMs, encrypted: task.encrypted },
         audit: auditSummary,
         rollback: rollbackReport ? { total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed } : null,
@@ -2788,7 +2788,7 @@ async function cmdRotate() {
     newDid: newIdentity.did,
     backup: backupFile,
     proof_valid: verifyKeyRotation(proof),
-    anchor: anchor ? { chain: 'solana', txHash: anchor.txHash } : null,
+    anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash } : null,
     next: 'Restart endpoint: atel start [port]',
   }, null, 2));
 }
