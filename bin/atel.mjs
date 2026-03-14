@@ -85,6 +85,246 @@ const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent:
 
 function ensureDir() { if (!existsSync(ATEL_DIR)) mkdirSync(ATEL_DIR, { recursive: true }); }
 
+// ═══════════════════════════════════════════════════════════════════
+// CLI UX Improvements - Helper Functions
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Unified Output Format ────────────────────────────────────────
+function formatOutput(data, options = {}) {
+  const format = options.json ? 'json' : (options.quiet ? 'quiet' : 'human');
+  
+  if (format === 'json') {
+    console.log(JSON.stringify(data));
+    return;
+  }
+  
+  if (format === 'quiet') {
+    // Only output essential info
+    if (data.id) console.log(data.id);
+    else if (data.did) console.log(data.did);
+    else if (data.sessionId) console.log(data.sessionId);
+    else if (data.requestId) console.log(data.requestId);
+    else console.log(data.message || 'ok');
+    return;
+  }
+  
+  // Human-readable format
+  if (data.status === 'ok' || data.success) {
+    console.log(`✓ ${data.message || 'Success'}`);
+    if (data.did) console.log(`  DID: ${data.did}`);
+    if (data.alias) console.log(`  Alias: ${data.alias}`);
+    if (data.sessionId) console.log(`  Session ID: ${data.sessionId}`);
+    if (data.requestId) console.log(`  Request ID: ${data.requestId}`);
+    if (data.addedAt) console.log(`  Added: ${new Date(data.addedAt).toLocaleString()}`);
+    if (data.expiresAt) console.log(`  Expires: ${new Date(data.expiresAt).toLocaleString()}`);
+  } else if (data.status === 'error' || data.error) {
+    console.error(`✗ ${data.message || data.error || 'Error'}`);
+    if (data.hint) console.error(`  Hint: ${data.hint}`);
+  } else {
+    // Neutral message
+    console.log(data.message || JSON.stringify(data));
+  }
+}
+
+// ─── Confirmation Prompts ─────────────────────────────────────────
+function confirm(message, defaultValue = false) {
+  const readline = require('readline');
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  
+  return new Promise((resolve) => {
+    const defaultText = defaultValue ? 'Y/n' : 'y/N';
+    rl.question(`${message} (${defaultText}): `, (answer) => {
+      rl.close();
+      const normalized = answer.toLowerCase().trim();
+      if (normalized === '') {
+        resolve(defaultValue);
+      } else {
+        resolve(normalized === 'y' || normalized === 'yes');
+      }
+    });
+  });
+}
+
+// ─── Help Functions ───────────────────────────────────────────────
+function showFriendHelp() {
+  console.log(`
+Friend Management Commands:
+
+  atel friend add <did> [options]
+    Add a DID as friend
+    
+    Arguments:
+      <did>             DID to add (format: did:atel:ed25519:<public-key>)
+    
+    Options:
+      --alias <name>    Friendly name for this friend
+      --notes <text>    Notes about this friend
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend add did:atel:ed25519:abc123 --alias "Alice"
+      atel friend add did:atel:ed25519:abc123 --alias "Bob" --notes "Met at conference"
+
+  atel friend remove <did> [options]
+    Remove a friend
+    
+    Arguments:
+      <did>             DID to remove
+    
+    Options:
+      --yes             Skip confirmation prompt
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend remove did:atel:ed25519:abc123
+      atel friend remove did:atel:ed25519:abc123 --yes
+
+  atel friend list [options]
+    List all friends
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend list
+      atel friend list --json
+
+  atel friend request <did> [options]
+    Send a friend request
+    
+    Arguments:
+      <did>             Target DID
+    
+    Options:
+      --message <text>  Message to include with request
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend request did:atel:ed25519:abc123
+      atel friend request did:atel:ed25519:abc123 --message "Hi, let's connect!"
+
+  atel friend accept <requestId> [options]
+    Accept a friend request
+    
+    Arguments:
+      <requestId>       Request ID to accept
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend accept freq_1234567890_abc123
+
+  atel friend reject <requestId> [options]
+    Reject a friend request
+    
+    Arguments:
+      <requestId>       Request ID to reject
+    
+    Options:
+      --reason <text>   Reason for rejection
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend reject freq_1234567890_abc123
+      atel friend reject freq_1234567890_abc123 --reason "Don't know you"
+
+  atel friend pending [options]
+    List pending friend requests
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend pending
+
+  atel friend status [options]
+    Show friend system status
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel friend status
+
+For more information, visit: https://docs.atel.io/friend-system
+  `);
+}
+
+function showTempSessionHelp() {
+  console.log(`
+Temporary Session Management:
+
+  atel temp-session allow <did> [options]
+    Grant temporary access to a DID
+    
+    Arguments:
+      <did>                   DID to grant access
+    
+    Options:
+      --duration <minutes>    Duration in minutes (default: 60, max: 1440)
+      --max-tasks <count>     Maximum number of tasks (default: 10, max: 100)
+      --reason <text>         Reason for granting access
+      --json                  Output in JSON format
+    
+    Common durations:
+      --duration 60           1 hour
+      --duration 1440         1 day
+      --duration 10080        1 week
+    
+    Examples:
+      atel temp-session allow did:atel:ed25519:abc123
+      atel temp-session allow did:atel:ed25519:abc123 --duration 120 --max-tasks 5
+      atel temp-session allow did:atel:ed25519:abc123 --duration 1440 --reason "One-time collaboration"
+
+  atel temp-session revoke <sessionId> [options]
+    Revoke a temporary session
+    
+    Arguments:
+      <sessionId>       Session ID to revoke
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel temp-session revoke temp_1234567890_abc123
+
+  atel temp-session list [options]
+    List temporary sessions
+    
+    Options:
+      --json            Output in JSON format
+      --all             Include expired sessions
+    
+    Examples:
+      atel temp-session list
+      atel temp-session list --all
+
+  atel temp-session clean [options]
+    Remove expired sessions
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel temp-session clean
+
+  atel temp-session status [options]
+    Show temporary session status
+    
+    Options:
+      --json            Output in JSON format
+    
+    Examples:
+      atel temp-session status
+
+For more information, visit: https://docs.atel.io/friend-system
+  `);
+}
+
 // Safe log with EPIPE protection
 function log(event) { 
   ensureDir(); 
@@ -4438,7 +4678,7 @@ async function cmdFriendAdd(args) {
   // Add validation
   const validation = validateDID(did);
   if (!validation.valid) {
-    console.error(`Invalid DID: ${validation.error}`);
+    formatOutput({ status: 'error', message: `Invalid DID: ${validation.error}` }, args);
     process.exit(1);
   }
   
@@ -4454,49 +4694,80 @@ async function cmdFriendAdd(args) {
   const added = addFriend(did, options);
   
   if (added) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'ok', 
       message: 'Friend added successfully',
       did,
-      alias: options.alias
-    }));
+      alias: options.alias,
+      addedAt: new Date().toISOString()
+    }, args);
   } else {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'already_exists', 
       message: 'Already friends with this DID',
       did
-    }));
+    }, args);
   }
 }
 
 async function cmdFriendRemove(args) {
-  const did = args._[0];
+  let did = args._[0];
   if (!did) {
-    console.error('Usage: atel friend remove <did>');
+    console.error('Usage: atel friend remove <did> [--yes] [--json]');
+    process.exit(1);
+  }
+  
+  // Resolve alias if needed
+  try {
+    did = resolveDID(did);
+  } catch (err) {
+    formatOutput({ status: 'error', message: err.message }, args);
     process.exit(1);
   }
   
   // Add validation
   const validation = validateDID(did);
   if (!validation.valid) {
-    console.error(`Invalid DID: ${validation.error}`);
+    formatOutput({ status: 'error', message: `Invalid DID: ${validation.error}` }, args);
     process.exit(1);
+  }
+  
+  const friends = loadFriends();
+  const friend = friends.friends.find(f => f.did === did);
+  
+  if (!friend) {
+    formatOutput({ status: 'error', message: 'Friend not found' }, args);
+    process.exit(1);
+  }
+  
+  // Confirmation prompt (unless --yes)
+  if (!args.yes && !args.json) {
+    console.log('⚠  Are you sure you want to remove this friend?');
+    console.log(`  DID: ${did}`);
+    if (friend.alias) console.log(`  Alias: ${friend.alias}`);
+    if (friend.addedAt) console.log(`  Added: ${new Date(friend.addedAt).toLocaleString()}`);
+    
+    const confirmed = await confirm('Confirm', false);
+    if (!confirmed) {
+      console.log('Cancelled');
+      process.exit(0);
+    }
   }
   
   const removed = removeFriend(did);
   
   if (removed) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'ok', 
       message: 'Friend removed successfully',
       did
-    }));
+    }, args);
   } else {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'not_found', 
       message: 'DID not found in friends list',
       did
-    }));
+    }, args);
   }
 }
 
@@ -4506,7 +4777,7 @@ async function cmdFriendList(args) {
   const jsonFlag = rawArgs.includes('--json');
   
   if (jsonFlag) {
-    console.log(JSON.stringify(data, null, 2));
+    formatOutput(data, args);
     return;
   }
   
@@ -4526,16 +4797,24 @@ async function cmdFriendList(args) {
 }
 
 async function cmdFriendRequest(args) {
-  const targetDid = args._[0];
+  let targetDid = args._[0];
   if (!targetDid) {
     console.error('Usage: atel friend request <target-did> [--message "text"]');
+    process.exit(1);
+  }
+  
+  // Resolve alias if needed
+  try {
+    targetDid = resolveDID(targetDid);
+  } catch (err) {
+    formatOutput({ status: 'error', message: err.message }, args);
     process.exit(1);
   }
   
   // Add DID validation
   const validation = validateDID(targetDid);
   if (!validation.valid) {
-    console.error(`Invalid DID: ${validation.error}`);
+    formatOutput({ status: 'error', message: `Invalid DID: ${validation.error}` }, args);
     process.exit(1);
   }
   
@@ -4543,7 +4822,7 @@ async function cmdFriendRequest(args) {
   
   // Check if already friends
   if (isFriend(targetDid)) {
-    console.error('Already friends with this DID');
+    formatOutput({ status: 'error', message: 'Already friends with this DID' }, args);
     process.exit(1);
   }
   
@@ -4553,7 +4832,7 @@ async function cmdFriendRequest(args) {
     r.to === targetDid && r.status === 'pending'
   );
   if (existing) {
-    console.error('Friend request already sent');
+    formatOutput({ status: 'error', message: 'Friend request already sent' }, args);
     process.exit(1);
   }
   
@@ -4608,20 +4887,20 @@ async function cmdFriendRequest(args) {
   log({ event: 'friend_request_created', to: targetDid, requestId, sent });
   
   if (sent) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'sent', 
       requestId, 
       to: targetDid,
       message: 'Friend request sent successfully'
-    }));
+    }, args);
   } else {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'queued', 
       requestId, 
       to: targetDid,
       message: 'Friend request saved locally. Will retry when target is online.',
       error: error
-    }));
+    }, args);
   }
 }
 
@@ -4637,12 +4916,12 @@ async function cmdFriendAccept(args) {
   
   const request = requests.incoming.find(r => r.requestId === requestId);
   if (!request) {
-    console.error('Request not found');
+    formatOutput({ status: 'error', message: 'Request not found' }, args);
     process.exit(1);
   }
   
   if (request.status !== 'pending') {
-    console.error(`Request already ${request.status}`);
+    formatOutput({ status: 'error', message: `Request already ${request.status}` }, args);
     process.exit(1);
   }
   
@@ -4677,20 +4956,20 @@ async function cmdFriendAccept(args) {
     await sendP2PMessage(request.from, signedMsg);
     log({ event: 'friend_request_accepted', from: request.from, requestId });
     
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'ok', 
       message: 'Friend request accepted',
       requestId,
       friend: request.from
-    }));
+    }, args);
   } catch (err) {
     console.error('Failed to send acceptance:', err.message);
     // Friend already added, so don't fail completely
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'partial', 
       message: 'Friend added locally, but failed to notify sender',
       requestId
-    }));
+    }, args);
   }
 }
 
@@ -4706,12 +4985,12 @@ async function cmdFriendReject(args) {
   
   const request = requests.incoming.find(r => r.requestId === requestId);
   if (!request) {
-    console.error('Request not found');
+    formatOutput({ status: 'error', message: 'Request not found' }, args);
     process.exit(1);
   }
   
   if (request.status !== 'pending') {
-    console.error(`Request already ${request.status}`);
+    formatOutput({ status: 'error', message: `Request already ${request.status}` }, args);
     process.exit(1);
   }
   
@@ -4743,18 +5022,18 @@ async function cmdFriendReject(args) {
     await sendP2PMessage(request.from, signedMsg);
     log({ event: 'friend_request_rejected', from: request.from, requestId, reason });
     
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'ok', 
       message: 'Friend request rejected',
       requestId
-    }));
+    }, args);
   } catch (err) {
     console.error('Failed to send rejection:', err.message);
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'partial', 
       message: 'Request marked as rejected locally, but failed to notify sender',
       requestId
-    }));
+    }, args);
   }
 }
 
@@ -4767,7 +5046,7 @@ async function cmdFriendPending(args) {
   const jsonFlag = rawArgs.includes('--json');
   
   if (jsonFlag) {
-    console.log(JSON.stringify({ incoming, outgoing }, null, 2));
+    formatOutput({ incoming, outgoing }, args);
     return;
   }
   
@@ -4801,99 +5080,201 @@ async function cmdFriendPending(args) {
   }
 }
 
+// ─── Friend Status Command ───────────────────────────────────────
+
+async function cmdFriendStatus(args) {
+  const friends = loadFriends();
+  const requests = loadFriendRequests();
+  const tempSessions = loadTempSessions();
+  const policy = loadPolicy();
+  
+  const relPolicy = policy.relationshipPolicy || {};
+  const defaultMode = relPolicy.defaultMode || 'open';
+  
+  const now = Date.now();
+  const activeSessions = tempSessions.sessions.filter(s => 
+    s.status === 'active' && new Date(s.expiresAt).getTime() > now
+  );
+  
+  const incomingPending = (requests.incoming || []).filter(r => r.status === 'pending');
+  const outgoingPending = (requests.outgoing || []).filter(r => r.status === 'pending');
+  
+  const blockedCount = (policy.blockedDIDs || []).length;
+  
+  if (args.json) {
+    formatOutput({
+      mode: defaultMode,
+      totalFriends: friends.friends.length,
+      pendingRequests: {
+        incoming: incomingPending.length,
+        outgoing: outgoingPending.length
+      },
+      temporarySessions: activeSessions.length,
+      blockedDIDs: blockedCount
+    }, args);
+    return;
+  }
+  
+  console.log('\nFriend System Status:');
+  console.log(`  Mode: ${defaultMode}`);
+  console.log(`  Total friends: ${friends.friends.length}`);
+  console.log(`  Pending requests: ${incomingPending.length + outgoingPending.length} (incoming: ${incomingPending.length}, outgoing: ${outgoingPending.length})`);
+  console.log(`  Temporary sessions: ${activeSessions.length} active`);
+  console.log(`  Blocked DIDs: ${blockedCount}`);
+  
+  // Recent activity
+  if (incomingPending.length > 0 || outgoingPending.length > 0) {
+    console.log('\nRecent activity:');
+    
+    incomingPending.slice(0, 3).forEach(r => {
+      const timeAgo = Math.floor((now - new Date(r.receivedAt).getTime()) / 60000);
+      console.log(`  - Friend request from ${r.from.slice(0, 20)}... (${timeAgo} minutes ago)`);
+    });
+    
+    outgoingPending.slice(0, 3).forEach(r => {
+      const timeAgo = Math.floor((now - new Date(r.sentAt).getTime()) / 60000);
+      console.log(`  - You sent a friend request to ${r.to.slice(0, 20)}... (${timeAgo} minutes ago)`);
+    });
+  }
+  
+  // Expiring sessions
+  const expiringSoon = activeSessions.filter(s => {
+    const expiresIn = new Date(s.expiresAt).getTime() - now;
+    return expiresIn < 3600000; // < 1 hour
+  });
+  
+  if (expiringSoon.length > 0) {
+    console.log('\nExpiring soon:');
+    expiringSoon.forEach(s => {
+      const expiresIn = Math.floor((new Date(s.expiresAt).getTime() - now) / 60000);
+      console.log(`  - Temporary session for ${s.did.slice(0, 20)}... expires in ${expiresIn} minutes`);
+    });
+  }
+  
+  console.log('');
+}
+
 // ─── Temporary Session Commands ──────────────────────────────────
 
 async function cmdTempAllow(args) {
-  const did = args._[0];
+  let did = args._[0];
   if (!did) {
     console.error('Usage: atel temp-session allow <did> [--duration 60] [--max-tasks 10] [--reason "text"]');
+    process.exit(1);
+  }
+  
+  // Resolve alias if needed
+  try {
+    did = resolveDID(did);
+  } catch (err) {
+    formatOutput({ status: 'error', message: err.message }, args);
     process.exit(1);
   }
   
   // Add validation
   const validation = validateDID(did);
   if (!validation.valid) {
-    console.error(`Invalid DID: ${validation.error}`);
+    formatOutput({ status: 'error', message: `Invalid DID: ${validation.error}` }, args);
     process.exit(1);
   }
   
   // Check if already a friend
   if (isFriend(did)) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'unnecessary', 
       message: 'This DID is already a friend. Temporary session not needed.',
       did
-    }));
+    }, args);
     return;
   }
   
   // Check if already has active session
   const existing = getActiveTempSession(did);
   if (existing) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'already_exists', 
       message: 'Active temporary session already exists',
       sessionId: existing.sessionId,
       expiresAt: existing.expiresAt,
       tasksRemaining: existing.maxTasks - existing.taskCount
-    }));
+    }, args);
     return;
   }
   
   const options = {
     durationMinutes: parseInt(args.duration) || 60,
     maxTasks: parseInt(args['max-tasks']) || 10,
-    reason: args.reason || ''
+    notes: args.reason || ''
   };
   
   // Validate options
   if (options.durationMinutes < 1 || options.durationMinutes > 1440) {
-    console.error('Duration must be between 1 and 1440 minutes (24 hours)');
+    formatOutput({ status: 'error', message: 'Duration must be between 1 and 1440 minutes (24 hours)' }, args);
     process.exit(1);
   }
   
   if (options.maxTasks < 1 || options.maxTasks > 100) {
-    console.error('Max tasks must be between 1 and 100');
+    formatOutput({ status: 'error', message: 'Max tasks must be between 1 and 100' }, args);
     process.exit(1);
   }
   
   const result = addTempSession(did, options);
-  const sessionId = result.created ? result.session.sessionId : result.session.sessionId;
   
-  const expiresAt = new Date(Date.now() + options.durationMinutes * 60000).toISOString();
-  
-  console.log(JSON.stringify({ 
+  formatOutput({ 
     status: 'ok', 
     message: 'Temporary session granted',
-    sessionId,
+    sessionId: result.session.sessionId,
     did,
     durationMinutes: options.durationMinutes,
     maxTasks: options.maxTasks,
-    expiresAt
-  }));
+    expiresAt: result.session.expiresAt
+  }, args);
 }
 
 async function cmdTempRevoke(args) {
   const sessionId = args._[0];
   if (!sessionId) {
-    console.error('Usage: atel temp-session revoke <session-id>');
+    console.error('Usage: atel temp-session revoke <session-id> [--yes] [--json]');
     process.exit(1);
+  }
+  
+  const sessions = loadTempSessions();
+  const session = sessions.sessions.find(s => s.sessionId === sessionId);
+  
+  if (!session) {
+    formatOutput({ status: 'error', message: 'Session not found' }, args);
+    process.exit(1);
+  }
+  
+  // Confirmation prompt (unless --yes)
+  if (!args.yes && !args.json) {
+    console.log('⚠  Are you sure you want to revoke this temporary session?');
+    console.log(`  Session ID: ${sessionId}`);
+    console.log(`  DID: ${session.did}`);
+    console.log(`  Expires: ${session.expiresAt}`);
+    console.log(`  Tasks used: ${session.taskCount}/${session.maxTasks}`);
+    
+    const confirmed = await confirm('Confirm', false);
+    if (!confirmed) {
+      console.log('Cancelled');
+      process.exit(0);
+    }
   }
   
   const removed = removeTempSession(sessionId);
   
   if (removed) {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'ok', 
       message: 'Temporary session revoked',
       sessionId
-    }));
+    }, args);
   } else {
-    console.log(JSON.stringify({ 
+    formatOutput({ 
       status: 'not_found', 
       message: 'Session not found',
       sessionId
-    }));
+    }, args);
   }
 }
 
@@ -4915,7 +5296,7 @@ async function cmdTempList(args) {
   }
   
   if (args.json) {
-    console.log(JSON.stringify({ sessions }, null, 2));
+    formatOutput({ sessions }, args);
     return;
   }
   
@@ -4954,11 +5335,159 @@ async function cmdTempList(args) {
 async function cmdTempClean(args) {
   const removed = cleanExpiredTempSessions();
   
-  console.log(JSON.stringify({ 
+  formatOutput({ 
     status: 'ok', 
     message: `Cleaned ${removed} expired session(s)`,
     count: removed
-  }));
+  }, args);
+}
+
+// ─── Temp Session Status Command ─────────────────────────────────
+
+async function cmdTempSessionStatus(args) {
+  const sessions = loadTempSessions();
+  const now = Date.now();
+  
+  const active = sessions.sessions.filter(s => 
+    s.status === 'active' && new Date(s.expiresAt).getTime() > now
+  );
+  
+  const expired = sessions.sessions.filter(s => 
+    new Date(s.expiresAt).getTime() <= now
+  );
+  
+  if (args.json) {
+    formatOutput({
+      activeSessions: active.length,
+      expiredSessions: expired.length,
+      totalGranted: sessions.sessions.length,
+      sessions: active.map(s => ({
+        sessionId: s.sessionId,
+        did: s.did,
+        expiresAt: s.expiresAt,
+        expiresIn: Math.floor((new Date(s.expiresAt).getTime() - now) / 60000),
+        tasks: `${s.taskCount}/${s.maxTasks}`,
+        reason: s.notes
+      }))
+    }, args);
+    return;
+  }
+  
+  console.log('\nTemporary Session Status:');
+  console.log(`  Active sessions: ${active.length}`);
+  console.log(`  Expired sessions: ${expired.length}`);
+  console.log(`  Total granted: ${sessions.sessions.length}`);
+  
+  if (active.length > 0) {
+    console.log('\nActive sessions:');
+    active.forEach((s, i) => {
+      const expiresIn = Math.floor((new Date(s.expiresAt).getTime() - now) / 60000);
+      console.log(`  ${i + 1}. DID: ${s.did.slice(0, 30)}...`);
+      console.log(`     Expires: ${new Date(s.expiresAt).toLocaleString()} (in ${expiresIn} minutes)`);
+      console.log(`     Tasks: ${s.taskCount}/${s.maxTasks}`);
+      if (s.notes) console.log(`     Reason: ${s.notes}`);
+    });
+  }
+  
+  console.log('');
+}
+
+// ─── DID Alias System ────────────────────────────────────────────
+
+const ALIASES_FILE = resolve(ATEL_DIR, 'aliases.json');
+
+function loadAliases() {
+  if (!existsSync(ALIASES_FILE)) {
+    return { aliases: {} };
+  }
+  try {
+    return JSON.parse(readFileSync(ALIASES_FILE, 'utf-8'));
+  } catch {
+    return { aliases: {} };
+  }
+}
+
+function saveAliases(data) {
+  ensureDir();
+  writeFileSync(ALIASES_FILE, JSON.stringify(data, null, 2));
+}
+
+function resolveDID(didOrAlias) {
+  if (didOrAlias.startsWith('@')) {
+    const alias = didOrAlias.slice(1);
+    const aliases = loadAliases();
+    const did = aliases.aliases[alias];
+    if (!did) {
+      throw new Error(`Alias not found: @${alias}`);
+    }
+    return did;
+  }
+  return didOrAlias;
+}
+
+async function cmdAliasSet(args) {
+  const alias = args._[0];
+  const did = args._[1];
+  
+  if (!alias || !did) {
+    console.error('Usage: atel alias set <alias> <did>');
+    process.exit(1);
+  }
+  
+  const validation = validateDID(did);
+  if (!validation.valid) {
+    formatOutput({ status: 'error', message: `Invalid DID: ${validation.error}` }, args);
+    process.exit(1);
+  }
+  
+  const aliases = loadAliases();
+  aliases.aliases[alias] = did;
+  saveAliases(aliases);
+  
+  formatOutput({ status: 'ok', message: 'Alias set successfully', alias, did }, args);
+}
+
+async function cmdAliasList(args) {
+  const aliases = loadAliases();
+  
+  if (args.json) {
+    formatOutput(aliases.aliases, args);
+    return;
+  }
+  
+  const entries = Object.entries(aliases.aliases);
+  
+  if (entries.length === 0) {
+    console.log('No aliases defined.');
+    return;
+  }
+  
+  console.log(`\nAliases (${entries.length}):\n`);
+  entries.forEach(([alias, did]) => {
+    console.log(`  @${alias} → ${did}`);
+  });
+  console.log('');
+}
+
+async function cmdAliasRemove(args) {
+  const alias = args._[0];
+  
+  if (!alias) {
+    console.error('Usage: atel alias remove <alias>');
+    process.exit(1);
+  }
+  
+  const aliases = loadAliases();
+  
+  if (!aliases.aliases[alias]) {
+    formatOutput({ status: 'error', message: 'Alias not found' }, args);
+    process.exit(1);
+  }
+  
+  delete aliases.aliases[alias];
+  saveAliases(aliases);
+  
+  formatOutput({ status: 'ok', message: 'Alias removed successfully', alias }, args);
 }
 
 // ─── Main ────────────────────────────────────────────────────────
@@ -5031,27 +5560,42 @@ const commands = {
       'max-tasks': rawArgs.includes('--max-tasks') ? rawArgs[rawArgs.indexOf('--max-tasks') + 1] : undefined,
       reason: rawArgs.includes('--reason') ? rawArgs[rawArgs.indexOf('--reason') + 1] : undefined,
       json: rawArgs.includes('--json'),
-      all: rawArgs.includes('--all')
+      all: rawArgs.includes('--all'),
+      yes: rawArgs.includes('--yes')
     };
+    
+    if (!subCmd || subCmd === 'help' || subCmd === '--help' || subCmd === '-h') {
+      showTempSessionHelp();
+      process.exit(0);
+    }
     
     if (subCmd === 'allow') return cmdTempAllow(parsedArgs);
     if (subCmd === 'revoke') return cmdTempRevoke(parsedArgs);
     if (subCmd === 'list') return cmdTempList(parsedArgs);
     if (subCmd === 'clean') return cmdTempClean(parsedArgs);
+    if (subCmd === 'status') return cmdTempSessionStatus(parsedArgs);
     
-    console.error('Usage: atel temp-session <allow|revoke|list|clean>');
+    console.error('Usage: atel temp-session <allow|revoke|list|clean|status>');
     console.error('  allow <did> [--duration 60] [--max-tasks 10] [--reason "text"]');
-    console.error('  revoke <session-id>');
+    console.error('  revoke <session-id> [--yes]');
     console.error('  list [--json] [--all]');
     console.error('  clean');
+    console.error('  status [--json]');
     process.exit(1);
   },
   // Friend System
   friend: () => {
     const subCmd = args[0];
     const parsedArgs = {
-      _: args.slice(1)
+      _: args.slice(1),
+      json: rawArgs.includes('--json'),
+      yes: rawArgs.includes('--yes')
     };
+    
+    if (!subCmd || subCmd === 'help' || subCmd === '--help' || subCmd === '-h') {
+      showFriendHelp();
+      process.exit(0);
+    }
     
     if (subCmd === 'add') return cmdFriendAdd(parsedArgs);
     if (subCmd === 'remove') return cmdFriendRemove(parsedArgs);
@@ -5060,15 +5604,35 @@ const commands = {
     if (subCmd === 'accept') return cmdFriendAccept(parsedArgs);
     if (subCmd === 'reject') return cmdFriendReject(parsedArgs);
     if (subCmd === 'pending') return cmdFriendPending(parsedArgs);
+    if (subCmd === 'status') return cmdFriendStatus(parsedArgs);
     
-    console.error('Usage: atel friend <add|remove|list|request|accept|reject|pending>');
+    console.error('Usage: atel friend <add|remove|list|request|accept|reject|pending|status>');
     console.error('  add <did> [--alias "name"] [--notes "text"]');
-    console.error('  remove <did>');
+    console.error('  remove <did> [--yes]');
     console.error('  list [--json]');
     console.error('  request <target-did> [--message "text"]');
     console.error('  accept <request-id>');
     console.error('  reject <request-id> [--reason "text"]');
     console.error('  pending [--json]');
+    console.error('  status [--json]');
+    process.exit(1);
+  },
+  // Alias System
+  alias: () => {
+    const subCmd = args[0];
+    const parsedArgs = {
+      _: args.slice(1),
+      json: rawArgs.includes('--json')
+    };
+    
+    if (subCmd === 'set') return cmdAliasSet(parsedArgs);
+    if (subCmd === 'list') return cmdAliasList(parsedArgs);
+    if (subCmd === 'remove') return cmdAliasRemove(parsedArgs);
+    
+    console.error('Usage: atel alias <set|list|remove>');
+    console.error('  set <alias> <did>       Set an alias for a DID');
+    console.error('  list [--json]           List all aliases');
+    console.error('  remove <alias>          Remove an alias');
     process.exit(1);
   },
 };
@@ -5148,14 +5712,17 @@ Temporary Session Commands:
     [--max-tasks 10]                   Max tasks allowed (1-100, default: 10)
     [--reason "text"]                  Optional reason for the session
   temp-session revoke <session-id>     Revoke a temporary session
+    [--yes]                            Skip confirmation prompt
   temp-session list [--json] [--all]   List temporary sessions (active by default)
   temp-session clean                   Remove expired temporary sessions
+  temp-session status [--json]         Show temporary session status
 
 Friend Commands:
   friend add <did>                     Add a friend manually
     [--alias "name"]                   Optional friendly name
     [--notes "text"]                   Optional notes
   friend remove <did>                  Remove a friend
+    [--yes]                            Skip confirmation prompt
   friend list [--json]                 List all friends
   friend request <target-did>          Send a friend request
     [--message "text"]                 Optional message
@@ -5163,6 +5730,12 @@ Friend Commands:
   friend reject <request-id>           Reject an incoming friend request
     [--reason "text"]                  Optional rejection reason
   friend pending [--json]              List pending friend requests (incoming & outgoing)
+  friend status [--json]               Show friend system status
+
+Alias Commands:
+  alias set <alias> <did>              Set an alias for a DID (use @alias in commands)
+  alias list [--json]                  List all aliases
+  alias remove <alias>                 Remove an alias
 
 Environment:
   ATEL_DIR                Identity directory (default: .atel)
