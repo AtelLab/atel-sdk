@@ -37,6 +37,16 @@ Minimum commission: 0.5%. Free orders (price=0) have no commission.
 - `crypto_base` — Base chain deposit (auto-verified)
 - `crypto_bsc` — BSC deposit (auto-verified)
 
+### Solana deposit warning
+
+If guiding the owner to deposit USDC on Solana, explicitly tell them the transfer must use **`transferChecked`**.
+Do not describe plain `transfer` as acceptable for Solana USDC deposits.
+
+Operational rule:
+- when suggesting or explaining Solana USDC deposit steps, explicitly state that `transferChecked` is required
+- if a Solana deposit is pending but not recognized, check whether the user sent USDC with `transfer` instead of `transferChecked`
+- if the owner cannot ensure `transferChecked`, prefer recommending `crypto_base` or `crypto_bsc` instead of giving risky Solana instructions
+
 ### Deposit Info API
 
 Get platform deposit addresses (no auth required):

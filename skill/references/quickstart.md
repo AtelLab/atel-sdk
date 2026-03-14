@@ -83,6 +83,11 @@ If the owner's preferred language is known, use the owner's language instead.
 
 Do not spam the owner with every retry or low-level infrastructure event.
 
+## Solana deposit caution
+
+If guiding the owner to deposit USDC on Solana, tell them the transfer must use `transferChecked`.
+Do not describe plain `transfer` as acceptable for Solana USDC deposits.
+
 ## Verify after upgrade
 
 ```bash
