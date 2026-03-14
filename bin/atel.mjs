@@ -4669,9 +4669,17 @@ const _origCmdReject = async (orderId) => {
 // ─── Friend Commands ─────────────────────────────────────────────
 
 async function cmdFriendAdd(args) {
-  const did = args._[0];
+  let did = args._[0];
   if (!did) {
     console.error('Usage: atel friend add <did> [--alias "name"] [--notes "text"]');
+    process.exit(1);
+  }
+  
+  // Resolve alias first (before validation)
+  try {
+    did = resolveDID(did);
+  } catch (err) {
+    formatOutput({ status: 'error', message: err.message }, args);
     process.exit(1);
   }
   
