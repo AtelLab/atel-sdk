@@ -46,6 +46,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import crypto from 'node:crypto';
 import {
   AgentIdentity, AgentEndpoint, AgentClient, HandshakeManager,
   createMessage, RegistryClient, ExecutionTrace, ProofGenerator,
@@ -125,6 +126,33 @@ function getGatewayUrl() {
 function saveIdentity(id) { ensureDir(); writeFileSync(IDENTITY_FILE, JSON.stringify({ agent_id: id.agent_id, did: id.did, publicKey: Buffer.from(id.publicKey).toString('hex'), secretKey: Buffer.from(id.secretKey).toString('hex') }, null, 2)); }
 function loadIdentity() { if (!existsSync(IDENTITY_FILE)) return null; const d = JSON.parse(readFileSync(IDENTITY_FILE, 'utf-8')); return new AgentIdentity({ agent_id: d.agent_id, publicKey: Uint8Array.from(Buffer.from(d.publicKey, 'hex')), secretKey: Uint8Array.from(Buffer.from(d.secretKey, 'hex')) }); }
 function requireIdentity() { const id = loadIdentity(); if (!id) { console.error('No identity. Run: atel init'); process.exit(1); } return id; }
+
+function validateDID(did) {
+  // ATEL DID format: did:atel:ed25519:<base58-encoded-public-key>
+  if (!did || typeof did !== 'string') {
+    return { valid: false, error: 'DID is required' };
+  }
+  
+  if (!did.startsWith('did:atel:')) {
+    return { valid: false, error: 'DID must start with "did:atel:"' };
+  }
+  
+  const parts = did.split(':');
+  if (parts.length !== 4) {
+    return { valid: false, error: 'Invalid DID format. Expected: did:atel:ed25519:<public-key>' };
+  }
+  
+  if (parts[2] !== 'ed25519') {
+    return { valid: false, error: 'Only ed25519 key type is supported' };
+  }
+  
+  const publicKey = parts[3];
+  if (!publicKey || publicKey.length < 32) {
+    return { valid: false, error: 'Invalid public key in DID' };
+  }
+  
+  return { valid: true };
+}
 
 function loadCapabilities() { const f = resolve(ATEL_DIR, 'capabilities.json'); if (!existsSync(f)) return []; try { return JSON.parse(readFileSync(f, 'utf-8')); } catch { return []; } }
 function saveCapabilities(c) { ensureDir(); writeFileSync(resolve(ATEL_DIR, 'capabilities.json'), JSON.stringify(c, null, 2)); }
@@ -394,6 +422,7 @@ function loadFriends() {
 function saveFriends(data) {
   ensureDir();
   writeFileSync(FRIENDS_FILE, JSON.stringify(data, null, 2));
+  invalidateFriendCache(); // Add this
 }
 
 // Add friend (idempotent)
@@ -436,7 +465,7 @@ function removeFriend(did) {
 
 // Check if DID is a friend
 function isFriend(did) {
-  const data = loadFriends();
+  const data = getCachedFriends();
   return data.friends.some(f => f.did === did && f.status === 'accepted');
 }
 
@@ -480,6 +509,7 @@ function loadTempSessions() {
 function saveTempSessions(data) {
   ensureDir();
   writeFileSync(TEMP_SESSIONS_FILE, JSON.stringify(data, null, 2));
+  invalidateTempSessionCache(); // Add this
 }
 
 // Add temporary session (idempotent)
@@ -498,7 +528,7 @@ function addTempSession(did, options = {}) {
     return { created: false, session: existing }; // Already exists
   }
   
-  const sessionId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const sessionId = `temp_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   const durationMinutes = options.durationMinutes || 60;
   const maxTasks = options.maxTasks || 5;
   
@@ -544,30 +574,99 @@ function cleanExpiredTempSessions() {
   return removed;
 }
 
+// Automatic cleanup when listing temp sessions
+function autoCleanExpiredTempSessions() {
+  const sessions = loadTempSessions();
+  const now = Date.now();
+  const before = sessions.sessions.length;
+  
+  sessions.sessions = sessions.sessions.filter(s => 
+    new Date(s.expiresAt).getTime() > now
+  );
+  
+  const removed = before - sessions.sessions.length;
+  if (removed > 0) {
+    saveTempSessions(sessions);
+    log({ event: 'temp_sessions_auto_cleaned', count: removed });
+  }
+  
+  return removed;
+}
+
+// Simple in-memory cache for friend system data
+const friendSystemCache = {
+  friends: { data: null, timestamp: 0, ttl: 60000 }, // 1 minute TTL
+  tempSessions: { data: null, timestamp: 0, ttl: 30000 }, // 30 seconds TTL
+  policy: { data: null, timestamp: 0, ttl: 60000 }
+};
+
+function getCachedFriends() {
+  const now = Date.now();
+  if (friendSystemCache.friends.data && 
+      (now - friendSystemCache.friends.timestamp) < friendSystemCache.friends.ttl) {
+    return friendSystemCache.friends.data;
+  }
+  
+  const data = loadFriends();
+  friendSystemCache.friends.data = data;
+  friendSystemCache.friends.timestamp = now;
+  return data;
+}
+
+function getCachedTempSessions() {
+  const now = Date.now();
+  if (friendSystemCache.tempSessions.data && 
+      (now - friendSystemCache.tempSessions.timestamp) < friendSystemCache.tempSessions.ttl) {
+    return friendSystemCache.tempSessions.data;
+  }
+  
+  const data = loadTempSessions();
+  friendSystemCache.tempSessions.data = data;
+  friendSystemCache.tempSessions.timestamp = now;
+  return data;
+}
+
+function invalidateFriendCache() {
+  friendSystemCache.friends.data = null;
+  friendSystemCache.friends.timestamp = 0;
+}
+
+function invalidateTempSessionCache() {
+  friendSystemCache.tempSessions.data = null;
+  friendSystemCache.tempSessions.timestamp = 0;
+}
+
 // Get active temporary session for a DID
 function getActiveTempSession(did) {
-  const data = loadTempSessions();
+  const data = getCachedTempSessions();
   const now = Date.now();
   
-  // Find active session (not expired)
-  const active = data.sessions.find(s => 
+  return data.sessions.find(s => 
     s.did === did && 
     s.status === 'active' && 
     new Date(s.expiresAt).getTime() > now
   );
-  
-  return active || null;
 }
 
 // Increment task count for a temporary session
 function incrementTempSessionTaskCount(sessionId) {
-  const data = loadTempSessions();
-  const session = data.sessions.find(s => s.sessionId === sessionId);
+  const sessions = loadTempSessions();
+  const session = sessions.sessions.find(s => s.sessionId === sessionId);
   
   if (session) {
-    session.taskCount = (session.taskCount || 0) + 1;
+    session.taskCount++;
     session.lastUsedAt = new Date().toISOString();
-    saveTempSessions(data);
+    saveTempSessions(sessions);
+    
+    // Note: Task count increments on access, not completion.
+    // This means failed tasks still count toward the limit.
+    // Future improvement: track pending vs completed tasks separately.
+    log({ 
+      event: 'temp_session_task_counted', 
+      sessionId, 
+      taskCount: session.taskCount,
+      maxTasks: session.maxTasks 
+    });
   }
 }
 
@@ -596,6 +695,33 @@ function getDefaultRelationshipPolicy() {
       durationMinutes: 60
     }
   };
+}
+
+// Rate limiting for friend requests
+function checkFriendRequestRateLimit(fromDid) {
+  const requests = loadFriendRequests();
+  if (!requests.incoming) return { allowed: true };
+  
+  const now = Date.now();
+  const oneHourAgo = now - 3600000; // 1 hour
+  
+  // Count requests from this DID in the last hour
+  const recentRequests = requests.incoming.filter(r => 
+    r.from === fromDid && 
+    new Date(r.receivedAt).getTime() > oneHourAgo
+  );
+  
+  const limit = 10; // Max 10 requests per hour per DID
+  
+  if (recentRequests.length >= limit) {
+    return { 
+      allowed: false, 
+      reason: 'rate_limit_exceeded',
+      message: `Too many friend requests from this DID. Limit: ${limit} per hour.`
+    };
+  }
+  
+  return { allowed: true };
 }
 
 // ─── P2P Access Control ──────────────────────────────────────────
@@ -1683,6 +1809,55 @@ async function cmdStart(port) {
       // New order notification - decide whether to accept
       const { orderId, requesterDid, capabilityType, priceAmount, description } = payload;
       
+      // ── Blacklist Check (Order System) ──
+      // Note: Order system only checks blacklist, not friend relationships.
+      // Platform-mediated orders (like Taobao) should allow strangers to place orders.
+      // P2P tasks use full friend system checks via checkP2PAccess().
+      const currentPolicy = loadPolicy();
+      if (currentPolicy.blockedDIDs && currentPolicy.blockedDIDs.includes(requesterDid)) {
+        log({ 
+          event: 'order_rejected_blacklist', 
+          orderId, 
+          requesterDid, 
+          reason: 'did_blocked' 
+        });
+        
+        // Reject via Platform API
+        try {
+          const timestamp = new Date().toISOString();
+          const rejectPayload = { reason: 'DID is blocked' };
+          const signPayload = { did: id.did, timestamp, payload: rejectPayload };
+          const signature = sign(signPayload, id.secretKey);
+          
+          await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/reject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              did: id.did, 
+              timestamp, 
+              signature, 
+              payload: rejectPayload 
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          
+          log({ event: 'order_rejected_api_called', orderId });
+        } catch (e) { 
+          log({ 
+            event: 'order_reject_api_error', 
+            orderId, 
+            error: e.message 
+          }); 
+        }
+        
+        res.json({ 
+          status: 'rejected', 
+          reason: 'did_blocked',
+          message: 'This DID is blocked'
+        });
+        return;
+      }
+      
       // Check capability match
       if (!capTypes.includes(capabilityType)) {
         log({ event: 'order_rejected', orderId, reason: 'capability_mismatch', required: capabilityType, available: capTypes });
@@ -1691,7 +1866,6 @@ async function cmdStart(port) {
       }
 
       // ── Task Mode Check ──
-      const currentPolicy = loadPolicy();
       const taskMode = currentPolicy.taskMode || 'auto';
       
       if (taskMode === 'off') {
@@ -2200,6 +2374,21 @@ async function cmdStart(port) {
       if (!verified.valid) {
         log({ event: 'friend_request_rejected', from: message.from, reason: 'invalid_signature' });
         return { status: 'rejected', error: 'Invalid signature' };
+      }
+      
+      // Check rate limit (ADD THIS)
+      const rateLimit = checkFriendRequestRateLimit(message.from);
+      if (!rateLimit.allowed) {
+        log({ 
+          event: 'friend_request_rate_limited', 
+          from: message.from, 
+          reason: rateLimit.reason 
+        });
+        return { 
+          status: 'rejected', 
+          error: rateLimit.message,
+          code: 'RATE_LIMIT_EXCEEDED'
+        };
       }
       
       // Check if already friends
@@ -4246,9 +4435,10 @@ async function cmdFriendAdd(args) {
     process.exit(1);
   }
   
-  // Validate DID format (basic check)
-  if (!did.startsWith('did:atel:')) {
-    console.error('Invalid DID format. Expected: did:atel:...');
+  // Add validation
+  const validation = validateDID(did);
+  if (!validation.valid) {
+    console.error(`Invalid DID: ${validation.error}`);
     process.exit(1);
   }
   
@@ -4283,6 +4473,13 @@ async function cmdFriendRemove(args) {
   const did = args._[0];
   if (!did) {
     console.error('Usage: atel friend remove <did>');
+    process.exit(1);
+  }
+  
+  // Add validation
+  const validation = validateDID(did);
+  if (!validation.valid) {
+    console.error(`Invalid DID: ${validation.error}`);
     process.exit(1);
   }
   
@@ -4335,6 +4532,13 @@ async function cmdFriendRequest(args) {
     process.exit(1);
   }
   
+  // Add DID validation
+  const validation = validateDID(targetDid);
+  if (!validation.valid) {
+    console.error(`Invalid DID: ${validation.error}`);
+    process.exit(1);
+  }
+  
   const id = requireIdentity();
   
   // Check if already friends
@@ -4354,7 +4558,7 @@ async function cmdFriendRequest(args) {
   }
   
   // Create request
-  const requestId = `freq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const requestId = `freq_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   const messageIdx = rawArgs.indexOf('--message');
   const message = messageIdx >= 0 ? rawArgs[messageIdx + 1] : '';
   
@@ -4372,32 +4576,52 @@ async function cmdFriendRequest(args) {
   // Sign the request
   const signedRequest = createMessage(request, id.secretKey);
   
-  // Send via P2P
+  // Try to send via P2P
+  let sent = false;
+  let error = null;
+  
   try {
     const result = await sendP2PMessage(targetDid, signedRequest);
-    
-    // Save to outgoing
-    if (!requests.outgoing) requests.outgoing = [];
-    requests.outgoing.push({
-      requestId,
-      to: targetDid,
-      message,
-      sentAt: new Date().toISOString(),
-      status: 'pending'
+    sent = true;
+  } catch (err) {
+    error = err.message;
+    log({ 
+      event: 'friend_request_send_failed', 
+      to: targetDid, 
+      requestId, 
+      error: err.message 
     });
-    saveFriendRequests(requests);
-    
-    log({ event: 'friend_request_sent', to: targetDid, requestId });
-    
+  }
+  
+  // Save to outgoing regardless of send result
+  if (!requests.outgoing) requests.outgoing = [];
+  requests.outgoing.push({
+    requestId,
+    to: targetDid,
+    message,
+    sentAt: new Date().toISOString(),
+    status: sent ? 'pending' : 'send_failed',
+    error: error || undefined
+  });
+  saveFriendRequests(requests);
+  
+  log({ event: 'friend_request_created', to: targetDid, requestId, sent });
+  
+  if (sent) {
     console.log(JSON.stringify({ 
       status: 'sent', 
       requestId, 
       to: targetDid,
       message: 'Friend request sent successfully'
     }));
-  } catch (err) {
-    console.error('Failed to send friend request:', err.message);
-    process.exit(1);
+  } else {
+    console.log(JSON.stringify({ 
+      status: 'queued', 
+      requestId, 
+      to: targetDid,
+      message: 'Friend request saved locally. Will retry when target is online.',
+      error: error
+    }));
   }
 }
 
@@ -4586,9 +4810,10 @@ async function cmdTempAllow(args) {
     process.exit(1);
   }
   
-  // Validate DID format
-  if (!did.startsWith('did:atel:')) {
-    console.error('Invalid DID format. Expected: did:atel:...');
+  // Add validation
+  const validation = validateDID(did);
+  if (!validation.valid) {
+    console.error(`Invalid DID: ${validation.error}`);
     process.exit(1);
   }
   
@@ -4673,6 +4898,9 @@ async function cmdTempRevoke(args) {
 }
 
 async function cmdTempList(args) {
+  // Auto-clean expired sessions first
+  autoCleanExpiredTempSessions();
+  
   const data = loadTempSessions();
   const now = Date.now();
   

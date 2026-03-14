@@ -1,0 +1,7 @@
+{
+  "agent_id": "shrimp1",
+  "did": "did:atel:ed25519:H6pBFkkVuDbTec244ySU8J7UMxVUr7jH2ZpGyGXYXiN8",
+  "publicKey": "ef383ce3611ffbf8b0a5b99e611c3762cead0839bddb10b018ce2bd6ffb7f4ad",
+  "secretKey": "e37aef21defc2e3567b45276e30cc0f9d42d5f0a00448d9028dc4988e6f0f979ef383ce3611ffbf8b0a5b99e611c3762cead0839bddb10b018ce2bd6ffb7f4ad",
+  "createdAt": "2026-03-10T12:45:14.703Z"
+}
