@@ -369,6 +369,416 @@ async function verifyTaskSignature(taskRequest, signature, publicKeyBase58) {
   }
 }
 
+// ─── Friend System Data Layer ────────────────────────────────────
+
+const FRIENDS_FILE = resolve(ATEL_DIR, 'friends.json');
+const TEMP_SESSIONS_FILE = resolve(ATEL_DIR, 'temp-sessions.json');
+const FRIEND_REQUESTS_FILE = resolve(ATEL_DIR, 'friend-requests.json');
+
+// Load friends list (returns object with backward compatibility)
+function loadFriends() {
+  if (!existsSync(FRIENDS_FILE)) return { friends: [] };
+  try {
+    const data = JSON.parse(readFileSync(FRIENDS_FILE, 'utf-8'));
+    // Support both old (array) and new (object) formats
+    if (Array.isArray(data)) {
+      return { friends: data };
+    }
+    return data;
+  } catch {
+    return { friends: [] };
+  }
+}
+
+// Save friends to file
+function saveFriends(data) {
+  ensureDir();
+  writeFileSync(FRIENDS_FILE, JSON.stringify(data, null, 2));
+}
+
+// Add friend (idempotent)
+function addFriend(did, options = {}) {
+  const data = loadFriends();
+  
+  // Idempotency check
+  if (data.friends.some(f => f.did === did)) {
+    return false; // Already exists
+  }
+  
+  data.friends.push({
+    did,
+    alias: options.alias || '',
+    status: 'accepted',
+    addedAt: new Date().toISOString(),
+    addedBy: options.addedBy || 'manual',
+    notes: options.notes || ''
+  });
+  
+  saveFriends(data);
+  log({ event: 'friend_added', did, addedBy: options.addedBy });
+  return true;
+}
+
+// Remove friend
+function removeFriend(did) {
+  const data = loadFriends();
+  const before = data.friends.length;
+  data.friends = data.friends.filter(f => f.did !== did);
+  const removed = before > data.friends.length;
+  
+  if (removed) {
+    saveFriends(data);
+    log({ event: 'friend_removed', did });
+  }
+  
+  return removed;
+}
+
+// Check if DID is a friend
+function isFriend(did) {
+  const data = loadFriends();
+  return data.friends.some(f => f.did === did && f.status === 'accepted');
+}
+
+// Load friend requests
+function loadFriendRequests() {
+  if (!existsSync(FRIEND_REQUESTS_FILE)) return { requests: [] };
+  try {
+    const data = JSON.parse(readFileSync(FRIEND_REQUESTS_FILE, 'utf-8'));
+    // Support both old (array) and new (object) formats
+    if (Array.isArray(data)) {
+      return { requests: data };
+    }
+    return data;
+  } catch {
+    return { requests: [] };
+  }
+}
+
+// Save friend requests to file
+function saveFriendRequests(data) {
+  ensureDir();
+  writeFileSync(FRIEND_REQUESTS_FILE, JSON.stringify(data, null, 2));
+}
+
+// Load temporary sessions (returns object with backward compatibility)
+function loadTempSessions() {
+  if (!existsSync(TEMP_SESSIONS_FILE)) return { sessions: [] };
+  try {
+    const data = JSON.parse(readFileSync(TEMP_SESSIONS_FILE, 'utf-8'));
+    // Support both old (array) and new (object) formats
+    if (Array.isArray(data)) {
+      return { sessions: data };
+    }
+    return data;
+  } catch {
+    return { sessions: [] };
+  }
+}
+
+// Save temporary sessions
+function saveTempSessions(data) {
+  ensureDir();
+  writeFileSync(TEMP_SESSIONS_FILE, JSON.stringify(data, null, 2));
+}
+
+// Add temporary session (idempotent)
+function addTempSession(did, options = {}) {
+  const data = loadTempSessions();
+  
+  // Check if active session already exists
+  const now = Date.now();
+  const existing = data.sessions.find(s => 
+    s.did === did && 
+    s.status === 'active' && 
+    new Date(s.expiresAt).getTime() > now
+  );
+  
+  if (existing) {
+    return { created: false, session: existing }; // Already exists
+  }
+  
+  const sessionId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const durationMinutes = options.durationMinutes || 60;
+  const maxTasks = options.maxTasks || 5;
+  
+  const session = {
+    sessionId,
+    did,
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + durationMinutes * 60 * 1000).toISOString(),
+    maxTasks,
+    taskCount: 0,
+    createdBy: options.createdBy || 'manual',
+    notes: options.notes || ''
+  };
+  
+  data.sessions.push(session);
+  saveTempSessions(data);
+  log({ event: 'temp_session_created', did, sessionId, durationMinutes, maxTasks });
+  
+  return { created: true, session };
+}
+
+// Clean expired temporary sessions
+function cleanExpiredTempSessions() {
+  const data = loadTempSessions();
+  const now = Date.now();
+  const before = data.sessions.length;
+  
+  data.sessions = data.sessions.filter(s => {
+    const expired = new Date(s.expiresAt).getTime() <= now;
+    if (expired) {
+      log({ event: 'temp_session_expired', sessionId: s.sessionId, did: s.did });
+    }
+    return !expired;
+  });
+  
+  const removed = before - data.sessions.length;
+  if (removed > 0) {
+    saveTempSessions(data);
+    log({ event: 'temp_sessions_cleaned', count: removed });
+  }
+  
+  return removed;
+}
+
+// Get active temporary session for a DID
+function getActiveTempSession(did) {
+  const data = loadTempSessions();
+  const now = Date.now();
+  
+  // Find active session (not expired)
+  const active = data.sessions.find(s => 
+    s.did === did && 
+    s.status === 'active' && 
+    new Date(s.expiresAt).getTime() > now
+  );
+  
+  return active || null;
+}
+
+// Increment task count for a temporary session
+function incrementTempSessionTaskCount(sessionId) {
+  const data = loadTempSessions();
+  const session = data.sessions.find(s => s.sessionId === sessionId);
+  
+  if (session) {
+    session.taskCount = (session.taskCount || 0) + 1;
+    session.lastUsedAt = new Date().toISOString();
+    saveTempSessions(data);
+  }
+}
+
+// Remove a temporary session
+function removeTempSession(sessionId) {
+  const data = loadTempSessions();
+  const before = data.sessions.length;
+  data.sessions = data.sessions.filter(s => s.sessionId !== sessionId);
+  const removed = before > data.sessions.length;
+  
+  if (removed) {
+    saveTempSessions(data);
+    log({ event: 'temp_session_removed', sessionId });
+  }
+  
+  return removed;
+}
+
+// Get default relationship policy
+function getDefaultRelationshipPolicy() {
+  return {
+    defaultMode: 'friends_only', // 'friends_only' | 'open'
+    openModeRequiresConfirm: true,
+    tempSessionDefaults: {
+      maxTasks: 5,
+      durationMinutes: 60
+    }
+  };
+}
+
+// ─── P2P Access Control ──────────────────────────────────────────
+
+// Check P2P access based on friend relationships
+function checkP2PAccess(from, action, payload, currentPolicy) {
+  // 1. Blacklist check (highest priority)
+  if (currentPolicy.blockedDIDs && currentPolicy.blockedDIDs.length > 0) {
+    if (currentPolicy.blockedDIDs.includes(from)) {
+      log({ 
+        event: 'p2p_access_denied', 
+        from, 
+        action, 
+        reason: 'DID_BLOCKED', 
+        timestamp: new Date().toISOString() 
+      });
+      return { 
+        allowed: false, 
+        reason: 'DID_BLOCKED',
+        message: 'You are blocked by this agent',
+        code: 'BLOCKED'
+      };
+    }
+  }
+  
+  // 2. Get relationship policy
+  const relPolicy = currentPolicy.relationshipPolicy || getDefaultRelationshipPolicy();
+  
+  // 3. Check if friend
+  if (isFriend(from)) {
+    log({ 
+      event: 'p2p_access_granted', 
+      from, 
+      action, 
+      reason: 'FRIEND', 
+      relationship: 'friend',
+      timestamp: new Date().toISOString() 
+    });
+    return { 
+      allowed: true, 
+      reason: 'FRIEND',
+      relationship: 'friend'
+    };
+  }
+  
+  // 4. Check temporary session
+  const tempSession = getActiveTempSession(from);
+  if (tempSession) {
+    // Check if expired (double check)
+    if (Date.now() > new Date(tempSession.expiresAt).getTime()) {
+      removeTempSession(tempSession.sessionId);
+      log({ 
+        event: 'p2p_access_denied', 
+        from, 
+        action, 
+        reason: 'TEMP_SESSION_EXPIRED',
+        sessionId: tempSession.sessionId,
+        timestamp: new Date().toISOString() 
+      });
+      return {
+        allowed: false,
+        reason: 'TEMP_SESSION_EXPIRED',
+        message: 'Your temporary session has expired. Please request a new one.',
+        code: 'TEMP_EXPIRED'
+      };
+    }
+    
+    // Check task limit
+    if (tempSession.taskCount >= tempSession.maxTasks) {
+      log({ 
+        event: 'p2p_access_denied', 
+        from, 
+        action, 
+        reason: 'TEMP_SESSION_LIMIT_REACHED',
+        sessionId: tempSession.sessionId,
+        taskCount: tempSession.taskCount,
+        maxTasks: tempSession.maxTasks,
+        timestamp: new Date().toISOString() 
+      });
+      return {
+        allowed: false,
+        reason: 'TEMP_SESSION_LIMIT_REACHED',
+        message: `Temporary session task limit reached (${tempSession.maxTasks} tasks)`,
+        code: 'TEMP_LIMIT'
+      };
+    }
+    
+    // Increment task count
+    incrementTempSessionTaskCount(tempSession.sessionId);
+    
+    log({ 
+      event: 'p2p_access_granted', 
+      from, 
+      action, 
+      reason: 'TEMP_SESSION',
+      relationship: 'temporary',
+      sessionId: tempSession.sessionId,
+      tasksRemaining: tempSession.maxTasks - tempSession.taskCount - 1,
+      timestamp: new Date().toISOString() 
+    });
+    
+    return { 
+      allowed: true, 
+      reason: 'TEMP_SESSION',
+      relationship: 'temporary',
+      sessionId: tempSession.sessionId,
+      tasksRemaining: tempSession.maxTasks - tempSession.taskCount - 1
+    };
+  }
+  
+  // 5. Check default mode
+  if (relPolicy.defaultMode === 'friends_only') {
+    log({ 
+      event: 'p2p_access_denied', 
+      from, 
+      action, 
+      reason: 'NOT_FRIEND',
+      defaultMode: 'friends_only',
+      timestamp: new Date().toISOString() 
+    });
+    return {
+      allowed: false,
+      reason: 'NOT_FRIEND',
+      message: 'You are not a friend. Please send a friend request first.',
+      hint: 'Send friend request: atel friend request <your-did>',
+      code: 'NOT_FRIEND'
+    };
+  }
+  
+  if (relPolicy.defaultMode === 'open') {
+    // Open mode - check if requires confirmation
+    if (relPolicy.openModeRequiresConfirm) {
+      log({ 
+        event: 'p2p_access_queued', 
+        from, 
+        action, 
+        reason: 'REQUIRES_CONFIRM',
+        defaultMode: 'open',
+        timestamp: new Date().toISOString() 
+      });
+      return {
+        allowed: false,
+        reason: 'REQUIRES_CONFIRM',
+        message: 'Task queued for manual confirmation',
+        queue: true,
+        code: 'CONFIRM_REQUIRED'
+      };
+    }
+    
+    log({ 
+      event: 'p2p_access_granted', 
+      from, 
+      action, 
+      reason: 'OPEN_MODE',
+      relationship: 'stranger',
+      timestamp: new Date().toISOString() 
+    });
+    
+    return { 
+      allowed: true, 
+      reason: 'OPEN_MODE',
+      relationship: 'stranger'
+    };
+  }
+  
+  // 6. Default: deny
+  log({ 
+    event: 'p2p_access_denied', 
+    from, 
+    action, 
+    reason: 'NOT_FRIEND',
+    defaultMode: relPolicy.defaultMode || 'unknown',
+    timestamp: new Date().toISOString() 
+  });
+  
+  return {
+    allowed: false,
+    reason: 'NOT_FRIEND',
+    message: 'Access denied. Please send a friend request first.',
+    code: 'NOT_FRIEND'
+  };
+}
+
 // ─── Unified Trust Score & Level System ──────────────────────────
 // Single source of truth: computeTrustScore() calculates score,
 // trustLevel is derived from score. No independent logic.
@@ -1781,6 +2191,161 @@ async function cmdStart(port) {
   endpoint.onTask(async (message, session) => {
     const payload = message.payload || {};
 
+    // Handle incoming friend request
+    if (message.type === 'friend_request') {
+      const { requestId, message: msg } = message.payload;
+      
+      // Verify signature
+      const verified = verifyMessage(message, parseDID(message.from));
+      if (!verified.valid) {
+        log({ event: 'friend_request_rejected', from: message.from, reason: 'invalid_signature' });
+        return { status: 'rejected', error: 'Invalid signature' };
+      }
+      
+      // Check if already friends
+      if (isFriend(message.from)) {
+        return { status: 'already_friends', message: 'Already friends' };
+      }
+      
+      // Check if blocked
+      const policy = loadPolicy();
+      if (policy.blockedDIDs && policy.blockedDIDs.includes(message.from)) {
+        log({ event: 'friend_request_rejected', from: message.from, reason: 'blocked' });
+        return { status: 'rejected', error: 'Blocked' };
+      }
+      
+      // Save to incoming requests
+      const requests = loadFriendRequests();
+      if (!requests.incoming) requests.incoming = [];
+      
+      // Check for duplicate
+      const existing = requests.incoming.find(r => r.requestId === requestId);
+      if (existing) {
+        return { status: 'already_received', requestId };
+      }
+      
+      requests.incoming.push({
+        requestId,
+        from: message.from,
+        message: msg || '',
+        receivedAt: new Date().toISOString(),
+        signature: message.signature,
+        status: 'pending'
+      });
+      saveFriendRequests(requests);
+      
+      log({ event: 'friend_request_received', from: message.from, requestId });
+      
+      // Check if auto-accept is enabled
+      const relPolicy = policy.relationshipPolicy || getDefaultRelationshipPolicy();
+      if (relPolicy.autoAcceptFriendRequests) {
+        // Auto-accept
+        addFriend(message.from, { 
+          addedBy: 'auto_accept', 
+          alias: '',
+          notes: `Auto-accepted request ${requestId}`
+        });
+        
+        // Update request status
+        const req = requests.incoming.find(r => r.requestId === requestId);
+        if (req) {
+          req.status = 'accepted';
+          req.acceptedAt = new Date().toISOString();
+          saveFriendRequests(requests);
+        }
+        
+        log({ event: 'friend_request_auto_accepted', from: message.from, requestId });
+        
+        return { 
+          status: 'auto_accepted', 
+          requestId,
+          message: 'Friend request auto-accepted'
+        };
+      }
+      
+      return { 
+        status: 'queued', 
+        requestId, 
+        message: 'Friend request queued for approval. Use: atel friend accept ' + requestId 
+      };
+    }
+
+    // Handle friend request acceptance
+    if (message.type === 'friend_accept') {
+      const { requestId } = message.payload;
+      
+      // Verify signature
+      const verified = verifyMessage(message, parseDID(message.from));
+      if (!verified.valid) {
+        log({ event: 'friend_accept_rejected', from: message.from, reason: 'invalid_signature' });
+        return { status: 'rejected', error: 'Invalid signature' };
+      }
+      
+      // Find outgoing request
+      const requests = loadFriendRequests();
+      if (!requests.outgoing) requests.outgoing = [];
+      
+      const request = requests.outgoing.find(r => r.requestId === requestId);
+      if (!request) {
+        log({ event: 'friend_accept_ignored', from: message.from, requestId, reason: 'request_not_found' });
+        return { status: 'error', error: 'Request not found' };
+      }
+      
+      // Update request status
+      request.status = 'accepted';
+      request.acceptedAt = new Date().toISOString();
+      saveFriendRequests(requests);
+      
+      // Add to friends
+      addFriend(message.from, { 
+        addedBy: 'request', 
+        alias: '',
+        notes: `Accepted our request ${requestId}`
+      });
+      
+      log({ event: 'friend_request_accepted_by_peer', from: message.from, requestId });
+      
+      return { 
+        status: 'ok',
+        message: 'Friend added successfully'
+      };
+    }
+
+    // Handle friend request rejection
+    if (message.type === 'friend_reject') {
+      const { requestId, reason } = message.payload;
+      
+      // Verify signature
+      const verified = verifyMessage(message, parseDID(message.from));
+      if (!verified.valid) {
+        log({ event: 'friend_reject_ignored', from: message.from, reason: 'invalid_signature' });
+        return { status: 'rejected', error: 'Invalid signature' };
+      }
+      
+      // Find outgoing request
+      const requests = loadFriendRequests();
+      if (!requests.outgoing) requests.outgoing = [];
+      
+      const request = requests.outgoing.find(r => r.requestId === requestId);
+      if (!request) {
+        log({ event: 'friend_reject_ignored', from: message.from, requestId, reason: 'request_not_found' });
+        return { status: 'error', error: 'Request not found' };
+      }
+      
+      // Update request status
+      request.status = 'rejected';
+      request.rejectedAt = new Date().toISOString();
+      request.reason = reason || '';
+      saveFriendRequests(requests);
+      
+      log({ event: 'friend_request_rejected_by_peer', from: message.from, requestId, reason });
+      
+      return { 
+        status: 'ok',
+        message: 'Friend request was rejected'
+      };
+    }
+
     // Ignore task-result messages (these are responses, not new tasks)
     if (message.type === 'task-result' || payload.status === 'completed' || payload.status === 'failed') {
       log({ event: 'result_received', type: 'task-result', from: message.from, taskId: payload.taskId, status: payload.status, proof: payload.proof || null, anchor: payload.anchor || null, execution: payload.execution || null, result: payload.result || null, timestamp: new Date().toISOString() });
@@ -1862,6 +2427,79 @@ async function cmdStart(port) {
       }
     }
 
+    // ── Friend System Access Check ──
+    const accessCheck = checkP2PAccess(message.from, action, payload, currentPolicy);
+    
+    if (!accessCheck.allowed) {
+      // Generate rejection proof
+      const rp = generateRejectionProof(
+        message.from, 
+        action, 
+        accessCheck.message || accessCheck.reason, 
+        accessCheck.code || 'ACCESS_DENIED'
+      );
+      
+      log({ 
+        event: 'p2p_task_rejected', 
+        from: message.from, 
+        action, 
+        reason: accessCheck.reason,
+        code: accessCheck.code,
+        timestamp: new Date().toISOString() 
+      });
+      
+      // If queue is requested (open mode + requires confirm)
+      if (accessCheck.queue) {
+        const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const pending = loadPending();
+        pending[taskId] = {
+          source: 'p2p',
+          from: message.from,
+          action,
+          payload,
+          price: 0,
+          status: 'pending_confirm',
+          receivedAt: new Date().toISOString(),
+          encrypted: !!session?.encrypted,
+          reason: 'open_mode_requires_confirm'
+        };
+        savePending(pending);
+        
+        log({ 
+          event: 'task_queued', 
+          taskId, 
+          from: message.from, 
+          action, 
+          reason: 'open_mode_requires_confirm',
+          timestamp: new Date().toISOString() 
+        });
+        
+        return { 
+          status: 'queued', 
+          taskId, 
+          message: 'Task queued for manual confirmation. Use: atel approve ' + taskId 
+        };
+      }
+      
+      return { 
+        status: 'rejected', 
+        error: accessCheck.message || 'Access denied', 
+        code: accessCheck.code,
+        hint: accessCheck.hint,
+        proof: rp 
+      };
+    }
+    
+    // Log successful access
+    log({ 
+      event: 'p2p_access_granted', 
+      from: message.from, 
+      action, 
+      relationship: accessCheck.relationship,
+      reason: accessCheck.reason,
+      timestamp: new Date().toISOString() 
+    });
+
     // ── Task Mode Check (P2P) ──
     const taskMode = currentPolicy.taskMode || 'auto';
     
@@ -1906,9 +2544,19 @@ async function cmdStart(port) {
       }
     } catch {}
 
-    pendingTasks[taskId] = { from: message.from, action, payload, senderEndpoint, senderCandidates, encrypted: !!session?.encrypted, acceptedAt: new Date().toISOString() };
+    pendingTasks[taskId] = { 
+      from: message.from, 
+      action, 
+      payload, 
+      senderEndpoint, 
+      senderCandidates, 
+      encrypted: !!session?.encrypted, 
+      acceptedAt: new Date().toISOString(),
+      relationship: accessCheck.relationship,
+      sessionId: accessCheck.sessionId
+    };
     saveTasks(pendingTasks);
-    log({ event: 'task_accepted', taskId, from: message.from, action, encrypted: !!session?.encrypted, timestamp: new Date().toISOString() });
+    log({ event: 'task_accepted', taskId, from: message.from, action, encrypted: !!session?.encrypted, relationship: accessCheck.relationship, timestamp: new Date().toISOString() });
 
     // Forward to executor or echo
     if (EXECUTOR_URL) {
@@ -3589,6 +4237,502 @@ const _origCmdReject = async (orderId) => {
   console.log(JSON.stringify(data, null, 2));
 };
 
+// ─── Friend Commands ─────────────────────────────────────────────
+
+async function cmdFriendAdd(args) {
+  const did = args._[0];
+  if (!did) {
+    console.error('Usage: atel friend add <did> [--alias "name"] [--notes "text"]');
+    process.exit(1);
+  }
+  
+  // Validate DID format (basic check)
+  if (!did.startsWith('did:atel:')) {
+    console.error('Invalid DID format. Expected: did:atel:...');
+    process.exit(1);
+  }
+  
+  const aliasIdx = rawArgs.indexOf('--alias');
+  const notesIdx = rawArgs.indexOf('--notes');
+  
+  const options = {
+    alias: aliasIdx >= 0 ? rawArgs[aliasIdx + 1] : '',
+    notes: notesIdx >= 0 ? rawArgs[notesIdx + 1] : '',
+    addedBy: 'manual'
+  };
+  
+  const added = addFriend(did, options);
+  
+  if (added) {
+    console.log(JSON.stringify({ 
+      status: 'ok', 
+      message: 'Friend added successfully',
+      did,
+      alias: options.alias
+    }));
+  } else {
+    console.log(JSON.stringify({ 
+      status: 'already_exists', 
+      message: 'Already friends with this DID',
+      did
+    }));
+  }
+}
+
+async function cmdFriendRemove(args) {
+  const did = args._[0];
+  if (!did) {
+    console.error('Usage: atel friend remove <did>');
+    process.exit(1);
+  }
+  
+  const removed = removeFriend(did);
+  
+  if (removed) {
+    console.log(JSON.stringify({ 
+      status: 'ok', 
+      message: 'Friend removed successfully',
+      did
+    }));
+  } else {
+    console.log(JSON.stringify({ 
+      status: 'not_found', 
+      message: 'DID not found in friends list',
+      did
+    }));
+  }
+}
+
+async function cmdFriendList(args) {
+  const data = loadFriends();
+  
+  const jsonFlag = rawArgs.includes('--json');
+  
+  if (jsonFlag) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  
+  if (data.friends.length === 0) {
+    console.log('No friends yet.');
+    return;
+  }
+  
+  console.log(`\nFriends (${data.friends.length}):\n`);
+  data.friends.forEach((f, i) => {
+    console.log(`${i + 1}. ${f.did}`);
+    if (f.alias) console.log(`   Alias: ${f.alias}`);
+    console.log(`   Added: ${f.addedAt} (${f.addedBy})`);
+    if (f.notes) console.log(`   Notes: ${f.notes}`);
+    console.log('');
+  });
+}
+
+async function cmdFriendRequest(args) {
+  const targetDid = args._[0];
+  if (!targetDid) {
+    console.error('Usage: atel friend request <target-did> [--message "text"]');
+    process.exit(1);
+  }
+  
+  const id = requireIdentity();
+  
+  // Check if already friends
+  if (isFriend(targetDid)) {
+    console.error('Already friends with this DID');
+    process.exit(1);
+  }
+  
+  // Check if already sent request
+  const requests = loadFriendRequests();
+  const existing = requests.outgoing && requests.outgoing.find(r => 
+    r.to === targetDid && r.status === 'pending'
+  );
+  if (existing) {
+    console.error('Friend request already sent');
+    process.exit(1);
+  }
+  
+  // Create request
+  const requestId = `freq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const messageIdx = rawArgs.indexOf('--message');
+  const message = messageIdx >= 0 ? rawArgs[messageIdx + 1] : '';
+  
+  const request = {
+    type: 'friend_request',
+    from: id.did,
+    to: targetDid,
+    payload: {
+      requestId,
+      message,
+      timestamp: new Date().toISOString()
+    }
+  };
+  
+  // Sign the request
+  const signedRequest = createMessage(request, id.secretKey);
+  
+  // Send via P2P
+  try {
+    const result = await sendP2PMessage(targetDid, signedRequest);
+    
+    // Save to outgoing
+    if (!requests.outgoing) requests.outgoing = [];
+    requests.outgoing.push({
+      requestId,
+      to: targetDid,
+      message,
+      sentAt: new Date().toISOString(),
+      status: 'pending'
+    });
+    saveFriendRequests(requests);
+    
+    log({ event: 'friend_request_sent', to: targetDid, requestId });
+    
+    console.log(JSON.stringify({ 
+      status: 'sent', 
+      requestId, 
+      to: targetDid,
+      message: 'Friend request sent successfully'
+    }));
+  } catch (err) {
+    console.error('Failed to send friend request:', err.message);
+    process.exit(1);
+  }
+}
+
+async function cmdFriendAccept(args) {
+  const requestId = args._[0];
+  if (!requestId) {
+    console.error('Usage: atel friend accept <request-id>');
+    process.exit(1);
+  }
+  
+  const requests = loadFriendRequests();
+  if (!requests.incoming) requests.incoming = [];
+  
+  const request = requests.incoming.find(r => r.requestId === requestId);
+  if (!request) {
+    console.error('Request not found');
+    process.exit(1);
+  }
+  
+  if (request.status !== 'pending') {
+    console.error(`Request already ${request.status}`);
+    process.exit(1);
+  }
+  
+  const id = requireIdentity();
+  
+  // Add to friends
+  addFriend(request.from, { 
+    addedBy: 'request', 
+    alias: '',
+    notes: `Accepted request ${requestId}`
+  });
+  
+  // Update request status
+  request.status = 'accepted';
+  request.acceptedAt = new Date().toISOString();
+  saveFriendRequests(requests);
+  
+  // Send acceptance message
+  const acceptMsg = {
+    type: 'friend_accept',
+    from: id.did,
+    to: request.from,
+    payload: {
+      requestId,
+      timestamp: new Date().toISOString()
+    }
+  };
+  
+  const signedMsg = createMessage(acceptMsg, id.secretKey);
+  
+  try {
+    await sendP2PMessage(request.from, signedMsg);
+    log({ event: 'friend_request_accepted', from: request.from, requestId });
+    
+    console.log(JSON.stringify({ 
+      status: 'ok', 
+      message: 'Friend request accepted',
+      requestId,
+      friend: request.from
+    }));
+  } catch (err) {
+    console.error('Failed to send acceptance:', err.message);
+    // Friend already added, so don't fail completely
+    console.log(JSON.stringify({ 
+      status: 'partial', 
+      message: 'Friend added locally, but failed to notify sender',
+      requestId
+    }));
+  }
+}
+
+async function cmdFriendReject(args) {
+  const requestId = args._[0];
+  if (!requestId) {
+    console.error('Usage: atel friend reject <request-id> [--reason "text"]');
+    process.exit(1);
+  }
+  
+  const requests = loadFriendRequests();
+  if (!requests.incoming) requests.incoming = [];
+  
+  const request = requests.incoming.find(r => r.requestId === requestId);
+  if (!request) {
+    console.error('Request not found');
+    process.exit(1);
+  }
+  
+  if (request.status !== 'pending') {
+    console.error(`Request already ${request.status}`);
+    process.exit(1);
+  }
+  
+  const id = requireIdentity();
+  const reasonIdx = rawArgs.indexOf('--reason');
+  const reason = reasonIdx >= 0 ? rawArgs[reasonIdx + 1] : '';
+  
+  // Update request status
+  request.status = 'rejected';
+  request.rejectedAt = new Date().toISOString();
+  request.reason = reason;
+  saveFriendRequests(requests);
+  
+  // Send rejection message
+  const rejectMsg = {
+    type: 'friend_reject',
+    from: id.did,
+    to: request.from,
+    payload: {
+      requestId,
+      reason,
+      timestamp: new Date().toISOString()
+    }
+  };
+  
+  const signedMsg = createMessage(rejectMsg, id.secretKey);
+  
+  try {
+    await sendP2PMessage(request.from, signedMsg);
+    log({ event: 'friend_request_rejected', from: request.from, requestId, reason });
+    
+    console.log(JSON.stringify({ 
+      status: 'ok', 
+      message: 'Friend request rejected',
+      requestId
+    }));
+  } catch (err) {
+    console.error('Failed to send rejection:', err.message);
+    console.log(JSON.stringify({ 
+      status: 'partial', 
+      message: 'Request marked as rejected locally, but failed to notify sender',
+      requestId
+    }));
+  }
+}
+
+async function cmdFriendPending(args) {
+  const requests = loadFriendRequests();
+  
+  const incoming = (requests.incoming || []).filter(r => r.status === 'pending');
+  const outgoing = (requests.outgoing || []).filter(r => r.status === 'pending');
+  
+  const jsonFlag = rawArgs.includes('--json');
+  
+  if (jsonFlag) {
+    console.log(JSON.stringify({ incoming, outgoing }, null, 2));
+    return;
+  }
+  
+  if (incoming.length === 0 && outgoing.length === 0) {
+    console.log('No pending friend requests.');
+    return;
+  }
+  
+  if (incoming.length > 0) {
+    console.log(`\nIncoming Requests (${incoming.length}):\n`);
+    incoming.forEach((r, i) => {
+      console.log(`${i + 1}. Request ID: ${r.requestId}`);
+      console.log(`   From: ${r.from}`);
+      if (r.message) console.log(`   Message: ${r.message}`);
+      console.log(`   Received: ${r.receivedAt}`);
+      console.log(`   Accept: atel friend accept ${r.requestId}`);
+      console.log(`   Reject: atel friend reject ${r.requestId}`);
+      console.log('');
+    });
+  }
+  
+  if (outgoing.length > 0) {
+    console.log(`\nOutgoing Requests (${outgoing.length}):\n`);
+    outgoing.forEach((r, i) => {
+      console.log(`${i + 1}. Request ID: ${r.requestId}`);
+      console.log(`   To: ${r.to}`);
+      if (r.message) console.log(`   Message: ${r.message}`);
+      console.log(`   Sent: ${r.sentAt}`);
+      console.log('');
+    });
+  }
+}
+
+// ─── Temporary Session Commands ──────────────────────────────────
+
+async function cmdTempAllow(args) {
+  const did = args._[0];
+  if (!did) {
+    console.error('Usage: atel temp-session allow <did> [--duration 60] [--max-tasks 10] [--reason "text"]');
+    process.exit(1);
+  }
+  
+  // Validate DID format
+  if (!did.startsWith('did:atel:')) {
+    console.error('Invalid DID format. Expected: did:atel:...');
+    process.exit(1);
+  }
+  
+  // Check if already a friend
+  if (isFriend(did)) {
+    console.log(JSON.stringify({ 
+      status: 'unnecessary', 
+      message: 'This DID is already a friend. Temporary session not needed.',
+      did
+    }));
+    return;
+  }
+  
+  // Check if already has active session
+  const existing = getActiveTempSession(did);
+  if (existing) {
+    console.log(JSON.stringify({ 
+      status: 'already_exists', 
+      message: 'Active temporary session already exists',
+      sessionId: existing.sessionId,
+      expiresAt: existing.expiresAt,
+      tasksRemaining: existing.maxTasks - existing.taskCount
+    }));
+    return;
+  }
+  
+  const options = {
+    durationMinutes: parseInt(args.duration) || 60,
+    maxTasks: parseInt(args['max-tasks']) || 10,
+    reason: args.reason || ''
+  };
+  
+  // Validate options
+  if (options.durationMinutes < 1 || options.durationMinutes > 1440) {
+    console.error('Duration must be between 1 and 1440 minutes (24 hours)');
+    process.exit(1);
+  }
+  
+  if (options.maxTasks < 1 || options.maxTasks > 100) {
+    console.error('Max tasks must be between 1 and 100');
+    process.exit(1);
+  }
+  
+  const result = addTempSession(did, options);
+  const sessionId = result.created ? result.session.sessionId : result.session.sessionId;
+  
+  const expiresAt = new Date(Date.now() + options.durationMinutes * 60000).toISOString();
+  
+  console.log(JSON.stringify({ 
+    status: 'ok', 
+    message: 'Temporary session granted',
+    sessionId,
+    did,
+    durationMinutes: options.durationMinutes,
+    maxTasks: options.maxTasks,
+    expiresAt
+  }));
+}
+
+async function cmdTempRevoke(args) {
+  const sessionId = args._[0];
+  if (!sessionId) {
+    console.error('Usage: atel temp-session revoke <session-id>');
+    process.exit(1);
+  }
+  
+  const removed = removeTempSession(sessionId);
+  
+  if (removed) {
+    console.log(JSON.stringify({ 
+      status: 'ok', 
+      message: 'Temporary session revoked',
+      sessionId
+    }));
+  } else {
+    console.log(JSON.stringify({ 
+      status: 'not_found', 
+      message: 'Session not found',
+      sessionId
+    }));
+  }
+}
+
+async function cmdTempList(args) {
+  const data = loadTempSessions();
+  const now = Date.now();
+  
+  let sessions = data.sessions || [];
+  
+  // Filter active sessions unless --all is specified
+  if (!args.all) {
+    sessions = sessions.filter(s => 
+      s.status === 'active' && 
+      new Date(s.expiresAt).getTime() > now
+    );
+  }
+  
+  if (args.json) {
+    console.log(JSON.stringify({ sessions }, null, 2));
+    return;
+  }
+  
+  if (sessions.length === 0) {
+    if (args.all) {
+      console.log('No temporary sessions.');
+    } else {
+      console.log('No active temporary sessions.');
+    }
+    return;
+  }
+  
+  console.log(`\nTemporary Sessions (${sessions.length}):\n`);
+  sessions.forEach((s, i) => {
+    const expired = new Date(s.expiresAt).getTime() <= now;
+    const status = expired ? 'EXPIRED' : 'ACTIVE';
+    
+    console.log(`${i + 1}. Session ID: ${s.sessionId}`);
+    console.log(`   DID: ${s.did}`);
+    console.log(`   Status: ${status}`);
+    console.log(`   Granted: ${s.createdAt}`);
+    console.log(`   Expires: ${s.expiresAt}`);
+    console.log(`   Tasks: ${s.taskCount}/${s.maxTasks}`);
+    if (s.notes) console.log(`   Reason: ${s.notes}`);
+    
+    if (!expired) {
+      const remaining = Math.floor((new Date(s.expiresAt).getTime() - now) / 60000);
+      console.log(`   Time remaining: ${remaining} minutes`);
+      console.log(`   Revoke: atel temp-session revoke ${s.sessionId}`);
+    }
+    
+    console.log('');
+  });
+}
+
+async function cmdTempClean(args) {
+  const removed = cleanExpiredTempSessions();
+  
+  console.log(JSON.stringify({ 
+    status: 'ok', 
+    message: `Cleaned ${removed} expired session(s)`,
+    count: removed
+  }));
+}
+
 // ─── Main ────────────────────────────────────────────────────────
 
 const [,, cmd, ...rawArgs] = process.argv;
@@ -3650,6 +4794,55 @@ const commands = {
   mode: () => cmdMode(args[0]),
   pending: () => cmdPending(),
   approve: () => cmdApprove(args[0]),
+  // Temporary Sessions
+  'temp-session': () => {
+    const subCmd = args[0];
+    const parsedArgs = {
+      _: args.slice(1),
+      duration: rawArgs.includes('--duration') ? rawArgs[rawArgs.indexOf('--duration') + 1] : undefined,
+      'max-tasks': rawArgs.includes('--max-tasks') ? rawArgs[rawArgs.indexOf('--max-tasks') + 1] : undefined,
+      reason: rawArgs.includes('--reason') ? rawArgs[rawArgs.indexOf('--reason') + 1] : undefined,
+      json: rawArgs.includes('--json'),
+      all: rawArgs.includes('--all')
+    };
+    
+    if (subCmd === 'allow') return cmdTempAllow(parsedArgs);
+    if (subCmd === 'revoke') return cmdTempRevoke(parsedArgs);
+    if (subCmd === 'list') return cmdTempList(parsedArgs);
+    if (subCmd === 'clean') return cmdTempClean(parsedArgs);
+    
+    console.error('Usage: atel temp-session <allow|revoke|list|clean>');
+    console.error('  allow <did> [--duration 60] [--max-tasks 10] [--reason "text"]');
+    console.error('  revoke <session-id>');
+    console.error('  list [--json] [--all]');
+    console.error('  clean');
+    process.exit(1);
+  },
+  // Friend System
+  friend: () => {
+    const subCmd = args[0];
+    const parsedArgs = {
+      _: args.slice(1)
+    };
+    
+    if (subCmd === 'add') return cmdFriendAdd(parsedArgs);
+    if (subCmd === 'remove') return cmdFriendRemove(parsedArgs);
+    if (subCmd === 'list') return cmdFriendList(parsedArgs);
+    if (subCmd === 'request') return cmdFriendRequest(parsedArgs);
+    if (subCmd === 'accept') return cmdFriendAccept(parsedArgs);
+    if (subCmd === 'reject') return cmdFriendReject(parsedArgs);
+    if (subCmd === 'pending') return cmdFriendPending(parsedArgs);
+    
+    console.error('Usage: atel friend <add|remove|list|request|accept|reject|pending>');
+    console.error('  add <did> [--alias "name"] [--notes "text"]');
+    console.error('  remove <did>');
+    console.error('  list [--json]');
+    console.error('  request <target-did> [--message "text"]');
+    console.error('  accept <request-id>');
+    console.error('  reject <request-id> [--reason "text"]');
+    console.error('  pending [--json]');
+    process.exit(1);
+  },
 };
 
 if (!cmd || !commands[cmd]) {
@@ -3720,6 +4913,28 @@ Task Mode Commands:
   mode [auto|confirm|off]              Get or set task acceptance mode
   pending                              List tasks awaiting manual confirmation
   approve <taskId|orderId>             Approve a pending task (forward to executor)
+
+Temporary Session Commands:
+  temp-session allow <did>             Grant temporary access to a DID
+    [--duration 60]                    Duration in minutes (1-1440, default: 60)
+    [--max-tasks 10]                   Max tasks allowed (1-100, default: 10)
+    [--reason "text"]                  Optional reason for the session
+  temp-session revoke <session-id>     Revoke a temporary session
+  temp-session list [--json] [--all]   List temporary sessions (active by default)
+  temp-session clean                   Remove expired temporary sessions
+
+Friend Commands:
+  friend add <did>                     Add a friend manually
+    [--alias "name"]                   Optional friendly name
+    [--notes "text"]                   Optional notes
+  friend remove <did>                  Remove a friend
+  friend list [--json]                 List all friends
+  friend request <target-did>          Send a friend request
+    [--message "text"]                 Optional message
+  friend accept <request-id>           Accept an incoming friend request
+  friend reject <request-id>           Reject an incoming friend request
+    [--reason "text"]                  Optional rejection reason
+  friend pending [--json]              List pending friend requests (incoming & outgoing)
 
 Environment:
   ATEL_DIR                Identity directory (default: .atel)
