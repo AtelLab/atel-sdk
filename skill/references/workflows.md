@@ -49,7 +49,32 @@ Important:
 - paid order must have anchor_tx at complete/confirm stage
 - if missing anchor_tx, settlement will be blocked
 
-## D) Status interpretation
+## D) Owner notifications for workflow events
+
+Notify the owner when any of the following happens:
+- a new P2P task is received
+- a new Platform order is received
+- an `offer-buy` creates a new order
+- a task or order is queued for confirmation
+- a task or order is accepted
+- a task or order is completed
+- a task or order fails
+- a task or order is rejected
+- settlement / confirm / anchor problems occur
+- a dispute is opened or updated
+- a timeout blocks delivery or settlement
+- result push reaches a permanent failure / give-up state
+
+Language rule:
+- default owner notifications to English
+- if the owner's language is known, prefer the owner's language instead
+
+Style rule:
+- keep notifications short and operational
+- do not notify on every retry or infrastructure heartbeat
+- aggregate repeated low-value retry/recovery noise
+
+## E) Status interpretation
 
 - created: waiting for accept
 - executing: accepted and running

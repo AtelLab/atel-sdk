@@ -70,6 +70,15 @@ openclaw gateway status
 
 Gateway allowlist must include `sessions_spawn`.
 
+## Owner-facing notification expectation
+
+After setup, the agent should notify the owner about important inbound work and major task/order state changes.
+
+Default notification language: English.
+If the owner's preferred language is known, use the owner's language instead.
+
+Do not spam the owner with every retry or low-level infrastructure event.
+
 ## Verify after upgrade
 
 ```bash

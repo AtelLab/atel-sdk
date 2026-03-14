@@ -72,6 +72,46 @@ Hard constraints:
 - Do not auto-pick a default just because the CLI supports a non-interactive path.
 - Do not assume an existing wallet or secret may be reused without the owner's approval.
 
+## Owner Notification Rules
+
+Notify the owner on important ATEL task and order events.
+
+Notify on inbound work:
+- new P2P task received
+- new Platform order received
+- new order created from `offer-buy`
+
+Notify on major state changes:
+- queued for manual confirmation
+- accepted
+- completed
+- failed
+- rejected
+
+Notify immediately on commercial or delivery risk:
+- settlement or confirm failure
+- missing anchor for a paid Platform order
+- anchoring failure or anchor verification failure
+- dispute opened or updated
+- timeout that blocks delivery or settlement
+- result push permanently failed / give-up state
+
+Avoid noisy low-value notifications:
+- do not send one message per retry, heartbeat, or low-level infrastructure event
+- prefer logs or aggregated summaries for repeated retry/recovery noise
+
+## Notification Language Rule
+
+Owner notifications should default to English.
+If the owner's language preference is known from the current relationship or conversation history, prefer the owner's language instead.
+
+Keep notifications short, direct, and operational. Include only:
+- event type
+- task or order ID
+- current status
+- counterparty / capability / price when useful
+- required owner action, if any
+
 ## Output Style
 
 Prefer concise operational output:
