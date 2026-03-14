@@ -235,3 +235,59 @@ export class NonceTracker {
     return this.seen.size;
   }
 }
+
+// ─── Rich Media Message Types ────────────────────────────────────
+
+/** Inline image (Base64) */
+export interface InlineImage {
+  kind: 'inline';
+  name: string;
+  mimeType: string;
+  size: number;
+  data: string; // data URL
+}
+
+/** Attachment image (Platform URL) */
+export interface AttachmentImage {
+  kind: 'attachment';
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  hash: string;
+  downloadUrl: string;
+  urlExpiresAt: string;
+  metadata?: {
+    width?: number;
+    height?: number;
+  };
+}
+
+/** Image content (inline or attachment) */
+export type ImageContent = InlineImage | AttachmentImage;
+
+/** File/Audio/Video attachment */
+export interface Attachment {
+  kind: 'file' | 'audio' | 'video';
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  hash: string;
+  downloadUrl: string;
+  urlExpiresAt: string;
+  metadata?: {
+    duration?: number;
+    width?: number;
+    height?: number;
+  };
+}
+
+/** Extended payload with rich media support */
+export interface RichMediaPayload {
+  text?: string;
+  prompt?: string;
+  images?: ImageContent[];
+  attachments?: Attachment[];
+  [key: string]: any;
+}

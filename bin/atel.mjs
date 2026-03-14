@@ -58,6 +58,7 @@ import {
 } from '@lawrenceliang-btc/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
 import { initializeOllama, getOllamaStatus } from './ollama-manager.mjs';
+import { parseAttachmentFlags, processAttachments } from './atel-attachment-helpers.mjs';
 
 const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
@@ -3393,6 +3394,32 @@ async function cmdTask(target, taskJson) {
   delete payload._risk;
   const force = payload._force || false;
   delete payload._force;
+
+  // Parse attachment flags
+  const attachmentFlags = parseAttachmentFlags(rawArgs);
+  const hasAttachments = attachmentFlags.images.length > 0 || 
+                         attachmentFlags.files.length > 0 || 
+                         attachmentFlags.audios.length > 0 || 
+                         attachmentFlags.videos.length > 0;
+
+  // Process attachments if any
+  if (hasAttachments) {
+    try {
+      const taskId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const processed = await processAttachments(attachmentFlags, id.did, taskId);
+      
+      // Add to payload
+      if (processed.images.length > 0) {
+        payload.images = processed.images;
+      }
+      if (processed.attachments.length > 0) {
+        payload.attachments = processed.attachments;
+      }
+    } catch (error) {
+      console.error(`Attachment processing failed: ${error.message}`);
+      process.exit(1);
+    }
+  }
 
   let remoteEndpoint = target;
   let remoteDid;
