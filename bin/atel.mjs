@@ -26,7 +26,7 @@
  *   atel order <did> <cap> <price>      Create a trade order
  *   atel accept <orderId>               Accept an order (executor)
  *   atel reject <orderId>               Reject an order (executor)
- *   atel escrow <orderId>               Freeze funds for order (requester)
+ *   atel escrow <orderId>               Lock USDC on-chain (approve + createEscrow + confirm)
  *   atel complete <orderId> [taskId]    Mark order complete (executor)
  *   atel confirm <orderId>              Confirm delivery + settle (requester)
  *   atel rate <orderId> <1-5> [comment] Rate the other party
@@ -4224,100 +4224,139 @@ async function cmdReject(orderId) {
 }
 
 async function cmdEscrow(orderId) {
-  // Pure on-chain escrow: requester calls approve + createEscrow, then confirms
   if (!orderId) { console.error('Usage: atel escrow <orderId>'); process.exit(1); }
   const id = requireIdentity();
 
-  // 1. Get order info (need escrow details)
+  // 1. Get order info
   const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
   const orderInfo = await res.json();
   if (!res.ok) { console.error('Failed to get order:', orderInfo.error); process.exit(1); }
 
   if (orderInfo.status !== 'pending_escrow') {
-    console.error(`Order is in '${orderInfo.status}' status, not 'pending_escrow'. Escrow may already be created.`);
-    console.log(JSON.stringify(orderInfo, null, 2));
+    if (['milestone_review', 'executing', 'settled'].includes(orderInfo.status)) {
+      console.log(`Order already past escrow stage (status: ${orderInfo.status}).`);
+    } else {
+      console.error(`Order status '${orderInfo.status}' — expected 'pending_escrow'.`);
+    }
     return;
   }
 
   const priceAmount = orderInfo.priceAmount || orderInfo.price_amount;
-  if (!priceAmount || priceAmount <= 0) {
-    console.error('Free order — no escrow needed.');
-    return;
-  }
+  if (!priceAmount || priceAmount <= 0) { console.error('Free order — no escrow needed.'); return; }
 
-  // 2. Determine chain and get wallet key
+  // 2. Chain + wallet setup
   const chain = orderInfo.chain || 'base';
   const privateKey = getChainPrivateKey(chain);
   if (!privateKey) {
-    console.error(`No private key for chain '${chain}'. Set ATEL_${chain.toUpperCase()}_PRIVATE_KEY environment variable.`);
+    console.error(`No private key for chain '${chain}'. Set ATEL_${chain.toUpperCase()}_PRIVATE_KEY`);
     process.exit(1);
   }
 
-  // 3. Get chain config
   const chainConfigs = {
     base: { rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', usdcDecimals: 6, escrowManager: process.env.ATEL_ESCROW_MANAGER || '0x1B114F2cF814C278b94D736b8bcACD4B4F3EA52d' },
     bsc: { rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', usdcDecimals: 18, escrowManager: process.env.ATEL_ESCROW_MANAGER_BSC || '0x6D07741c7bB47B635Eaca593f8cf97C5a78447Ec' }
   };
   const cfg = chainConfigs[chain];
-  if (!cfg) { console.error(`Unsupported chain for escrow: ${chain}`); process.exit(1); }
+  if (!cfg) { console.error(`Unsupported chain: ${chain}`); process.exit(1); }
 
   try {
     const { ethers } = await import('ethers');
     const provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
     const wallet = new ethers.Wallet(privateKey, provider);
 
-    const amount = ethers.parseUnits(String(priceAmount), cfg.usdcDecimals);
-
-    // 4. Approve USDC
-    console.log(`[Escrow] Approving ${priceAmount} USDC for EscrowManager on ${chain}...`);
-    const usdc = new ethers.Contract(cfg.usdcAddress, [
-      'function approve(address spender, uint256 amount) returns (bool)',
-      'function allowance(address owner, address spender) view returns (uint256)'
-    ], wallet);
-
-    const currentAllowance = await usdc.allowance(wallet.address, cfg.escrowManager);
-    if (currentAllowance < amount) {
-      const approveTx = await usdc.approve(cfg.escrowManager, amount);
-      console.log(`[Escrow] Approve tx: ${approveTx.hash}`);
-      await approveTx.wait();
-      console.log(`[Escrow] Approve confirmed.`);
-    } else {
-      console.log(`[Escrow] Sufficient allowance already set.`);
+    // 3. Get operator signature from Platform (also validates requester identity)
+    console.log(`Requesting escrow parameters from Platform...`);
+    let sigData;
+    try {
+      sigData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-sig`, { requesterAddress: wallet.address });
+    } catch (e) {
+      console.error(`Platform rejected escrow request: ${e.message}`);
+      process.exit(1);
     }
 
-    // 5. Call createEscrow
-    // createEscrow(bytes32 orderId, address executor, address token, uint256 amount, uint256 fee, uint256 nonce, bytes operatorSig)
-    // For now, we need the operator signature from Platform — request it
-    console.log(`[Escrow] Creating escrow for order ${orderId}...`);
+    const amount = BigInt(sigData.amount);
+    const fee = BigInt(sigData.platformFee);
 
-    // Get operator signature from Platform
-    const sigData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-sig`, {});
-
-    const orderIdHash = ethers.keccak256(ethers.toUtf8Bytes(orderId));
-    const escrowContract = new ethers.Contract(cfg.escrowManager, [
-      'function createEscrow(bytes32 orderId, address executor, address token, uint256 amount, uint256 fee, uint256 nonce, bytes memory operatorSig) external'
+    // 4. Check balances
+    const usdc = new ethers.Contract(cfg.usdcAddress, [
+      'function approve(address,uint256) returns (bool)',
+      'function allowance(address,address) view returns (uint256)',
+      'function balanceOf(address) view returns (uint256)',
     ], wallet);
 
-    const commission = ethers.parseUnits(String(priceAmount * 0.05), cfg.usdcDecimals); // 5% default fee
-    const tx = await escrowContract.createEscrow(
-      orderIdHash,
-      sigData.executorAddress,
-      cfg.usdcAddress,
-      amount,
-      commission,
-      sigData.nonce,
-      sigData.operatorSignature
-    );
-    console.log(`[Escrow] CreateEscrow tx: ${tx.hash}`);
-    await tx.wait();
-    console.log(`[Escrow] CreateEscrow confirmed!`);
+    const usdcBal = await usdc.balanceOf(wallet.address);
+    if (usdcBal < amount) {
+      console.error(`Insufficient USDC: need ${ethers.formatUnits(amount, cfg.usdcDecimals)}, have ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)}`);
+      process.exit(1);
+    }
+    console.log(`USDC balance: ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)} ✓`);
 
-    // 6. Confirm to Platform
-    const confirmData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-confirm`, { txHash: tx.hash });
-    console.log(JSON.stringify(confirmData, null, 2));
+    const ethBal = await provider.getBalance(wallet.address);
+    if (ethBal < ethers.parseEther('0.0001')) {
+      console.error(`Insufficient gas: ${ethers.formatEther(ethBal)} ETH/BNB`);
+      process.exit(1);
+    }
+
+    // 5. Approve USDC (idempotent: skip if allowance sufficient)
+    const currentAllowance = await usdc.allowance(wallet.address, cfg.escrowManager);
+    if (currentAllowance >= amount) {
+      console.log(`Allowance sufficient (${ethers.formatUnits(currentAllowance, cfg.usdcDecimals)}), skipping approve.`);
+    } else {
+      // If there's a stale small allowance, reset to 0 first (some USDC implementations require this)
+      if (currentAllowance > 0n) {
+        console.log(`Resetting stale allowance...`);
+        const resetTx = await usdc.approve(cfg.escrowManager, 0n);
+        await resetTx.wait();
+      }
+      console.log(`Approving ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC...`);
+      const approveTx = await usdc.approve(cfg.escrowManager, amount);
+      console.log(`  Approve tx: ${approveTx.hash}`);
+      await approveTx.wait();
+      console.log(`  Confirmed ✓`);
+    }
+
+    // 6. createEscrow
+    console.log(`Creating escrow (locking ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC)...`);
+    const escrowContract = new ethers.Contract(cfg.escrowManager, [
+      'function createEscrow(bytes32,address,address,uint256,uint256,bytes32,bytes) external'
+    ], wallet);
+
+    let createTxHash;
+    try {
+      const tx = await escrowContract.createEscrow(
+        sigData.orderId,
+        sigData.executorAddress,
+        cfg.usdcAddress,
+        amount,
+        fee,
+        sigData.nonce,
+        sigData.operatorSig
+      );
+      console.log(`  Escrow tx: ${tx.hash}`);
+      const receipt = await tx.wait();
+      console.log(`  Confirmed ✓ (gas: ${receipt.gasUsed})`);
+      createTxHash = tx.hash;
+    } catch (e) {
+      console.error(`\n❌ createEscrow failed: ${e.reason || e.message}`);
+      console.log(`\nUSDC approval is active. You can safely retry:`);
+      console.log(`  atel escrow ${orderId}`);
+      process.exit(1);
+    }
+
+    // 7. Confirm to Platform
+    console.log(`Confirming with Platform...`);
+    try {
+      const confirmData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-confirm`, { txHash: createTxHash });
+      console.log(`  ✓ Order status: ${confirmData.status}`);
+      console.log(`\nNext: run "atel milestone-status ${orderId}" to view milestone plan`);
+    } catch (e) {
+      console.error(`\n⚠️ Escrow is on-chain but Platform confirmation failed: ${e.message}`);
+      console.log(`Retry with: atel escrow ${orderId}`);
+      console.log(`(createEscrow won't re-execute, only confirmation will be retried)`);
+    }
 
   } catch (error) {
-    console.error(`[Escrow] Failed: ${error.message}`);
+    console.error(`Failed: ${error.message}`);
     process.exit(1);
   }
 }
@@ -4639,39 +4678,107 @@ async function cmdMilestoneFeedback(orderId) {
 }
 
 async function cmdMilestoneSubmit(orderId, indexStr) {
-  if (!orderId || indexStr === undefined) { console.error('Usage: atel milestone-submit <orderId> <index> --result "结果描述"'); process.exit(1); }
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-submit <orderId> <index> --result "结果描述"');
+    console.error('       atel milestone-submit <orderId> <index> --result ./file.pdf [--hash 0x...]');
+    process.exit(1);
+  }
   const resultIdx = rawArgs.findIndex(a => a === '--result');
-  const result = resultIdx >= 0 ? rawArgs.slice(resultIdx + 1).join(' ') : '';
-  if (!result) { console.error('--result is required'); process.exit(1); }
+  const hashIdx = rawArgs.findIndex(a => a === '--hash');
+
+  if (resultIdx < 0) { console.error('--result is required (text or file path)'); process.exit(1); }
+
+  // Collect result text (everything after --result until next flag or end)
+  let resultParts = [];
+  for (let i = resultIdx + 1; i < rawArgs.length; i++) {
+    if (rawArgs[i].startsWith('--')) break;
+    resultParts.push(rawArgs[i]);
+  }
+  const result = resultParts.join(' ');
+  if (!result) { console.error('--result value cannot be empty'); process.exit(1); }
+
+  // Compute resultHash: deterministic, reproducible (no timestamp)
+  let resultHash;
+  if (hashIdx >= 0 && rawArgs[hashIdx + 1]) {
+    // User-provided hash
+    resultHash = rawArgs[hashIdx + 1];
+  } else if (existsSync(result)) {
+    // File path: hash = keccak256(file content)
+    const { ethers } = await import('ethers');
+    const fileContent = readFileSync(result);
+    resultHash = ethers.keccak256(fileContent);
+    console.log(`File detected: ${result} (${fileContent.length} bytes)`);
+  } else {
+    // Text: hash = keccak256(text) — stable, reproducible
+    const { ethers } = await import('ethers');
+    resultHash = ethers.keccak256(ethers.toUtf8Bytes(result));
+  }
+
+  console.log(`Submitting M${indexStr}: "${result.slice(0, 60)}${result.length > 60 ? '...' : ''}"`);
+  console.log(`Hash: ${resultHash}`);
 
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/submit`, {
     resultSummary: result,
-    resultHash: 'sha256:' + Buffer.from(result).toString('hex').slice(0, 40),
+    resultHash,
   });
   console.log(JSON.stringify(data, null, 2));
 }
 
 async function cmdMilestoneVerify(orderId, indexStr) {
-  if (!orderId || indexStr === undefined) { console.error('Usage: atel milestone-verify <orderId> <index> [--pass | --reject "原因"]'); process.exit(1); }
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-verify <orderId> <index> --pass');
+    console.error('       atel milestone-verify <orderId> <index> --reject "原因"');
+    process.exit(1);
+  }
   const pass = rawArgs.includes('--pass');
   const rejectIdx = rawArgs.findIndex(a => a === '--reject');
-  const rejectReason = rejectIdx >= 0 ? rawArgs.slice(rejectIdx + 1).join(' ') : '';
+  const hasReject = rejectIdx >= 0;
 
-  if (!pass && !rejectReason) {
-    console.error('Usage: atel milestone-verify <orderId> <index> --pass');
-    console.error('       atel milestone-verify <orderId> <index> --reject "不满意的原因"');
+  // Strict mutual exclusion (audit fix #5)
+  if (pass && hasReject) {
+    console.error('Error: --pass and --reject are mutually exclusive');
+    process.exit(1);
+  }
+  if (!pass && !hasReject) {
+    console.error('Error: must specify --pass or --reject "reason"');
     process.exit(1);
   }
 
-  const payload = pass ? { passed: true } : { passed: false, rejectReason };
-  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, payload);
-  console.log(JSON.stringify(data, null, 2));
+  if (hasReject) {
+    const rejectReason = rawArgs.slice(rejectIdx + 1).join(' ');
+    if (!rejectReason) {
+      console.error('Error: --reject requires a reason');
+      process.exit(1);
+    }
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: false, rejectReason });
+    console.log(JSON.stringify(data, null, 2));
+  } else {
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: true });
+    console.log(JSON.stringify(data, null, 2));
+  }
 }
 
 async function cmdMilestoneArbitrate(orderId, indexStr) {
   if (!orderId || indexStr === undefined) { console.error('Usage: atel milestone-arbitrate <orderId> <index>'); process.exit(1); }
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/arbitrate`, {});
   console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdChainRecords(orderId) {
+  if (!orderId) { console.error('Usage: atel chain-records <orderId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/chain-records`);
+  const data = await resp.json();
+  if (!data.records || data.records.length === 0) {
+    console.log(`No chain records for order ${orderId}.`);
+    return;
+  }
+  console.log(`\nOrder: ${orderId}  Chain records: ${data.count}\n`);
+  for (const r of data.records) {
+    const icon = r.status === 'confirmed' ? '✅' : '⏳';
+    const tx = r.txHash ? r.txHash.slice(0, 18) + '...' : '(pending)';
+    console.log(`  ${icon} ${r.operationType.padEnd(20)} ${r.status.padEnd(10)} ${tx}`);
+  }
+  console.log('');
 }
 
 // ─── Dispute Commands ────────────────────────────────────────────
@@ -5858,6 +5965,7 @@ const commands = {
   'milestone-submit': () => cmdMilestoneSubmit(args[0], args[1]),
   'milestone-verify': () => cmdMilestoneVerify(args[0], args[1]),
   'milestone-arbitrate': () => cmdMilestoneArbitrate(args[0], args[1]),
+  'chain-records': () => cmdChainRecords(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
