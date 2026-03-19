@@ -4169,7 +4169,7 @@ async function cmdDeposit(amount, channel) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-async function cmdWithdraw(amount, channel, address) {
+async function cmdWithdraw(amount, address, chain) {
   if (!amount || isNaN(amount) || !address) {
     console.error('Usage: atel withdraw <amount> <your_wallet_address> [chain]');
     console.error('  amount:  USDC amount to withdraw');
@@ -4178,7 +4178,7 @@ async function cmdWithdraw(amount, channel, address) {
     process.exit(1);
   }
   // Smart wallet withdrawal (new flow)
-  const chain = channel || 'base'; // channel param reused as chain
+  chain = chain || 'base';
   try {
     const data = await signedFetch('POST', '/trade/v1/wallet/withdraw', {
       amount: parseFloat(amount),
