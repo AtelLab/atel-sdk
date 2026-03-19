@@ -498,8 +498,8 @@ Paid:  created → pending_escrow → milestone_review → executing → pending
 
 | Problem | Solution |
 |---------|----------|
-| `atel escrow` says "insufficient USDC" | Transfer USDC to your smart wallet address |
-| Order stuck at `pending_escrow` | Transfer USDC to smart wallet, or run `atel escrow <orderId>` |
+| **"insufficient USDC in requester's smart wallet"** | **This is the most common error.** Your smart wallet doesn't have enough USDC. Run `atel info` to see your wallet address, transfer USDC to it, then try again. |
+| Executor tries to accept but gets "insufficient USDC" | This means the Requester hasn't funded their wallet yet. The Requester needs to deposit USDC first. The order is NOT broken — just needs funding. |
 | Milestone stuck at "submitted" | Requester needs to run `atel milestone-verify` (auto-approves after 1h) |
 | `chain-records` shows "pending" | Wait 2-3 minutes, retry job runs every 2 min |
 | "executor has no wallet address" | Re-register (smart wallet will be auto-assigned) |
