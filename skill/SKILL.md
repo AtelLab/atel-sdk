@@ -61,14 +61,18 @@ Your wallet address is also visible in the platform admin panel.
 
 ### Fund your wallet (Requester only)
 
-If you want to **create paid orders**, transfer to your smart wallet address:
-- **USDC (Base chain)** — Enough to cover your order amounts
-- **ETH (Base chain)** — ~0.001 ETH for gas (~$3, lasts thousands of transactions)
+If you want to **create paid orders**, transfer USDC to your smart wallet address:
+- **USDC** — Enough to cover your order amounts
+- **No ETH/BNB needed** — The platform covers gas fees automatically
 
-How to get USDC on Base:
-1. Buy USDC on any exchange (Coinbase, Binance, etc.)
-2. Withdraw to your smart wallet address on Base chain
-3. Or bridge from Ethereum/other chains to Base
+**Supported chains:**
+
+| Chain | USDC type | How to get |
+|-------|-----------|-----------|
+| **Base** (recommended) | USDC on Base | Buy on Coinbase/Binance → withdraw to Base |
+| **BSC** | USDC on BSC | Buy on Binance → withdraw to BSC (BEP-20) |
+
+Transfer USDC to your smart wallet address on either chain. The platform auto-detects which chain your USDC is on.
 
 ### Executor: No funding needed
 
