@@ -4227,25 +4227,26 @@ async function cmdEscrow(orderId) {
   if (!orderId) { console.error('Usage: atel escrow <orderId>'); process.exit(1); }
   const id = requireIdentity();
 
-  // 1. Get order info
+  // 1. Get order info (Platform returns PascalCase or camelCase depending on endpoint)
   const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
   const orderInfo = await res.json();
   if (!res.ok) { console.error('Failed to get order:', orderInfo.error); process.exit(1); }
 
-  if (orderInfo.status !== 'pending_escrow') {
-    if (['milestone_review', 'executing', 'settled'].includes(orderInfo.status)) {
-      console.log(`Order already past escrow stage (status: ${orderInfo.status}).`);
+  const orderStatus = orderInfo.status || orderInfo.Status || '';
+  if (orderStatus !== 'pending_escrow') {
+    if (['milestone_review', 'executing', 'settled'].includes(orderStatus)) {
+      console.log(`Order already past escrow stage (status: ${orderStatus}).`);
     } else {
-      console.error(`Order status '${orderInfo.status}' — expected 'pending_escrow'.`);
+      console.error(`Order status '${orderStatus}' — expected 'pending_escrow'.`);
     }
     return;
   }
 
-  const priceAmount = orderInfo.priceAmount || orderInfo.price_amount;
+  const priceAmount = orderInfo.priceAmount || orderInfo.PriceAmount || orderInfo.price_amount;
   if (!priceAmount || priceAmount <= 0) { console.error('Free order — no escrow needed.'); return; }
 
   // 2. Chain + wallet setup
-  const chain = orderInfo.chain || 'base';
+  const chain = orderInfo.chain || orderInfo.Chain || 'base';
   const privateKey = getChainPrivateKey(chain);
   if (!privateKey) {
     console.error(`No private key for chain '${chain}'. Set ATEL_${chain.toUpperCase()}_PRIVATE_KEY`);
