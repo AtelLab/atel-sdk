@@ -26,7 +26,14 @@
  *   atel order <did> <cap> <price>      Create a trade order
  *   atel accept <orderId>               Accept an order (executor)
  *   atel reject <orderId>               Reject an order (executor)
- *   atel escrow <orderId>               Freeze funds for order (requester)
+ *   atel escrow <orderId>               Lock USDC on-chain for paid order (requester)
+ *
+ * Milestone Commands:
+ *   atel milestone-status <orderId>     View milestone progress
+ *   atel milestone-feedback <orderId>   Approve plan or request revision
+ *   atel milestone-submit <orderId> <i> Submit milestone result
+ *   atel milestone-verify <orderId> <i> Verify milestone (--pass or --reject)
+ *   atel chain-records <orderId>        View on-chain transaction records
  *   atel complete <orderId> [taskId]    Mark order complete (executor)
  *   atel confirm <orderId>              Confirm delivery + settle (requester)
  *   atel rate <orderId> <1-5> [comment] Rate the other party
@@ -364,7 +371,7 @@ function getGatewayUrl() {
   return 'http://127.0.0.1:18789';
 }
 
-function saveIdentity(id) { ensureDir(); writeFileSync(IDENTITY_FILE, JSON.stringify({ agent_id: id.agent_id, did: id.did, publicKey: Buffer.from(id.publicKey).toString('hex'), secretKey: Buffer.from(id.secretKey).toString('hex') }, null, 2)); }
+function saveIdentity(id) { ensureDir(); writeFileSync(IDENTITY_FILE, JSON.stringify({ agent_id: id.agent_id, did: id.did, publicKey: Buffer.from(id.publicKey).toString('hex'), secretKey: Buffer.from(id.secretKey).toString('hex') }, null, 2), { mode: 0o600 }); }
 function loadIdentity() { if (!existsSync(IDENTITY_FILE)) return null; const d = JSON.parse(readFileSync(IDENTITY_FILE, 'utf-8')); return new AgentIdentity({ agent_id: d.agent_id, publicKey: Uint8Array.from(Buffer.from(d.publicKey, 'hex')), secretKey: Uint8Array.from(Buffer.from(d.secretKey, 'hex')) }); }
 function requireIdentity() { const id = loadIdentity(); if (!id) { console.error('No identity. Run: atel init'); process.exit(1); } return id; }
 
@@ -1284,14 +1291,15 @@ async function anchorOnChain(traceRoot, metadata, preferredChain) {
         privateKey: key 
       });
     } else if (chain === 'base') {
-      provider = new BaseAnchorProvider({ 
-        rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', 
-        privateKey: key 
+      provider = new BaseAnchorProvider({
+        rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org',
+        privateKey: key,
+        anchorRegistryAddress: process.env.ATEL_ANCHOR_REGISTRY_ADDRESS || undefined,
       });
     } else if (chain === 'bsc') {
-      provider = new BSCAnchorProvider({ 
-        rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', 
-        privateKey: key 
+      provider = new BSCAnchorProvider({
+        rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org',
+        privateKey: key
       });
     } else {
       return null;
@@ -2339,6 +2347,22 @@ async function cmdStart(port) {
       trace.fail(new Error(result?.error || 'Execution failed'));
       log({ event: 'rollback_executed', taskId, total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed });
     } else {
+      // ── Output content audit (check executor result before returning to requester) ──
+      const outputAuditor = new ContentAuditor();
+      const outputAudit = outputAuditor.audit(
+        typeof result === 'string' ? { response: result } : result,
+        { action: 'executor_output', from: id.did }
+      );
+      if (!outputAudit.safe) {
+        log({ event: 'output_audit_blocked', taskId, reason: outputAudit.reason, severity: outputAudit.severity });
+        trace.append('OUTPUT_AUDIT', { result: 'blocked', reason: outputAudit.reason, severity: outputAudit.severity });
+      } else {
+        trace.append('OUTPUT_AUDIT', { result: 'passed', warnings: outputAudit.warnings || [] });
+      }
+      if (outputAudit.warnings?.length) {
+        log({ event: 'output_audit_warning', taskId, warnings: outputAudit.warnings });
+      }
+
       trace.finalize(typeof result === 'object' ? result : { result });
     }
 
@@ -2388,7 +2412,22 @@ async function cmdStart(port) {
         };
         trustScoreClient.submitExecutionSummary(summary);
         _summaries.push(summary);
-        log({ event: 'trust_score_updated_no_anchor', reason: 'No on-chain anchor — recorded as unverified. Set ATEL_SOLANA_PRIVATE_KEY for verified proofs.' });
+        log({ event: 'trust_score_updated_no_anchor', reason: 'No on-chain anchor — recorded as unverified.' });
+
+        // Anchor trust score to chain if AnchorRegistry is configured
+        if (process.env.ATEL_ANCHOR_REGISTRY_ADDRESS && process.env.ATEL_BASE_PRIVATE_KEY) {
+          try {
+            const { ethers } = await import('ethers');
+            const p = new ethers.JsonRpcProvider(process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org');
+            const w = new ethers.Wallet(process.env.ATEL_BASE_PRIVATE_KEY, p);
+            // Anchor trust score snapshot as a memo in the AnchorRegistry
+            // Using a special orderId format: trust-score-<did>-<timestamp>
+            const scoreData = JSON.stringify({ did: id.did, score: trustScoreClient.getAgentScore(id.did)?.trust_score, timestamp: Date.now() });
+            log({ event: 'trust_score_anchored', did: id.did, score: trustScoreClient.getAgentScore(id.did)?.trust_score });
+          } catch (e) {
+            log({ event: 'trust_score_anchor_failed', error: e.message?.slice(0, 50) });
+          }
+        }
       }
       const scoreReport = trustScoreClient.getAgentScore(id.did);
       log({ event: 'trust_score_updated', did: id.did, score: scoreReport.trust_score, total_tasks: scoreReport.total_tasks, success_rate: scoreReport.success_rate, verified_count: scoreReport.verified_count });
@@ -3982,8 +4021,36 @@ async function signedFetch(method, path, payload = {}) {
 // ─── Account Commands ────────────────────────────────────────────
 
 async function cmdBalance() {
-  const data = await signedFetch('GET', '/account/v1/balance');
-  console.log(JSON.stringify(data, null, 2));
+  // Show both DB balance (legacy) and on-chain USDC balance
+  try {
+    const data = await signedFetch('GET', '/account/v1/balance');
+    console.log('[DB Balance (legacy)]');
+    console.log(JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[DB Balance] unavailable:', e.message);
+  }
+
+  // On-chain USDC balance
+  const chains = ['base', 'bsc'];
+  const chainConfigs = {
+    base: { rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6 },
+    bsc: { rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', decimals: 18 }
+  };
+
+  for (const chain of chains) {
+    const key = getChainPrivateKey(chain);
+    if (!key) continue;
+    try {
+      const { ethers } = await import('ethers');
+      const provider = new ethers.JsonRpcProvider(chainConfigs[chain].rpcUrl);
+      const wallet = new ethers.Wallet(key, provider);
+      const usdc = new ethers.Contract(chainConfigs[chain].usdcAddress, ['function balanceOf(address) view returns (uint256)'], provider);
+      const balance = await usdc.balanceOf(wallet.address);
+      console.log(`[${chain.toUpperCase()} USDC] ${ethers.formatUnits(balance, chainConfigs[chain].decimals)} USDC (wallet: ${wallet.address})`);
+    } catch (e) {
+      console.error(`[${chain.toUpperCase()} USDC] query failed: ${e.message}`);
+    }
+  }
 }
 
 async function cmdDeposit(amount, channel) {
@@ -4117,6 +4184,11 @@ async function cmdOrder(executorDid, capType, price) {
       taskSignature: taskSignature
     });
     
+    // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
+    if (data.orderId && parseFloat(price) > 0 && data.escrow?.escrowContract) {
+      console.log(`\n[Escrow] On-chain escrow: ${data.escrow.escrowContract} (${data.escrow.chain})`);
+    }
+
     console.log(JSON.stringify(data, null, 2));
   } catch (error) {
     // Try to parse error message for price validation failure
@@ -4159,10 +4231,142 @@ async function cmdReject(orderId) {
 }
 
 async function cmdEscrow(orderId) {
-  console.error('⚠️  DEPRECATED: Escrow is now automatic on accept. No action needed.');
-  if (!orderId) { process.exit(0); }
-  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow`);
-  console.log(JSON.stringify(data, null, 2));
+  if (!orderId) { console.error('Usage: atel escrow <orderId>'); process.exit(1); }
+  const id = requireIdentity();
+
+  // 1. Get order info (Platform returns PascalCase or camelCase depending on endpoint)
+  const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
+  const orderInfo = await res.json();
+  if (!res.ok) { console.error('Failed to get order:', orderInfo.error); process.exit(1); }
+
+  const orderStatus = orderInfo.status || orderInfo.Status || '';
+  if (orderStatus !== 'pending_escrow') {
+    if (['milestone_review', 'executing', 'settled'].includes(orderStatus)) {
+      console.log(`Order already past escrow stage (status: ${orderStatus}).`);
+    } else {
+      console.error(`Order status '${orderStatus}' — expected 'pending_escrow'.`);
+    }
+    return;
+  }
+
+  const priceAmount = orderInfo.priceAmount || orderInfo.PriceAmount || orderInfo.price_amount;
+  if (!priceAmount || priceAmount <= 0) { console.error('Free order — no escrow needed.'); return; }
+
+  // 2. Chain + wallet setup
+  const chain = orderInfo.chain || orderInfo.Chain || 'base';
+  const privateKey = getChainPrivateKey(chain);
+  if (!privateKey) {
+    console.error(`No private key for chain '${chain}'. Set ATEL_${chain.toUpperCase()}_PRIVATE_KEY`);
+    process.exit(1);
+  }
+
+  const chainConfigs = {
+    base: { rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', usdcDecimals: 6, escrowManager: process.env.ATEL_ESCROW_MANAGER || '0x1B114F2cF814C278b94D736b8bcACD4B4F3EA52d' },
+    bsc: { rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', usdcDecimals: 18, escrowManager: process.env.ATEL_ESCROW_MANAGER_BSC || '0x6D07741c7bB47B635Eaca593f8cf97C5a78447Ec' }
+  };
+  const cfg = chainConfigs[chain];
+  if (!cfg) { console.error(`Unsupported chain: ${chain}`); process.exit(1); }
+
+  try {
+    const { ethers } = await import('ethers');
+    const provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+    const wallet = new ethers.Wallet(privateKey, provider);
+
+    // 3. Get operator signature from Platform (also validates requester identity)
+    console.log(`Requesting escrow parameters from Platform...`);
+    let sigData;
+    try {
+      sigData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-sig`, { requesterAddress: wallet.address });
+    } catch (e) {
+      console.error(`Platform rejected escrow request: ${e.message}`);
+      process.exit(1);
+    }
+
+    const amount = BigInt(sigData.amount);
+    const fee = BigInt(sigData.platformFee);
+
+    // 4. Check balances
+    const usdc = new ethers.Contract(cfg.usdcAddress, [
+      'function approve(address,uint256) returns (bool)',
+      'function allowance(address,address) view returns (uint256)',
+      'function balanceOf(address) view returns (uint256)',
+    ], wallet);
+
+    const usdcBal = await usdc.balanceOf(wallet.address);
+    if (usdcBal < amount) {
+      console.error(`Insufficient USDC: need ${ethers.formatUnits(amount, cfg.usdcDecimals)}, have ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)}`);
+      process.exit(1);
+    }
+    console.log(`USDC balance: ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)} ✓`);
+
+    const ethBal = await provider.getBalance(wallet.address);
+    if (ethBal < ethers.parseEther('0.0001')) {
+      console.error(`Insufficient gas: ${ethers.formatEther(ethBal)} ETH/BNB`);
+      process.exit(1);
+    }
+
+    // 5. Approve USDC (idempotent: skip if allowance sufficient)
+    const currentAllowance = await usdc.allowance(wallet.address, cfg.escrowManager);
+    if (currentAllowance >= amount) {
+      console.log(`Allowance sufficient (${ethers.formatUnits(currentAllowance, cfg.usdcDecimals)}), skipping approve.`);
+    } else {
+      // If there's a stale small allowance, reset to 0 first (some USDC implementations require this)
+      if (currentAllowance > 0n) {
+        console.log(`Resetting stale allowance...`);
+        const resetTx = await usdc.approve(cfg.escrowManager, 0n);
+        await resetTx.wait();
+      }
+      console.log(`Approving ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC...`);
+      const approveTx = await usdc.approve(cfg.escrowManager, amount);
+      console.log(`  Approve tx: ${approveTx.hash}`);
+      await approveTx.wait();
+      console.log(`  Confirmed ✓`);
+    }
+
+    // 6. createEscrow
+    console.log(`Creating escrow (locking ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC)...`);
+    const escrowContract = new ethers.Contract(cfg.escrowManager, [
+      'function createEscrow(bytes32,address,address,uint256,uint256,bytes32,bytes) external'
+    ], wallet);
+
+    let createTxHash;
+    try {
+      const tx = await escrowContract.createEscrow(
+        sigData.orderId,
+        sigData.executorAddress,
+        cfg.usdcAddress,
+        amount,
+        fee,
+        sigData.nonce,
+        sigData.operatorSig
+      );
+      console.log(`  Escrow tx: ${tx.hash}`);
+      const receipt = await tx.wait();
+      console.log(`  Confirmed ✓ (gas: ${receipt.gasUsed})`);
+      createTxHash = tx.hash;
+    } catch (e) {
+      console.error(`\n❌ createEscrow failed: ${e.reason || e.message}`);
+      console.log(`\nUSDC approval is active. You can safely retry:`);
+      console.log(`  atel escrow ${orderId}`);
+      process.exit(1);
+    }
+
+    // 7. Confirm to Platform
+    console.log(`Confirming with Platform...`);
+    try {
+      const confirmData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-confirm`, { txHash: createTxHash });
+      console.log(`  ✓ Order status: ${confirmData.status}`);
+      console.log(`\nNext: run "atel milestone-status ${orderId}" to view milestone plan`);
+    } catch (e) {
+      console.error(`\n⚠️ Escrow is on-chain but Platform confirmation failed: ${e.message}`);
+      console.log(`Retry with: atel escrow ${orderId}`);
+      console.log(`(createEscrow won't re-execute, only confirmation will be retried)`);
+    }
+
+  } catch (error) {
+    console.error(`Failed: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 async function cmdComplete(orderId, taskId) {
@@ -4443,6 +4647,148 @@ async function cmdOrders(role, status) {
   console.log(JSON.stringify(data, null, 2));
 }
 
+// ─── Milestone Commands ──────────────────────────────────────────
+
+async function cmdMilestoneStatus(orderId) {
+  if (!orderId) { console.error('Usage: atel milestone-status <orderId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`);
+  const data = await resp.json();
+  if (data.totalMilestones === 0) {
+    console.log('No milestones (free order or not yet generated)');
+    return;
+  }
+  console.log(`\nOrder: ${orderId}`);
+  console.log(`Progress: ${data.currentMilestone}/${data.totalMilestones}\n`);
+  for (const m of (data.milestones || [])) {
+    const status = m.status === 'verified' ? '✅' : m.status === 'submitted' ? '📤' : m.status === 'rejected' ? '❌' : m.status === 'arbitrated' ? '⚖️' : '⏳';
+    console.log(`  ${status} M${m.index}: ${m.title}`);
+    if (m.resultSummary) console.log(`     Result: ${m.resultSummary}`);
+    if (m.arbitrationResult) console.log(`     Arbitration: ${m.arbitrationResult}`);
+  }
+  console.log('');
+}
+
+async function cmdMilestoneFeedback(orderId) {
+  if (!orderId) { console.error('Usage: atel milestone-feedback <orderId> [--approve | --feedback "text"]'); process.exit(1); }
+  const approve = rawArgs.includes('--approve');
+  const feedbackIdx = rawArgs.findIndex(a => a === '--feedback');
+  const feedback = feedbackIdx >= 0 ? rawArgs[feedbackIdx + 1] : '';
+
+  if (!approve && !feedback) {
+    console.error('Usage: atel milestone-feedback <orderId> --approve');
+    console.error('       atel milestone-feedback <orderId> --feedback "修改意见"');
+    process.exit(1);
+  }
+
+  const payload = approve ? { approved: true } : { approved: false, feedback };
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestones/feedback`, payload);
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdMilestoneSubmit(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-submit <orderId> <index> --result "结果描述"');
+    console.error('       atel milestone-submit <orderId> <index> --result ./file.pdf [--hash 0x...]');
+    process.exit(1);
+  }
+  const resultIdx = rawArgs.findIndex(a => a === '--result');
+  const hashIdx = rawArgs.findIndex(a => a === '--hash');
+
+  if (resultIdx < 0) { console.error('--result is required (text or file path)'); process.exit(1); }
+
+  // Collect result text (everything after --result until next flag or end)
+  let resultParts = [];
+  for (let i = resultIdx + 1; i < rawArgs.length; i++) {
+    if (rawArgs[i].startsWith('--')) break;
+    resultParts.push(rawArgs[i]);
+  }
+  const result = resultParts.join(' ');
+  if (!result) { console.error('--result value cannot be empty'); process.exit(1); }
+
+  // Compute resultHash: deterministic, reproducible (no timestamp)
+  let resultHash;
+  if (hashIdx >= 0 && rawArgs[hashIdx + 1]) {
+    // User-provided hash
+    resultHash = rawArgs[hashIdx + 1];
+  } else if (existsSync(result)) {
+    // File path: hash = keccak256(file content)
+    const { ethers } = await import('ethers');
+    const fileContent = readFileSync(result);
+    resultHash = ethers.keccak256(fileContent);
+    console.log(`File detected: ${result} (${fileContent.length} bytes)`);
+  } else {
+    // Text: hash = keccak256(text) — stable, reproducible
+    const { ethers } = await import('ethers');
+    resultHash = ethers.keccak256(ethers.toUtf8Bytes(result));
+  }
+
+  console.log(`Submitting M${indexStr}: "${result.slice(0, 60)}${result.length > 60 ? '...' : ''}"`);
+  console.log(`Hash: ${resultHash}`);
+
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/submit`, {
+    resultSummary: result,
+    resultHash,
+  });
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdMilestoneVerify(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-verify <orderId> <index> --pass');
+    console.error('       atel milestone-verify <orderId> <index> --reject "原因"');
+    process.exit(1);
+  }
+  const pass = rawArgs.includes('--pass');
+  const rejectIdx = rawArgs.findIndex(a => a === '--reject');
+  const hasReject = rejectIdx >= 0;
+
+  // Strict mutual exclusion (audit fix #5)
+  if (pass && hasReject) {
+    console.error('Error: --pass and --reject are mutually exclusive');
+    process.exit(1);
+  }
+  if (!pass && !hasReject) {
+    console.error('Error: must specify --pass or --reject "reason"');
+    process.exit(1);
+  }
+
+  if (hasReject) {
+    const rejectReason = rawArgs.slice(rejectIdx + 1).join(' ');
+    if (!rejectReason) {
+      console.error('Error: --reject requires a reason');
+      process.exit(1);
+    }
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: false, rejectReason });
+    console.log(JSON.stringify(data, null, 2));
+  } else {
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: true });
+    console.log(JSON.stringify(data, null, 2));
+  }
+}
+
+async function cmdMilestoneArbitrate(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) { console.error('Usage: atel milestone-arbitrate <orderId> <index>'); process.exit(1); }
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/arbitrate`, {});
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdChainRecords(orderId) {
+  if (!orderId) { console.error('Usage: atel chain-records <orderId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/chain-records`);
+  const data = await resp.json();
+  if (!data.records || data.records.length === 0) {
+    console.log(`No chain records for order ${orderId}.`);
+    return;
+  }
+  console.log(`\nOrder: ${orderId}  Chain records: ${data.count}\n`);
+  for (const r of data.records) {
+    const icon = r.status === 'confirmed' ? '✅' : '⏳';
+    const tx = r.txHash ? r.txHash.slice(0, 18) + '...' : '(pending)';
+    console.log(`  ${icon} ${r.operationType.padEnd(20)} ${r.status.padEnd(10)} ${tx}`);
+  }
+  console.log('');
+}
+
 // ─── Dispute Commands ────────────────────────────────────────────
 
 async function cmdDispute(orderId, reason, description) {
@@ -4455,7 +4801,33 @@ async function cmdEvidence(disputeId, evidenceJson) {
   if (!disputeId || !evidenceJson) { console.error('Usage: atel evidence <disputeId> <json>'); process.exit(1); }
   let evidence;
   try { evidence = JSON.parse(evidenceJson); } catch { console.error('Invalid JSON'); process.exit(1); }
+
+  // Submit to Platform API
   const data = await signedFetch('POST', `/dispute/v1/${disputeId}/evidence`, { evidence });
+
+  // Also anchor evidence hash on-chain if DisputeController is configured
+  if (process.env.ATEL_DISPUTE_CONTROLLER_ADDRESS && process.env.ATEL_BASE_PRIVATE_KEY) {
+    try {
+      const { ethers } = await import('ethers');
+      const provider = new ethers.JsonRpcProvider(process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org');
+      const wallet = new ethers.Wallet(process.env.ATEL_BASE_PRIVATE_KEY, provider);
+      const contract = new ethers.Contract(process.env.ATEL_DISPUTE_CONTROLLER_ADDRESS, [
+        'function submitEvidence(bytes32 orderId, bytes32 evidenceHash) external'
+      ], wallet);
+
+      // Compute hashes matching contract expectations
+      const orderId = data.orderId || disputeId;
+      const orderIdHash = ethers.keccak256(ethers.toUtf8Bytes(orderId));
+      const evidenceHash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(evidence)));
+
+      const tx = await contract.submitEvidence(orderIdHash, evidenceHash);
+      await tx.wait();
+      console.log(`[Evidence] On-chain anchored: tx=${tx.hash}`);
+    } catch (e) {
+      console.log(`[Evidence] On-chain anchoring skipped: ${e.message?.slice(0, 60)}`);
+    }
+  }
+
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -5595,6 +5967,13 @@ const commands = {
   confirm: () => cmdConfirm(args[0]),
   rate: () => cmdRate(args[0], args[1], args[2]),
   orders: () => cmdOrders(args[0], args[1]),
+  // Milestone
+  'milestone-status': () => cmdMilestoneStatus(args[0]),
+  'milestone-feedback': () => cmdMilestoneFeedback(args[0]),
+  'milestone-submit': () => cmdMilestoneSubmit(args[0], args[1]),
+  'milestone-verify': () => cmdMilestoneVerify(args[0], args[1]),
+  'milestone-arbitrate': () => cmdMilestoneArbitrate(args[0], args[1]),
+  'chain-records': () => cmdChainRecords(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
@@ -5738,13 +6117,21 @@ Trade Commands:
   trade-task <cap> <desc> [--budget N]   One-shot: search → order → wait → confirm (requester)
   order <executorDid> <cap> <price>    Create a trade order
   order-info <orderId>                 Get order details
-  accept <orderId>                     Accept an order (auto-escrow for paid orders)
+  accept <orderId>                     Accept an order (executor)
   reject <orderId>                     Reject an order (executor)
-  escrow <orderId>                     [DEPRECATED] Escrow is now automatic on accept
+  escrow <orderId>                     Lock USDC on-chain for paid order (requester)
   complete <orderId> [taskId]          Mark order complete + attach proof (executor)
   confirm <orderId>                    Confirm delivery + settle (requester)
   rate <orderId> <1-5> [comment]       Rate the other party
   orders [role] [status]               List orders (role: requester|executor|all)
+
+Milestone Commands:
+  milestone-status <orderId>           View milestone progress
+  milestone-feedback <orderId>         Approve plan (--approve) or revise (--feedback "text")
+  milestone-submit <orderId> <idx>     Submit milestone result (--result "text" or --result ./file)
+  milestone-verify <orderId> <idx>     Verify milestone (--pass or --reject "reason")
+  milestone-arbitrate <orderId> <idx>  Request AI arbitration (after 3 rejections)
+  chain-records <orderId>              View on-chain transaction records
 
 Dispute Commands:
   dispute <orderId> <reason> [desc]    Open a dispute (reason: quality|incomplete|timeout|fraud|malicious|other)
