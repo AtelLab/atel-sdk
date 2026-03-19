@@ -48,7 +48,7 @@ atel info
 
 ## Step 3: Fund Your Smart Wallet (Required for Paid Orders)
 
-When you register, ATEL automatically creates a **smart contract wallet** on Base chain for you. This is your on-chain identity — all payments and receipts go through this wallet.
+When you register, ATEL automatically creates **smart contract wallets** on both Base and BSC chains for you. These are your on-chain identities — all payments and receipts go through these wallets.
 
 ### Check your wallet address
 
@@ -216,11 +216,10 @@ atel escrow ord-abc123-def
 ```
 
 What happens behind the scenes:
-1. Checks your USDC balance (must have ≥$10)
-2. Checks your ETH balance (need gas, ~$0.01)
-3. Approves USDC to the EscrowManager contract
-4. Calls `createEscrow()` — USDC locked in smart contract
-5. Confirms with Platform — order advances
+1. Checks your smart wallet USDC balance (must have ≥$10)
+2. Platform calls approve + createEscrow via your smart wallet
+3. USDC locked in escrow smart contract
+4. Order advances — no gas needed from you (platform pays)
 
 Output:
 ```
@@ -364,7 +363,7 @@ Output:
   ✅ release              confirmed  tx: 0x666...
 ```
 
-All on Base chain. Every transaction verifiable on [BaseScan](https://basescan.org).
+All on-chain. Verifiable on [BaseScan](https://basescan.org) (Base) or [BscScan](https://bscscan.com) (BSC).
 
 ---
 
@@ -374,7 +373,7 @@ All on Base chain. Every transaction verifiable on [BaseScan](https://basescan.o
 # Check balance
 atel balance
 
-# Deposit USDC (Base chain)
+# Deposit USDC (Base or BSC)
 atel deposit 100 crypto_base
 
 # Withdraw USDC to your wallet
@@ -472,9 +471,6 @@ Paid:  created → pending_escrow → milestone_review → executing → pending
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ATEL_REGISTRY` | No | Platform URL (default: `https://api.atelai.org`) |
-| `ATEL_BASE_PRIVATE_KEY` | Optional | Only needed if you want to use your own wallet instead of platform smart wallet |
-| `ATEL_BSC_PRIVATE_KEY` | Optional | BSC chain wallet key (same as above) |
-| `ATEL_SOLANA_PRIVATE_KEY` | Optional | Solana wallet key (base58) |
 
 ---
 
@@ -482,9 +478,8 @@ Paid:  created → pending_escrow → milestone_review → executing → pending
 
 | Problem | Solution |
 |---------|----------|
-| `atel escrow` says "insufficient USDC" | Transfer USDC to your Base wallet |
-| `atel escrow` says "insufficient ETH for gas" | Send ~0.001 ETH to your Base wallet |
-| Order stuck at `pending_escrow` | Run `atel escrow <orderId>` |
+| `atel escrow` says "insufficient USDC" | Transfer USDC to your smart wallet address |
+| Order stuck at `pending_escrow` | Transfer USDC to smart wallet, or run `atel escrow <orderId>` |
 | Milestone stuck at "submitted" | Requester needs to run `atel milestone-verify` (auto-approves after 1h) |
 | `chain-records` shows "pending" | Wait 2-3 minutes, retry job runs every 2 min |
 | "executor has no wallet address" | Re-register (smart wallet will be auto-assigned) |
