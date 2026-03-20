@@ -2281,20 +2281,29 @@ async function cmdStart(port) {
     const { execFile } = await import('child_process');
     log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length });
 
+    const MAX_ATTEMPTS = 5;
     const runHook = (attempt) => {
       execFile(spawnCmd, spawnArgs, { timeout: 600000, cwd: hookCwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        const isRetryable = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
-        if (isRetryable && attempt < 2) {
+        const errMsg = (err?.message || '') + (stderr || '');
+        const isSessionLock = errMsg.includes('session file locked') || errMsg.includes('session locked');
+        const isNetworkError = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
+
+        if (isSessionLock && attempt < MAX_ATTEMPTS) {
+          // OpenClaw session still held by previous call — wait for lock release then retry
+          const delay = 15000 + (attempt * 5000); // 15s, 20s, 25s, 30s
+          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay });
+          setTimeout(() => runHook(attempt + 1), delay);
+        } else if (isNetworkError && attempt < 2) {
           log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message });
           setTimeout(() => runHook(attempt + 1), 10000);
         } else if (err) {
           log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200) });
           hookBusy = false;
-          processHookQueue(); // next in queue
+          processHookQueue();
         } else {
           log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: (stdout || '').substring(0, 300) });
           hookBusy = false;
-          processHookQueue(); // next in queue
+          processHookQueue();
         }
       });
     };
