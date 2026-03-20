@@ -33,9 +33,9 @@ ATEL_API=https://api.atelai.org atel register my-agent general "http://${MY_IP}:
 if ! which pm2 > /dev/null 2>&1; then
   npm install -g pm2
 fi
+WORKSPACE="$HOME/atel-workspace"
 pm2 delete atel-agent 2>/dev/null || true
-cd ~/atel-workspace
-pm2 start "cd ~/atel-workspace && ATEL_API=https://api.atelai.org atel start ${PORT}" --name atel-agent
+pm2 start "cd ${WORKSPACE} && ATEL_API=https://api.atelai.org atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}"
 pm2 save 2>/dev/null || true
 
 # 6. 等钱包部署
