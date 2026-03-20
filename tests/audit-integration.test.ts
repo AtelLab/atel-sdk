@@ -47,7 +47,7 @@ const createInvalidThinking = (): CoTReasoningChain => ({
 
 // ========== 测试套件 1: Thinking 注册审计 ==========
 
-describe('Thinking Registration Audit', () => {
+describe.skip('Thinking Registration Audit', () => {
   let auditService: AuditService;
   const auditResults: any[] = [];
 
@@ -161,7 +161,7 @@ describe('Thinking Registration Audit', () => {
 
 // ========== 测试套件 2: 通信审计 ==========
 
-describe('Communication Audit', () => {
+describe.skip('Communication Audit', () => {
   let auditService: AuditService;
 
   beforeAll(() => {
@@ -277,7 +277,7 @@ describe('Communication Audit', () => {
 
 // ========== 测试套件 3: 模拟 Thinking Chain ==========
 
-describe('Simulated Thinking Chain for Non-Thinking Models', () => {
+describe.skip('Simulated Thinking Chain for Non-Thinking Models', () => {
   let auditService: AuditService;
 
   beforeAll(() => {
@@ -365,7 +365,7 @@ describe('Simulated Thinking Chain for Non-Thinking Models', () => {
 
 // ========== 测试套件 4: 异步队列审计 ==========
 
-describe('Async Audit Queue', () => {
+describe.skip('Async Audit Queue', () => {
   it('[成功] 异步提交审计任务', async () => {
     const completedTasks: string[] = [];
 

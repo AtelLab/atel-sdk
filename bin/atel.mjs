@@ -64,7 +64,9 @@ import {
   TrustGraph, calculateTaskWeight,
 } from '@lawrenceliang-btc/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
-import { initializeOllama, getOllamaStatus } from './ollama-manager.mjs';
+// ollama-manager removed — SDK does not run local models
+const initializeOllama = async () => {};
+const getOllamaStatus = async () => ({ running: false, models: [] });
 import { parseAttachmentFlags, processAttachments } from './atel-attachment-helpers.mjs';
 
 const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
@@ -1944,25 +1946,13 @@ async function cmdStart(port) {
   const toolGatewayServer = await startToolGatewayProxy(toolProxyPort, id, policy);
   log({ event: 'tool_gateway_started', port: toolProxyPort });
 
-  // ── Built-in Executor (auto-start if no external ATEL_EXECUTOR_URL) ──
-  let builtinExecutor = null;
-  if (!EXECUTOR_URL) {
-    const executorPort = p + 2;
-    try {
-      const { BuiltinExecutor } = await import('../dist/executor/index.js');
-      builtinExecutor = new BuiltinExecutor({
-        port: executorPort,
-        callbackUrl: `http://127.0.0.1:${p}/atel/v1/result`,
-        gatewayUrl: getGatewayUrl(),
-        contextPath: join(ATEL_DIR, 'agent-context.md'),
-        log,
-      });
-      await builtinExecutor.start();
-      EXECUTOR_URL = `http://127.0.0.1:${executorPort}`;
-      log({ event: 'builtin_executor_started', port: executorPort, url: EXECUTOR_URL });
-    } catch (e) {
-      log({ event: 'builtin_executor_failed', error: e.message, note: 'Falling back to echo mode. Set ATEL_EXECUTOR_URL for external executor.' });
-    }
+  // ── Executor: Agent brings their own AI. SDK does not run a built-in executor. ──
+  // If ATEL_EXECUTOR_URL is set, P2P tasks are forwarded there.
+  // Milestone work is done by the Agent itself (not the SDK).
+  if (EXECUTOR_URL) {
+    log({ event: 'external_executor_configured', url: EXECUTOR_URL });
+  } else {
+    log({ event: 'no_executor', note: 'No ATEL_EXECUTOR_URL set. Agent handles tasks via notifications + CLI.' });
   }
 
   // ── Trust Score Client (persistent) ──
@@ -2084,17 +2074,74 @@ async function cmdStart(port) {
     }
   });
 
-  // Webhook notification: POST /atel/v1/notify (platform calls this for order events)
+  // ── Event dedup (processed eventIds) ──
+  const processedEvents = new Set();
+
+  // Webhook notification: POST /atel/v1/notify
+  // SDK only: logs, writes inbox, prints prompt. Does NOT execute any actions.
+  // Agent reads inbox or webhook to decide what to do.
   endpoint.app?.post?.('/atel/v1/notify', async (req, res) => {
-    const { event, payload } = req.body || {};
-    if (!event || !payload) {
-      res.status(400).json({ error: 'event and payload required' });
+    const body = req.body || {};
+    // Support both old format {event, payload} and new format {eventId, eventType, payload}
+    const event = body.eventType || body.event;
+    const payload = body.payload || {};
+    const eventId = body.eventId;
+    const prompt = body.prompt || payload.prompt;
+    const recommendedActions = body.recommendedActions || payload.recommendedActions;
+
+    if (!event) {
+      res.status(400).json({ error: 'event/eventType required' });
       return;
     }
 
-    log({ event: 'webhook_received', type: event, payload });
+    // Dedup: skip already processed events
+    if (eventId && processedEvents.has(eventId)) {
+      log({ event: 'event_dedup_skip', eventId, eventType: event });
+      res.json({ status: 'already_processed', eventId });
+      return;
+    }
+    if (eventId) {
+      processedEvents.add(eventId);
+      // Keep set bounded
+      if (processedEvents.size > 1000) {
+        const first = processedEvents.values().next().value;
+        processedEvents.delete(first);
+      }
+    }
 
-    if (event === 'order_created') {
+    // Log the full event
+    log({ event: 'notification_received', eventId, eventType: event, orderId: body.orderId || payload.orderId, prompt: prompt ? prompt.substring(0, 100) : undefined });
+
+    // ── Universal notification handler: print prompt + log + respond ──
+    // SDK does NOT execute any actions. Agent reads inbox/webhook and decides.
+    if (prompt) {
+      console.log(`\n📨 [${event}] ${prompt.split('\n')[0]}`);
+    }
+    if (recommendedActions && Array.isArray(recommendedActions)) {
+      for (const action of recommendedActions) {
+        if (action.command) console.log(`   → ${action.command.join(' ')}`);
+      }
+    }
+    console.log('');
+
+    // Write full event to inbox for Agent program to read
+    log({
+      event: 'notification',
+      eventId,
+      eventType: event,
+      orderId: body.orderId || payload.orderId,
+      payload,
+      prompt,
+      recommendedActions,
+      sequenceNo: body.sequenceNo,
+      dedupeKey: body.dedupeKey,
+    });
+
+    res.json({ status: 'received', eventId, eventType: event });
+    return;
+
+    // ── Legacy event handlers below (kept but unreachable for reference) ──
+    if (event === 'order_created_legacy') {
       // New order notification - decide whether to accept
       const { orderId, requesterDid, capabilityType, priceAmount, description } = payload;
       
@@ -2379,25 +2426,31 @@ async function cmdStart(port) {
       return;
     }
 
-    // Milestone events
+    // Milestone events (helpers defined above, shared with /atel/v1/result handler)
     if (event === 'milestone_submitted') {
       const { orderId, milestoneIndex, resultSummary, submitCount } = payload;
-      log({
-        event: 'milestone_submitted_notification',
-        orderId,
-        milestoneIndex,
-        resultSummary: resultSummary || '(no summary)',
-        submitCount,
-        message: `M${milestoneIndex} submitted. Review the content and verify:`,
-        action: `atel milestone-verify ${orderId} ${milestoneIndex} --pass   (or --reject "reason")`,
-      });
-      // Print prominently so the agent/user actually sees the content
-      console.log(`\n📋 [Milestone M${milestoneIndex} submitted for ${orderId}]`);
-      console.log(`   Content: ${resultSummary || '(no summary provided)'}`);
-      console.log(`   Attempt: ${submitCount || 1}/3`);
-      console.log(`   Action:  atel milestone-verify ${orderId} ${milestoneIndex} --pass`);
-      console.log(`            atel milestone-verify ${orderId} ${milestoneIndex} --reject "reason"\n`);
+      log({ event: 'milestone_submitted_notification', orderId, milestoneIndex, resultSummary: resultSummary || '(no summary)', submitCount });
+      console.log(`\n📋 M${milestoneIndex} submitted for ${orderId}. Agent reviewing...`);
       res.json({ status: 'received', event });
+      // Requester Agent: auto-review using agent's own brain (async callback)
+      setTimeout(async () => {
+        try {
+          const ms = await getMilestoneInfo(orderId);
+          if (!ms || !ms.milestones) return;
+          const m = ms.milestones[milestoneIndex];
+          if (!m) return;
+          const orderDesc = ms.description || orderId;
+          const submittedContent = m.result_summary || resultSummary || '(no content)';
+          const prompt = `You are an AI Agent reviewing a milestone submission.\n\nOrder: ${orderDesc}\nMilestone M${milestoneIndex}: ${m.description || m.title}\nSubmitted content: ${submittedContent}\n\nEvaluate: Does the submission adequately fulfill the milestone goal?\nReply with EXACTLY one of:\n- PASS\n- REJECT: <specific reason>`;
+          console.log(`\n🔍 Reviewing M${milestoneIndex} for ${orderId}...`);
+          await agentExecute(prompt, `review-${orderId}-${milestoneIndex}`, { orderId, milestoneIndex, type: 'verify' });
+        } catch (e) {
+          // Fallback: auto-pass if agent brain unavailable
+          log({ event: 'auto_review_fallback', orderId, milestone: milestoneIndex, error: e.message });
+          console.log(`\n✅ Auto-pass M${milestoneIndex} (review fallback)`);
+          await autoMilestoneVerify(orderId, milestoneIndex, true);
+        }
+      }, 3000);
       return;
     }
 
@@ -2405,8 +2458,23 @@ async function cmdStart(port) {
       const { orderId, milestoneIndex, currentMilestone, totalMilestones, allComplete } = payload;
       if (allComplete) {
         log({ event: 'all_milestones_complete', orderId, message: 'Settlement in progress' });
+        console.log(`\n🎉 All milestones complete for ${orderId}. Settlement in progress.`);
       } else {
-        log({ event: 'milestone_verified_notification', orderId, milestoneIndex, next: currentMilestone, message: `M${milestoneIndex} verified. Ready to submit M${currentMilestone}` });
+        log({ event: 'milestone_verified_notification', orderId, milestoneIndex, next: currentMilestone });
+        console.log(`\n✅ M${milestoneIndex} verified for ${orderId}. Working on M${currentMilestone}...`);
+        // Auto-submit next milestone using agent's own brain (async callback)
+        setTimeout(async () => {
+          try {
+            const ms = await getMilestoneInfo(orderId);
+            if (!ms || !ms.milestones) return;
+            const nextM = ms.milestones[currentMilestone];
+            if (!nextM) return;
+            const orderDesc = ms.description || orderId;
+            const prompt = `You are an AI Agent executing a paid task.\n\nOrder: ${orderDesc}\nMilestone M${currentMilestone}: ${nextM.description || nextM.title}\n\nPrevious milestones have been completed and approved. Now complete this milestone. Provide a thorough, detailed deliverable. Output ONLY the deliverable content.`;
+            console.log(`\n🤖 Working on M${currentMilestone} for ${orderId}...`);
+            await agentExecute(prompt, `milestone-${orderId}-${currentMilestone}`, { orderId, milestoneIndex: currentMilestone, type: 'submit' });
+          } catch (e) { log({ event: 'auto_milestone_next_error', orderId, error: e.message }); }
+        }, 3000);
       }
       res.json({ status: 'received', event });
       return;
@@ -2414,8 +2482,22 @@ async function cmdStart(port) {
 
     if (event === 'milestone_rejected') {
       const { orderId, milestoneIndex, rejectReason } = payload;
-      log({ event: 'milestone_rejected_notification', orderId, milestoneIndex, rejectReason, message: 'Resubmit with improvements' });
+      log({ event: 'milestone_rejected_notification', orderId, milestoneIndex, rejectReason });
+      console.log(`\n❌ M${milestoneIndex} rejected for ${orderId}: ${rejectReason}. Improving...`);
       res.json({ status: 'received', event });
+      // Auto-resubmit with improvements using agent's own brain (async callback)
+      setTimeout(async () => {
+        try {
+          const ms = await getMilestoneInfo(orderId);
+          if (!ms || !ms.milestones) return;
+          const m = ms.milestones[milestoneIndex];
+          if (!m) return;
+          const orderDesc = ms.description || orderId;
+          const prompt = `You are an AI Agent. Your previous submission was REJECTED.\n\nOrder: ${orderDesc}\nMilestone M${milestoneIndex}: ${m.description || m.title}\nRejection reason: ${rejectReason}\n\nImprove your work based on the feedback. Output ONLY the improved deliverable.`;
+          console.log(`\n🔄 Improving M${milestoneIndex} for ${orderId}...`);
+          await agentExecute(prompt, `milestone-${orderId}-${milestoneIndex}-retry`, { orderId, milestoneIndex, type: 'submit' });
+        } catch (e) { log({ event: 'auto_milestone_resubmit_error', orderId, error: e.message }); }
+      }, 3000);
       return;
     }
 
@@ -2426,12 +2508,33 @@ async function cmdStart(port) {
       return;
     }
 
-    // Requester: order was accepted by executor (USDC locked)
+    // Requester: order was accepted by executor (USDC locked) → auto-approve plan
     if (event === 'order_accepted' && payload.executorDid) {
-      const { orderId, executorDid, escrowTx, message } = payload;
-      log({ event: 'order_accepted_by_executor', orderId, executorDid, escrowTx, message: message || 'Your order was accepted. USDC locked in escrow. Review milestone plan: atel milestone-status ' + orderId });
-      console.log(`\n📋 Order ${orderId} accepted! Run: atel milestone-feedback ${orderId} --approve`);
+      const { orderId, executorDid, escrowTx } = payload;
+      log({ event: 'order_accepted_by_executor', orderId, executorDid, escrowTx });
+      console.log(`\n📋 Order ${orderId} accepted! Auto-approving milestone plan...`);
       res.json({ status: 'received', event });
+      // Auto-approve milestone plan (non-blocking)
+      setTimeout(async () => {
+        try {
+          for (let wait = 0; wait < 10; wait++) {
+            await new Promise(r => setTimeout(r, 3000));
+            const ms = await getMilestoneInfo(orderId);
+            if (ms && ms.totalMilestones > 0) {
+              const ts = new Date().toISOString();
+              const pl = { approved: true };
+              const sig = sign({ did: id.did, timestamp: ts, payload: pl }, id.secretKey);
+              const fbResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones/feedback`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ did: id.did, timestamp: ts, signature: sig, payload: pl }),
+                signal: AbortSignal.timeout(10000),
+              });
+              log({ event: 'requester_auto_approved_plan', orderId, ok: fbResp.ok });
+              break;
+            }
+          }
+        } catch (e) { log({ event: 'requester_auto_approve_error', orderId, error: e.message }); }
+      }, 2000);
       return;
     }
 
@@ -2441,6 +2544,20 @@ async function cmdStart(port) {
       log({ event: 'milestone_plan_confirmed', orderId, message });
       console.log(`\n✅ Milestone plan confirmed for ${orderId}. Execution started.`);
       res.json({ status: 'received', event });
+      // Executor: auto-submit M0 using agent's own brain (non-blocking, async callback)
+      if (message && message.includes('Submit milestone')) {
+        setTimeout(async () => {
+          try {
+            const ms = await getMilestoneInfo(orderId);
+            if (!ms || !ms.milestones || ms.milestones.length === 0) return;
+            const m0 = ms.milestones[0];
+            const orderDesc = ms.description || orderId;
+            const prompt = `You are an AI Agent executing a paid task.\n\nOrder: ${orderDesc}\nMilestone M0: ${m0.description || m0.title}\n\nComplete this milestone. Provide a thorough, detailed deliverable. Output ONLY the deliverable content.`;
+            console.log(`\n🤖 Working on M0 for ${orderId}...`);
+            await agentExecute(prompt, `milestone-${orderId}-0`, { orderId, milestoneIndex: 0, type: 'submit' });
+          } catch (e) { log({ event: 'auto_milestone_0_error', orderId, error: e.message }); }
+        }, 3000);
+      }
       return;
     }
 
@@ -2461,6 +2578,8 @@ async function cmdStart(port) {
   endpoint.app?.post?.('/atel/v1/result', async (req, res) => {
     const { taskId, result, success, trace: executorTrace } = req.body || {};
     if (!taskId || !pendingTasks[taskId]) { res.status(404).json({ error: 'Unknown taskId' }); return; }
+
+    // Milestone auto-execution removed. Agent handles results via its own AI.
     const task = pendingTasks[taskId];
     const startTime = new Date(task.acceptedAt).getTime();
     const durationMs = Date.now() - startTime;
@@ -3410,14 +3529,14 @@ async function cmdStart(port) {
   process.on('SIGINT', async () => { 
     heartbeat.stop();
     if (tunnelManager) await tunnelManager.stop();
-    if (builtinExecutor) await builtinExecutor.stop();
+    
     await endpoint.stop(); 
     process.exit(0); 
   });
   process.on('SIGTERM', async () => { 
     heartbeat.stop();
     if (tunnelManager) await tunnelManager.stop();
-    if (builtinExecutor) await builtinExecutor.stop();
+    
     await endpoint.stop(); 
     process.exit(0); 
   });

@@ -54,7 +54,6 @@
     "express": "^5.2.1",
     "form-data": "^4.0.5",
     "nat-upnp": "^1.1.1",
-    "node-llama-cpp": "^3.17.1",
     "tweetnacl": "^1.0.3",
     "uuid": "^11.1.0"
   },
