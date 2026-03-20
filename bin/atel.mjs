@@ -2125,6 +2125,10 @@ async function cmdStart(port) {
   // ── Event dedup (processed eventIds) ──
   const processedEvents = new Set();
 
+  // ── Agent hook queue (serialize hook executions to avoid session lock conflicts) ──
+  let hookBusy = false;
+  const hookQueue = [];
+
   // Webhook notification: POST /atel/v1/notify
   // SDK only: logs, writes inbox, prints prompt. Does NOT execute any actions.
   // Agent reads inbox or webhook to decide what to do.
@@ -2255,45 +2259,47 @@ async function cmdStart(port) {
         log({ event: 'agent_cmd_dedup', eventType: event, dedupeKey });
       } else {
         processedEvents.add('hook:' + dedupeKey);
-        const { execFile, exec } = await import('child_process');
 
-        // Build command as argv array (not string concat) to avoid path corruption
-        let spawnCmd, spawnArgs;
+        // Build argv array
         const parsedCmd = agentCmd.trim().split(/\s+/);
-        if (agentCmd.includes('openclaw')) {
-          // Use unique session-id to avoid lock conflicts between concurrent hooks
-          const sessionId = `atel-${dedupeKey.replace(/[^a-zA-Z0-9-]/g, '-')}`;
-          const mIdx = parsedCmd.lastIndexOf('-m');
-          if (mIdx > 0) {
-            parsedCmd.splice(mIdx, 0, '--session-id', sessionId);
-          }
-          parsedCmd.push(enrichedPrompt);
-          spawnCmd = parsedCmd[0];
-          spawnArgs = parsedCmd.slice(1);
-        } else {
-          parsedCmd.push(enrichedPrompt);
-          spawnCmd = parsedCmd[0];
-          spawnArgs = parsedCmd.slice(1);
-        }
+        parsedCmd.push(enrichedPrompt);
 
-        log({ event: 'agent_cmd_trigger', eventType: event, dedupeKey, cmd: spawnCmd, argsCount: spawnArgs.length });
-
-        // Execute with retry (only on timeout/connection errors, not on argument errors)
-        const runHook = (attempt) => {
-          const child = execFile(spawnCmd, spawnArgs, { timeout: 600000, cwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-            const isRetryable = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
-            if (isRetryable && attempt < 2) {
-              log({ event: 'agent_cmd_retry', eventType: event, attempt: attempt + 1, error: err.message });
-              setTimeout(() => runHook(attempt + 1), 10000);
-            } else if (err) {
-              log({ event: 'agent_cmd_error', eventType: event, error: err.message, stderr: (stderr || '').substring(0, 200) });
-            } else {
-              log({ event: 'agent_cmd_done', eventType: event, stdout: (stdout || '').substring(0, 300) });
-            }
-          });
-        };
-        runHook(0);
+        // Queue the hook (serialize to avoid session lock conflicts)
+        hookQueue.push({ event, dedupeKey, cmd: parsedCmd[0], args: parsedCmd.slice(1), cwd });
+        if (!hookBusy) processHookQueue();
       }
+    }
+
+    res.json({ status: 'received', eventId, eventType: event });
+  });
+
+  // Process hook queue serially
+  async function processHookQueue() {
+    if (hookBusy || hookQueue.length === 0) return;
+    hookBusy = true;
+    const { event: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, args: spawnArgs, cwd: hookCwd } = hookQueue.shift();
+    const { execFile } = await import('child_process');
+    log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length });
+
+    const runHook = (attempt) => {
+      execFile(spawnCmd, spawnArgs, { timeout: 600000, cwd: hookCwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const isRetryable = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
+        if (isRetryable && attempt < 2) {
+          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message });
+          setTimeout(() => runHook(attempt + 1), 10000);
+        } else if (err) {
+          log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200) });
+          hookBusy = false;
+          processHookQueue(); // next in queue
+        } else {
+          log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: (stdout || '').substring(0, 300) });
+          hookBusy = false;
+          processHookQueue(); // next in queue
+        }
+      });
+    };
+    runHook(0);
+  }
     }
 
     res.json({ status: 'received', eventId, eventType: event });
