@@ -2409,6 +2409,33 @@ async function cmdStart(port) {
       return;
     }
 
+    // Requester: order was accepted by executor (USDC locked)
+    if (event === 'order_accepted' && payload.executorDid) {
+      const { orderId, executorDid, escrowTx, message } = payload;
+      log({ event: 'order_accepted_by_executor', orderId, executorDid, escrowTx, message: message || 'Your order was accepted. USDC locked in escrow. Review milestone plan: atel milestone-status ' + orderId });
+      console.log(`\n📋 Order ${orderId} accepted! Run: atel milestone-feedback ${orderId} --approve`);
+      res.json({ status: 'received', event });
+      return;
+    }
+
+    // Both parties: milestone plan confirmed, execution started
+    if (event === 'milestone_plan_confirmed') {
+      const { orderId, message } = payload;
+      log({ event: 'milestone_plan_confirmed', orderId, message });
+      console.log(`\n✅ Milestone plan confirmed for ${orderId}. Execution started.`);
+      res.json({ status: 'received', event });
+      return;
+    }
+
+    // Both parties: order settled, payment released
+    if (event === 'order_settled') {
+      const { orderId, message } = payload;
+      log({ event: 'order_settled_notification', orderId, message });
+      console.log(`\n💰 Order ${orderId} settled! ${message || 'Check: atel balance'}`);
+      res.json({ status: 'received', event });
+      return;
+    }
+
     // Unknown event type
     res.json({ status: 'ignored', event });
   });
