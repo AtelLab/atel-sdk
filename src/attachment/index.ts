@@ -45,7 +45,23 @@ const ALLOWED_MIME_TYPES: Record<AttachmentKind, string[]> = {
   image: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
   audio: ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   video: ['video/mp4', 'video/webm', 'video/quicktime'],
-  file: ['application/pdf', 'application/zip', 'text/plain', 'application/json', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 'application/octet-stream'],
+  file: [
+    'text/plain', 'text/csv', 'text/html', 'text/markdown',
+    'application/json', 'application/xml', 'text/xml',
+    'application/pdf',
+    'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.oasis.opendocument.text',
+    'application/vnd.oasis.opendocument.spreadsheet',
+    'application/vnd.oasis.opendocument.presentation',
+    'application/zip', 'application/x-zip-compressed', 'application/x-tar',
+    'application/gzip', 'application/x-7z-compressed', 'application/x-rar-compressed',
+    'application/javascript', 'text/javascript', 'text/x-python', 'text/x-java', 'text/x-c',
+    'application/epub+zip',
+    'application/octet-stream',
+  ],
 };
 
 export function validateMimeType(kind: AttachmentKind, mimeType: string): boolean {
