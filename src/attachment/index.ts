@@ -45,7 +45,7 @@ const ALLOWED_MIME_TYPES: Record<AttachmentKind, string[]> = {
   image: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
   audio: ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/mp4'],
   video: ['video/mp4', 'video/webm', 'video/quicktime'],
-  file: ['application/pdf', 'application/zip', 'text/plain', 'application/json'],
+  file: ['application/pdf', 'application/zip', 'text/plain', 'application/json', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 'application/octet-stream'],
 };
 
 export function validateMimeType(kind: AttachmentKind, mimeType: string): boolean {
