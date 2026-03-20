@@ -56,7 +56,7 @@ import { resolve, join } from 'node:path';
 import crypto from 'node:crypto';
 import {
   AgentIdentity, AgentEndpoint, AgentClient, HandshakeManager,
-  createMessage, RegistryClient, ExecutionTrace, ProofGenerator,
+  createMessage, verifyMessage, parseDID, RegistryClient, ExecutionTrace, ProofGenerator,
   SolanaAnchorProvider, BaseAnchorProvider, BSCAnchorProvider,
   autoNetworkSetup, collectCandidates, connectToAgent,
   discoverPublicIP, checkReachable, ContentAuditor, TrustScoreClient,
@@ -257,6 +257,23 @@ Friend Management Commands:
     
     Examples:
       atel friend status
+
+── How Friend System Affects Communication ──────────────────────────
+
+  By default, agents operate in "friends_only" mode:
+    • P2P messages (atel send) and tasks will be REJECTED if you are not a friend
+    • You must send a friend request and have it accepted first
+
+  Typical flow to communicate with a new agent:
+    1. atel friend request <their-did> --message "Hi, lets connect!"
+    2. They run: atel friend pending         (to see your request)
+    3. They run: atel friend accept <req-id> (to accept)
+    4. Now you can: atel send <their-did> "Hello!"
+
+  To allow communication WITHOUT friend relationship (open mode):
+    Edit .atel/policy.json and set:
+    { "relationshipPolicy": { "defaultMode": "open" } }
+    Restart your agent. Both sides can configure this independently.
 
 For more information, visit: https://docs.atel.io/friend-system
   `);
@@ -5441,14 +5458,32 @@ async function cmdFriendRequest(args) {
   };
   
   // Sign the request
-  const signedRequest = createMessage(request, id.secretKey);
+  const signedRequest = createMessage({ ...request, secretKey: id.secretKey });
   
-  // Try to send via P2P
+  // Try to send via P2P — look up registry for endpoint
   let sent = false;
   let error = null;
   
   try {
-    const result = await sendP2PMessage(targetDid, signedRequest);
+    // Resolve endpoint from registry
+    let endpoint = null;
+    try {
+      const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        const entry = await resp.json();
+        const candidates = entry.endpoint_candidates || [];
+        const direct = candidates.find(c => c.type === 'direct');
+        const relay = candidates.find(c => c.type === 'relay');
+        endpoint = direct?.url || relay?.url || entry.endpoint;
+      }
+    } catch (e) {
+      throw new Error(`Cannot find agent in registry: ${e.message}`);
+    }
+    if (!endpoint) throw new Error('Agent has no reachable endpoint');
+    
+    const hsManager = new HandshakeManager(id);
+    const client = new AgentClient(id);
+    await client.sendTask(endpoint, signedRequest, hsManager);
     sent = true;
   } catch (err) {
     error = err.message;
@@ -5538,7 +5573,7 @@ async function cmdFriendAccept(args) {
     }
   };
   
-  const signedMsg = createMessage(acceptMsg, id.secretKey);
+  const signedMsg = createMessage({ ...acceptMsg, secretKey: id.secretKey });
   
   try {
     await sendP2PMessage(request.from, signedMsg);
@@ -5604,7 +5639,7 @@ async function cmdFriendReject(args) {
     }
   };
   
-  const signedMsg = createMessage(rejectMsg, id.secretKey);
+  const signedMsg = createMessage({ ...rejectMsg, secretKey: id.secretKey });
   
   try {
     await sendP2PMessage(request.from, signedMsg);
@@ -5740,6 +5775,214 @@ async function cmdFriendStatus(args) {
   }
   
   console.log('');
+}
+
+// ─── P2P Send Helper ────────────────────────────────────────────
+// Resolves DID → endpoint via registry, then sends a signed message.
+// Replaces the previously undefined sendP2PMessage.
+async function sendP2PMessage(targetDid, signedMsg) {
+  const id = loadIdentity();
+  if (!id) throw new Error('No identity found');
+
+  let endpoint = null;
+  try {
+    const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const entry = await resp.json();
+      const candidates = entry.endpoint_candidates || [];
+      const direct = candidates.find(c => c.type === 'direct');
+      const relay  = candidates.find(c => c.type === 'relay');
+      endpoint = direct?.url || relay?.url || entry.endpoint;
+    }
+  } catch (e) {
+    throw new Error(`Registry lookup failed for ${targetDid}: ${e.message}`);
+  }
+  if (!endpoint) throw new Error(`No reachable endpoint for ${targetDid}`);
+
+  const hsManager = new HandshakeManager(id);
+  const client    = new AgentClient(id);
+  return await client.sendTask(endpoint, signedMsg, hsManager);
+}
+
+// ─── Send Command (Rich Media P2P Messaging) ─────────────────────
+
+function showSendHelp() {
+  console.log(`
+atal send — Send a message (with optional rich media) to another agent
+
+Usage:
+  atel send <did|alias|endpoint> "message text"
+  atel send <did> "look at this" --image ./photo.jpg
+  atel send <did> "here is the file" --file ./report.pdf
+  atel send <did> "listen" --audio ./voice.mp3
+  atel send <did> "watch this" --video ./clip.mp4
+
+Flags:
+  --image <path>   Attach image (jpg/png/gif/webp, max 10MB, up to 9)
+  --file  <path>   Attach file  (pdf/zip/txt/json, max 100MB, up to 5)
+  --audio <path>   Attach audio (mp3/wav/ogg/m4a, max 50MB)
+  --video <path>   Attach video (mp4/webm/mov, max 500MB)
+  --json           Output result as JSON
+
+Notes:
+  By default, agents require a mutual friend relationship before accepting
+  P2P messages. If you get a NOT_FRIEND error, run:
+    atel friend request <did>
+  and ask the other side to accept with:
+    atel friend accept <request-id>
+
+  To disable the friend requirement on your own agent, set in policy.json:
+    { "relationshipPolicy": { "defaultMode": "open" } }
+
+Examples:
+  atel send did:atel:ed25519:ABC "Hello!"
+  atel send @alice "Check this" --image ./screenshot.png
+  atel send did:atel:ed25519:ABC "Report" --file ./q1.pdf
+`);
+}
+
+async function cmdSend(args) {
+  const target  = args._[0];
+  const text    = args._[1] || '';
+  const isJson  = rawArgs.includes('--json');
+
+  if (!target) { showSendHelp(); process.exit(1); }
+
+  const id = loadIdentity();
+  if (!id) { console.error('No identity found. Run: atel init'); process.exit(1); }
+
+  // Parse attachment flags
+  const attachmentFlags = parseAttachmentFlags(rawArgs);
+  const hasAttachments  = attachmentFlags.images.length > 0 ||
+                          attachmentFlags.files.length  > 0 ||
+                          attachmentFlags.audios.length > 0 ||
+                          attachmentFlags.videos.length > 0;
+
+  if (!text && !hasAttachments) {
+    console.error('Error: message text or at least one attachment is required');
+    showSendHelp(); process.exit(1);
+  }
+
+  // Build payload
+  const msgId   = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const payload = {
+    action:    'general',   // broad compatibility with all SDK versions
+    msgType:   'message',   // identifies this as a p2p chat message
+    msgId,
+    text,
+    timestamp: new Date().toISOString(),
+  };
+
+  // Upload attachments
+  if (hasAttachments) {
+    try {
+      if (!isJson) process.stderr.write('Uploading attachments...\n');
+      const processed = await processAttachments(attachmentFlags, id.did, msgId);
+      if (processed.images.length     > 0) payload.images      = processed.images;
+      if (processed.attachments.length > 0) payload.attachments = processed.attachments;
+      if (!isJson) {
+        const total = (processed.images.length + processed.attachments.length);
+        process.stderr.write(`  ✓ ${total} attachment(s) ready\n`);
+      }
+    } catch (err) {
+      console.error(`Attachment upload failed: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  // Resolve target → endpoint + remoteDid
+  let remoteEndpoint = target;
+  let remoteDid;
+
+  // Resolve @alias
+  try { const r = resolveDID(target); if (r !== target) remoteEndpoint = r; } catch (_) {}
+
+  if (!remoteEndpoint.startsWith('http')) {
+    // Registry lookup
+    let entry;
+    try {
+      const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(remoteEndpoint)}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) entry = await resp.json();
+    } catch (_) {}
+    if (!entry) {
+      const regClient = new RegistryClient({ registryUrl: REGISTRY_URL });
+      const results = await regClient.search({ type: remoteEndpoint, limit: 1 });
+      if (results.length > 0) entry = results[0];
+    }
+    if (!entry) { console.error(`Agent not found: ${target}`); process.exit(1); }
+    remoteDid = entry.did;
+    const candidates = entry.endpoint_candidates || [];
+    const direct = candidates.find(c => c.type === 'direct');
+    const relay  = candidates.find(c => c.type === 'relay');
+    remoteEndpoint = direct?.url || relay?.url || entry.endpoint;
+  } else {
+    remoteDid = target.startsWith('did:') ? target : undefined;
+    // Try to get remoteDid from handshake cache for direct endpoints
+    if (!remoteDid) {
+      try {
+        const tmpHs = new HandshakeManager(id);
+        const session = await tmpHs.getOrCreate(remoteEndpoint);
+        if (session?.remoteDid) remoteDid = session.remoteDid;
+      } catch (_) {}
+    }
+  }
+
+  if (!remoteEndpoint) {
+    console.error(`No reachable endpoint for: ${target}`);
+    process.exit(1);
+  }
+
+  // Send
+  try {
+    const hsManager = new HandshakeManager(id);
+    const client    = new AgentClient(id);
+    const msg       = createMessage({ type: 'task', from: id.did, to: remoteDid || remoteEndpoint, payload, secretKey: id.secretKey });
+    const result    = await client.sendTask(remoteEndpoint, msg, hsManager);
+
+    // Surface friendly errors
+    const inner = result?.result;
+    if (inner?.code === 'NOT_FRIEND' || inner?.error?.includes('NOT_FRIEND') || inner?.error?.includes('not a friend')) {
+      if (isJson) {
+        console.log(JSON.stringify({ status: 'error', code: 'NOT_FRIEND', message: inner.error, hint: `Run: atel friend request ${remoteDid || target}` }));
+      } else {
+        console.error(`✗ Message blocked: the recipient requires a friend relationship.`);
+        console.error(`  Run: atel friend request ${remoteDid || target}`);
+        console.error(`  Then ask them to: atel friend accept <request-id>`);
+      }
+      process.exit(1);
+    }
+    if (inner?.status === 'rejected') {
+      if (isJson) {
+        console.log(JSON.stringify({ status: 'error', message: inner.error || 'Message rejected', result }));
+      } else {
+        console.error(`✗ Message rejected: ${inner.error || 'unknown reason'}`);
+      }
+      process.exit(1);
+    }
+
+    if (isJson) {
+      console.log(JSON.stringify({ status: 'sent', msgId, to: remoteDid || remoteEndpoint, attachments: (payload.images?.length || 0) + (payload.attachments?.length || 0), result }, null, 2));
+    } else {
+      console.log(`✓ Message sent to ${remoteDid || remoteEndpoint}`);
+      if (payload.images?.length)      console.log(`  Images:      ${payload.images.length}`);
+      if (payload.attachments?.length) console.log(`  Attachments: ${payload.attachments.length}`);
+    }
+  } catch (err) {
+    if (isJson) {
+      console.log(JSON.stringify({ status: 'error', message: err.message }));
+    } else {
+      // Surface specific known errors in human-readable form
+      if (err.message?.includes('fetch failed') || err.message?.includes('ECONNREFUSED')) {
+        console.error(`✗ Cannot reach agent at ${remoteEndpoint}`);
+        console.error(`  The agent may be offline or behind a firewall.`);
+      } else if (err.message?.includes('401') || err.message?.includes('Unauthorized')) {
+        console.error(`✗ Authentication failed — try: atel handshake ${remoteEndpoint}`);
+      } else {
+        console.error(`✗ Send failed: ${err.message}`);
+      }
+    }
+    process.exit(1);
+  }
 }
 
 // ─── Temporary Session Commands ──────────────────────────────────
@@ -6212,6 +6455,14 @@ const commands = {
     console.error('  status [--json]');
     process.exit(1);
   },
+  // Send (Rich Media P2P Message)
+  send: () => {
+    if (rawArgs.includes('--help') || rawArgs.includes('-h') || args.length === 0) {
+      showSendHelp();
+      process.exit(0);
+    }
+    return cmdSend({ _: args, json: rawArgs.includes('--json') });
+  },
   // Alias System
   alias: () => {
     const subCmd = args[0];
@@ -6248,6 +6499,7 @@ Protocol Commands:
   register [name] [caps] [endpoint]    Register on public registry (caps: "type1:price1,type2:price2" or "type1,type2" for free)
   search <capability>                  Search registry for agents (shows pricing info)
   handshake <endpoint> [did]           Handshake with remote agent
+  send <target> "text" [--image/--file/--audio/--video <path>]  Send P2P message with optional rich media
   task <target> <json>                 Delegate task (auto trust check)
   result <taskId> <json>               Submit execution result (from executor)
   check <did> [risk]                   Check agent trust (risk: low|medium|high|critical)
