@@ -3164,15 +3164,14 @@ async function cmdStart(port) {
         });
         if (!resp.ok) return;
         const data = await resp.json();
-        // Relay returns {messages: [{id, sender, message, createdAt}]}
-        // Each message.message contains {method, path, body}
         const rawMessages = data.messages || data.requests || [];
-        const requests = rawMessages.map(m => {
+        if (rawMessages.length === 0) return;
+
+        const processedIds = []; // track successfully processed message IDs for ACK
+
+        for (const m of rawMessages) {
           const inner = m.message || m;
-          return typeof inner === 'string' ? JSON.parse(inner) : inner;
-        });
-        for (const req of requests) {
-          // Forward to local endpoint
+          const req = typeof inner === 'string' ? JSON.parse(inner) : inner;
           try {
             const method = req.method || 'POST';
             const fetchOpts = {
@@ -3182,21 +3181,21 @@ async function cmdStart(port) {
             };
             if (method !== 'GET' && method !== 'HEAD') fetchOpts.body = JSON.stringify(req.body);
             const localResp = await fetch(`http://127.0.0.1:${p}${req.path}`, fetchOpts);
-            const body = await localResp.json();
-            // Send response back to relay
-            await fetch(`${relayUrl}/relay/v1/respond`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ requestId: req.requestId, status: localResp.status, body }),
-              signal: AbortSignal.timeout(5000),
-            });
+            await localResp.json();
+            if (m.id) processedIds.push(m.id); // mark for ACK
           } catch (e) {
-            // Send error response
-            await fetch(`${relayUrl}/relay/v1/respond`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ requestId: req.requestId, status: 500, body: { error: e.message } }),
-              signal: AbortSignal.timeout(5000),
-            }).catch(() => {});
+            // Still ACK even on local processing error (to prevent infinite retry)
+            if (m.id) processedIds.push(m.id);
           }
+        }
+
+        // ACK processed messages so relay doesn't re-deliver them
+        if (processedIds.length > 0) {
+          await fetch(`${relayUrl}/relay/v1/ack`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ did: id.did, ids: processedIds }),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => {});
         }
       } catch {}
     };
