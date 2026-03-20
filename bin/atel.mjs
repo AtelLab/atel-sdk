@@ -2195,35 +2195,55 @@ async function cmdStart(port) {
         return;
       }
 
-      // Auto-accept (default)
+      // Auto-accept with retry (default)
       log({ event: 'order_auto_accept', orderId, requesterDid, capabilityType });
-      
-      // Call platform API to accept
-      try {
-        const timestamp = new Date().toISOString(); // RFC3339 format
-        const payload = {}; // Empty payload for accept
-        const signPayload = { did: id.did, timestamp, payload };
-        const signature = sign(signPayload, id.secretKey);
-        
-        const signedRequest = {
-          did: id.did,
-          timestamp,
-          signature,
-          payload
-        };
-        
-        log({ event: 'order_accept_calling_api', orderId, platform: ATEL_PLATFORM });
-        
-        const acceptResp = await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/accept`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(signedRequest),
-          signal: AbortSignal.timeout(10000), // 10秒超时
-        });
-        
-        log({ event: 'order_accept_response', orderId, status: acceptResp.status, ok: acceptResp.ok });
-        
-        if (acceptResp.ok) {
+
+      // Call platform API to accept (retry up to 3 times for transient RPC failures)
+      let acceptOk = false;
+      let lastError = '';
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const timestamp = new Date().toISOString();
+          const payload = {};
+          const signPayload = { did: id.did, timestamp, payload };
+          const signature = sign(signPayload, id.secretKey);
+          const signedRequest = { did: id.did, timestamp, signature, payload };
+
+          log({ event: 'order_accept_calling_api', orderId, platform: ATEL_PLATFORM, attempt: attempt + 1 });
+
+          const acceptResp = await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(signedRequest),
+            signal: AbortSignal.timeout(30000), // 30s timeout (escrow tx can take 10-15s)
+          });
+
+          log({ event: 'order_accept_response', orderId, status: acceptResp.status, ok: acceptResp.ok, attempt: attempt + 1 });
+
+          if (acceptResp.ok) {
+            acceptOk = true;
+            break;
+          }
+
+          const errBody = await acceptResp.text();
+          lastError = errBody;
+          log({ event: 'order_accept_failed', orderId, error: errBody, status: acceptResp.status, attempt: attempt + 1 });
+
+          // Retry if server hints it's a transient failure
+          const shouldRetry = errBody.includes('retry') || errBody.includes('RPC') || errBody.includes('balance check failed');
+          if (!shouldRetry || attempt >= 2) break;
+          log({ event: 'order_accept_retrying', orderId, waitMs: 5000 });
+          await new Promise(r => setTimeout(r, 5000));
+        } catch (err) {
+          lastError = err.message;
+          log({ event: 'order_accept_error', orderId, error: err.message, attempt: attempt + 1 });
+          if (attempt >= 2) break;
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      }
+
+      if (acceptOk) {
+        try {
           log({ event: 'order_accepted', orderId });
           res.json({ status: 'accepted', orderId });
 
@@ -2260,15 +2280,12 @@ async function cmdStart(port) {
               log({ event: 'milestone_auto_approve_error', orderId, error: e.message });
             }
           }, 2000);
-        } else {
-          const error = await acceptResp.text();
-          log({ event: 'order_accept_failed', orderId, error, status: acceptResp.status });
-          res.status(500).json({ error: 'accept failed: ' + error });
+        } catch (e) {
+          log({ event: 'milestone_auto_approve_outer_error', orderId, error: e.message });
         }
-      } catch (err) {
-        log({ event: 'order_accept_error', orderId, error: err.message, stack: err.stack });
-        console.error('[ERROR] Order accept failed:', err);
-        res.status(500).json({ error: err.message });
+      } else {
+        log({ event: 'order_accept_gave_up', orderId, lastError });
+        res.status(500).json({ error: 'accept failed after retries: ' + lastError });
       }
       return;
     }
