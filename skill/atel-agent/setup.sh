@@ -84,10 +84,36 @@ echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 echo "========================================="
 cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
+# 自动绑定当前 TG 会话为通知目标
+SESSION_FILE="$HOME/.openclaw/agents/main/sessions/sessions.json"
+CHAT_ID=""
+if [ -f "$SESSION_FILE" ]; then
+  CHAT_ID=$(python3 - <<'PY'
+import json, os
+p=os.path.expanduser("~/.openclaw/agents/main/sessions/sessions.json")
+try:
+    data=json.load(open(p))
+    for v in (data.values() if isinstance(data,dict) else [data]):
+        if isinstance(v,dict) and v.get("lastChannel")=="telegram":
+            lt=v.get("lastTo","")
+            if lt.startswith("telegram:"):
+                print(lt.split(":",1)[1])
+                break
+except:
+    pass
+PY
+)
+fi
+
+if [ -n "$CHAT_ID" ]; then
+  echo "🔔 Binding notifications to current Telegram chat: $CHAT_ID"
+  cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
+  cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+else
+  echo "⚠️ Could not auto-detect Telegram chat. Run: atel notify bind <chat_id>"
+fi
+
 echo "DID: $DID"
 echo "Port: $PORT"
 echo "pm2: $(pm2 jlist 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['pm2_env']['status'] if d else 'unknown')" 2>/dev/null || echo 'check: pm2 status')"
-echo ""
-echo "📢 To enable TG notifications, run:"
-echo "  cd ~/atel-workspace && atel notify bind <your-chat-id> --bot-token <bot-token>"
 echo "========================================="

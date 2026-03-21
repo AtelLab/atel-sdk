@@ -110,6 +110,51 @@ function saveNotifyTargets(data) {
   writeFileSync(NOTIFY_TARGETS_FILE, JSON.stringify(data, null, 2));
 }
 
+// Auto-detect current TG chat from OpenClaw session state
+function discoverTelegramChat() {
+  const sessionPaths = [
+    join(process.env.HOME || '', '.openclaw/agents/main/sessions/sessions.json'),
+    join(process.env.HOME || '', '.openclaw/sessions/sessions.json'),
+  ];
+  for (const p of sessionPaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf-8'));
+      // sessions.json can be { "agent:main:main": { lastChannel, lastTo, ... } } or flat
+      const entries = typeof data === 'object' ? Object.values(data) : [];
+      for (const session of entries) {
+        if (session?.lastChannel === 'telegram' && typeof session?.lastTo === 'string' && session.lastTo.startsWith('telegram:')) {
+          return session.lastTo.split(':', 2)[1]; // "telegram:123456" → "123456"
+        }
+      }
+      // Also check top-level
+      if (data?.lastChannel === 'telegram' && typeof data?.lastTo === 'string' && data.lastTo.startsWith('telegram:')) {
+        return data.lastTo.split(':', 2)[1];
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Auto-bind TG notification target if not already bound
+function autoBindNotifications() {
+  const targets = loadNotifyTargets();
+  if (targets.targets.length > 0) return; // already has targets
+
+  const chatId = discoverTelegramChat();
+  if (!chatId) return;
+
+  const botToken = discoverTelegramBot();
+  const id = `tg_${chatId}`;
+  targets.targets.push({
+    id, channel: 'telegram', target: chatId,
+    botToken: botToken || undefined,
+    label: 'owner', enabled: true,
+    createdAt: new Date().toISOString(), lastUsedAt: null,
+  });
+  saveNotifyTargets(targets);
+  console.log(`🔔 Auto-bound TG notifications to chat ${chatId}`);
+}
+
 // Auto-discover OpenClaw gateway: read token + find port
 function discoverGateway() {
   // 1. Env override
@@ -3205,6 +3250,9 @@ async function cmdStart(port) {
   endpoint.onProof(async (message) => { log({ event: 'proof_received', from: message.from, payload: message.payload, timestamp: new Date().toISOString() }); });
 
   await endpoint.start();
+
+  // Auto-bind TG notifications on first start
+  try { autoBindNotifications(); } catch (e) { /* never block startup */ }
 
   // Background retry for failed result pushes (durable queue)
   const flushResultPushQueue = async () => {
@@ -6575,8 +6623,17 @@ const commands = {
     }
 
     if (subCmd === 'bind') {
-      const chatId = args[1];
-      if (!chatId) { console.error('Usage: atel notify bind <chatId> [--bot-token TOKEN]'); process.exit(1); }
+      let chatId = args[1];
+      // Auto-detect from OpenClaw session if not provided
+      if (!chatId) {
+        chatId = discoverTelegramChat();
+        if (chatId) {
+          console.log(`🔍 Auto-detected TG chat: ${chatId}`);
+        } else {
+          console.error('Could not auto-detect TG chat. Usage: atel notify bind <chatId> [--bot-token TOKEN]');
+          process.exit(1);
+        }
+      }
       // Get bot token: --bot-token flag > env > openclaw config
       let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
       if (!botToken) botToken = process.env.TELEGRAM_BOT_TOKEN || '';

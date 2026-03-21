@@ -64,24 +64,42 @@ pm2 save 2>/dev/null || true
 
 echo "⏳ Waiting for wallet (15s)..."
 sleep 15
+
+# 自动绑定当前 TG 会话为通知目标
+SESSION_FILE="$HOME/.openclaw/agents/main/sessions/sessions.json"
+CHAT_ID=""
+if [ -f "$SESSION_FILE" ]; then
+  CHAT_ID=$(python3 - <<'PY'
+import json, os
+p=os.path.expanduser("~/.openclaw/agents/main/sessions/sessions.json")
+try:
+    data=json.load(open(p))
+    for v in (data.values() if isinstance(data,dict) else [data]):
+        if isinstance(v,dict) and v.get("lastChannel")=="telegram":
+            lt=v.get("lastTo","")
+            if lt.startswith("telegram:"):
+                print(lt.split(":",1)[1])
+                break
+except:
+    pass
+PY
+)
+fi
+
+if [ -n "$CHAT_ID" ]; then
+  echo "🔔 Binding notifications to current Telegram chat: $CHAT_ID"
+  cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
+  cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+else
+  echo "⚠️ Could not auto-detect Telegram chat. Run: atel notify bind <chat_id>"
+fi
+
 echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
 echo "DID: $DID | Port: $PORT"
 echo "========================================="
 ```
-
-### 设置完成后：绑定通知
-
-设置脚本跑完后，**立即执行以下命令绑定当前 TG 会话为通知目标**：
-
-```bash
-cd ~/atel-workspace && atel notify bind <当前聊天的chat_id> --bot-token <bot_token>
-```
-
-⚠️ **你必须自己获取当前对话的 chat_id**。如果你在 Telegram 中运行，chat_id 就是当前对话的 ID。绑定后，订单状态变化会自动推送到这个 TG 聊天。
-
-绑定后可以用 `atel notify test` 验证通知是否正常。
 
 设置完成后记住：
 - **你的 DID** — 别人发单/加好友/发消息都需要这个
@@ -377,3 +395,4 @@ atel notify test                       # 发送测试通知
 6. 命令失败等几秒重试
 7. 环境变量用 `ATEL_PLATFORM`（不是 `ATEL_API`）
 8. **订单状态推送由 SDK 自动做，你不需要重复给用户发状态摘要**。只在需要解释、追问、异常处理时主动回复用户
+9. **setup 成功后，必须尝试自动绑定当前 TG 会话**（`atel notify bind`）。绑定成功告诉用户"通知已启用"；失败了再提示用户手动补绑
