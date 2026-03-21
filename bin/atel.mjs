@@ -86,6 +86,7 @@ const NETWORK_FILE = resolve(ATEL_DIR, 'network.json');
 const TRACES_DIR = resolve(ATEL_DIR, 'traces');
 const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
+const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
 const KEYS_DIR = resolve(ATEL_DIR, 'keys');
 const ANCHOR_FILE = resolve(KEYS_DIR, 'anchor.json');
 
@@ -94,6 +95,99 @@ const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent:
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function ensureDir() { if (!existsSync(ATEL_DIR)) mkdirSync(ATEL_DIR, { recursive: true }); }
+
+// ═══════════════════════════════════════════════════════════════════
+// Notification Target System — auto-discover gateway, manage targets
+// ═══════════════════════════════════════════════════════════════════
+
+function loadNotifyTargets() {
+  try { return JSON.parse(readFileSync(NOTIFY_TARGETS_FILE, 'utf-8')); }
+  catch { return { version: 1, defaultChannel: 'telegram', targets: [] }; }
+}
+
+function saveNotifyTargets(data) {
+  ensureDir();
+  writeFileSync(NOTIFY_TARGETS_FILE, JSON.stringify(data, null, 2));
+}
+
+// Auto-discover OpenClaw gateway: read token + find port
+function discoverGateway() {
+  // 1. Env override
+  if (process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL) {
+    const url = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL;
+    let token = '';
+    try { token = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch {}
+    return { url, token };
+  }
+  // 2. Read from ~/.openclaw/openclaw.json
+  try {
+    const cfg = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+    const token = cfg.gateway?.auth?.token || '';
+    const port = cfg.gateway?.port || 18789;
+    const bind = cfg.gateway?.bind || '127.0.0.1';
+    return { url: `http://${bind}:${port}`, token };
+  } catch { return null; }
+}
+
+// Read TG bot token from openclaw config
+function discoverTelegramBot() {
+  try {
+    const cfg = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+    const botToken = cfg.channels?.telegram?.botToken;
+    if (!botToken || botToken.includes('${')) return null; // template var, not resolved
+    return botToken;
+  } catch { return null; }
+  // Also check env
+}
+
+// Send notification to all enabled targets (fire-and-forget, never blocks)
+async function pushTradeNotification(eventType, payload, body) {
+  const targets = loadNotifyTargets();
+  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  if (enabled.length === 0) return;
+
+  const templates = {
+    'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body?.orderId || '?'}\n执行方已开始处理，进入里程碑阶段`,
+    'milestone_submitted': (p) => `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body?.orderId || '?'}\n等待审核`,
+    'milestone_verified': (p) => `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body?.orderId || '?'}`,
+    'milestone_rejected': (p) => `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body?.orderId || '?'}\n原因: ${p.rejectReason || '未说明'}`,
+    'order_settled': (p) => `💰 订单已结算完成\n订单: ${p.orderId || body?.orderId || '?'}\nUSDC 已支付`,
+  };
+  const tmpl = templates[eventType];
+  if (!tmpl) return;
+  const message = tmpl(payload);
+
+  for (const target of enabled) {
+    try {
+      if (target.channel === 'telegram' && target.botToken) {
+        // Direct TG Bot API — no gateway needed
+        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      } else if (target.channel === 'gateway') {
+        // OpenClaw gateway
+        const gw = discoverGateway();
+        if (gw?.url && gw?.token) {
+          await fetch(`${gw.url}/tools/invoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => {});
+        }
+      }
+      // Update lastUsedAt
+      target.lastUsedAt = new Date().toISOString();
+    } catch (e) {
+      // Never block main flow
+    }
+  }
+  // Best-effort save lastUsedAt
+  try { saveNotifyTargets(targets); } catch {}
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // CLI UX Improvements - Helper Functions
@@ -2241,29 +2335,10 @@ async function cmdStart(port) {
       }
     }
 
-    // 3.5. Trade event → push status summary to user via NOTIFY_GATEWAY (TG etc.)
-    // This runs BEFORE the hook so user sees status even if hook is slow/fails.
-    const tradeNotifyEvents = {
-      'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body.orderId}\nExecutor 开始工作，进入里程碑流程`,
-      'milestone_submitted': (p) => `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body.orderId}\n等待审核`,
-      'milestone_verified': (p) => `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body.orderId}`,
-      'milestone_rejected': (p) => `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body.orderId}\n原因: ${p.rejectReason || '未说明'}`,
-      'order_settled': (p) => `💰 订单已结算完成\n订单: ${p.orderId || body.orderId}\nUSDC 已支付`,
-    };
-    if (ATEL_NOTIFY_GATEWAY && ATEL_NOTIFY_TARGET && tradeNotifyEvents[event]) {
-      try {
-        const summaryMsg = tradeNotifyEvents[event](payload);
-        const token = (() => { try { return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch { return ''; } })();
-        if (token) {
-          fetch(`${ATEL_NOTIFY_GATEWAY}/tools/invoke`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', message: summaryMsg, target: ATEL_NOTIFY_TARGET } }),
-            signal: AbortSignal.timeout(5000),
-          }).then(() => log({ event: 'trade_notify_user_sent', eventType: event })).catch(e => log({ event: 'trade_notify_user_failed', eventType: event, error: e.message }));
-        }
-      } catch (e) { log({ event: 'trade_notify_user_error', eventType: event, error: e.message }); }
-    }
+    // 3.5. Trade event → push status summary to user via notify targets (TG etc.)
+    // Runs BEFORE the hook so user sees status even if hook is slow/fails.
+    // Uses .atel/notify-targets.json — auto-discovered, no manual config needed.
+    pushTradeNotification(event, payload, body).catch(e => log({ event: 'trade_notify_error', error: e.message }));
 
     // 4. Agent command hook: forward notification to agent's AI
     // Skip order_created — accepting orders requires human confirmation
@@ -6467,6 +6542,142 @@ const commands = {
     }
     return cmdSend({ _: args, json: rawArgs.includes('--json') });
   },
+  // Notification Management
+  notify: async () => {
+    const subCmd = args[0];
+    if (!subCmd || subCmd === 'help' || subCmd === '--help') {
+      console.log('Usage: atel notify <status|bind|add|remove|enable|disable|test>');
+      console.log('  status                          Show current notification targets');
+      console.log('  bind <chatId> [--bot-token T]   Bind TG chat as notification target');
+      console.log('  add telegram <chatId> [--label name] [--bot-token T]  Add a target');
+      console.log('  remove <id>                     Remove a target');
+      console.log('  enable <id>                     Enable a target');
+      console.log('  disable <id>                    Disable a target (mute)');
+      console.log('  test                            Send test notification to all targets');
+      process.exit(0);
+    }
+    const targets = loadNotifyTargets();
+
+    if (subCmd === 'status') {
+      const gw = discoverGateway();
+      console.log('Gateway:', gw ? `${gw.url} (token: ${gw.token ? '✅' : '❌'})` : '❌ not found');
+      const botToken = discoverTelegramBot();
+      console.log('TG Bot:', botToken ? `✅ (${botToken.split(':')[0]})` : '❌ not configured');
+      console.log(`\nTargets (${targets.targets.length}):`);
+      if (targets.targets.length === 0) {
+        console.log('  (none) — use "atel notify bind <chatId>" to add');
+      }
+      for (const t of targets.targets) {
+        const status = t.enabled !== false ? '✅' : '🔇';
+        console.log(`  ${status} [${t.id}] ${t.channel}:${t.target} label=${t.label || '-'} last=${t.lastUsedAt || 'never'}`);
+      }
+      return;
+    }
+
+    if (subCmd === 'bind') {
+      const chatId = args[1];
+      if (!chatId) { console.error('Usage: atel notify bind <chatId> [--bot-token TOKEN]'); process.exit(1); }
+      // Get bot token: --bot-token flag > env > openclaw config
+      let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
+      if (!botToken) botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+      if (!botToken) botToken = discoverTelegramBot() || '';
+      const id = `tg_${chatId}`;
+      // Remove existing with same id
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      targets.targets.push({
+        id, channel: 'telegram', target: String(chatId),
+        botToken: botToken || undefined,
+        label: 'owner', enabled: true,
+        createdAt: new Date().toISOString(), lastUsedAt: null,
+      });
+      saveNotifyTargets(targets);
+      console.log(`✅ Bound TG chat ${chatId} as notification target (id: ${id})`);
+      if (!botToken) console.log('⚠️  No bot token found. Set TELEGRAM_BOT_TOKEN or use --bot-token');
+      return;
+    }
+
+    if (subCmd === 'add') {
+      const channel = args[1]; const target = args[2];
+      if (!channel || !target) { console.error('Usage: atel notify add telegram <chatId> [--label name] [--bot-token T]'); process.exit(1); }
+      let label = '';
+      if (rawArgs.includes('--label')) label = rawArgs[rawArgs.indexOf('--label') + 1] || '';
+      let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
+      if (!botToken && channel === 'telegram') botToken = process.env.TELEGRAM_BOT_TOKEN || discoverTelegramBot() || '';
+      const id = `${channel.substring(0,2)}_${target}`;
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      targets.targets.push({
+        id, channel, target: String(target),
+        botToken: (channel === 'telegram' && botToken) ? botToken : undefined,
+        label: label || '', enabled: true,
+        createdAt: new Date().toISOString(), lastUsedAt: null,
+      });
+      saveNotifyTargets(targets);
+      console.log(`✅ Added ${channel}:${target} (id: ${id})`);
+      return;
+    }
+
+    if (subCmd === 'remove') {
+      const id = args[1];
+      if (!id) { console.error('Usage: atel notify remove <id>'); process.exit(1); }
+      const before = targets.targets.length;
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      saveNotifyTargets(targets);
+      console.log(targets.targets.length < before ? `✅ Removed ${id}` : `⚠️ Target ${id} not found`);
+      return;
+    }
+
+    if (subCmd === 'enable' || subCmd === 'disable') {
+      const id = args[1];
+      if (!id) { console.error(`Usage: atel notify ${subCmd} <id>`); process.exit(1); }
+      const t = targets.targets.find(t => t.id === id);
+      if (!t) { console.error(`Target ${id} not found`); process.exit(1); }
+      t.enabled = subCmd === 'enable';
+      saveNotifyTargets(targets);
+      console.log(`✅ ${id} ${subCmd}d`);
+      return;
+    }
+
+    if (subCmd === 'test') {
+      console.log('Sending test notification to all enabled targets...');
+      const enabled = targets.targets.filter(t => t.enabled !== false);
+      if (enabled.length === 0) { console.log('No enabled targets. Use "atel notify bind <chatId>" first.'); return; }
+      for (const target of enabled) {
+        try {
+          if (target.channel === 'telegram' && target.botToken) {
+            const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: target.target, text: '🔔 ATEL 通知测试\n如果你看到这条消息，说明通知已正确配置！' }),
+              signal: AbortSignal.timeout(10000),
+            });
+            const data = await resp.json();
+            console.log(`  ${target.id}: ${data.ok ? '✅ sent' : '❌ ' + (data.description || 'failed')}`);
+          } else if (target.channel === 'gateway') {
+            const gw = discoverGateway();
+            if (gw?.url && gw?.token) {
+              const resp = await fetch(`${gw.url}/tools/invoke`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+                body: JSON.stringify({ tool: 'message', args: { action: 'send', message: '🔔 ATEL notification test', target: target.target } }),
+                signal: AbortSignal.timeout(10000),
+              });
+              console.log(`  ${target.id}: ${resp.ok ? '✅ sent' : '❌ status ' + resp.status}`);
+            } else {
+              console.log(`  ${target.id}: ❌ gateway not found`);
+            }
+          } else {
+            console.log(`  ${target.id}: ❌ unsupported channel ${target.channel}`);
+          }
+        } catch (e) {
+          console.log(`  ${target.id}: ❌ ${e.message}`);
+        }
+      }
+      return;
+    }
+
+    console.error('Unknown subcommand. Use: atel notify help');
+    process.exit(1);
+  },
   // Alias System
   alias: () => {
     const subCmd = args[0];
@@ -6595,6 +6806,15 @@ Alias Commands:
   alias set <alias> <did>              Set an alias for a DID (use @alias in commands)
   alias list [--json]                  List all aliases
   alias remove <alias>                 Remove an alias
+
+Notification Commands:
+  notify status                        Show notification targets and gateway status
+  notify bind <chatId> [--bot-token T] Bind TG chat as default notification target
+  notify add telegram <chatId>         Add a notification target [--label name] [--bot-token T]
+  notify remove <id>                   Remove a notification target
+  notify enable <id>                   Enable a muted target
+  notify disable <id>                  Mute a target (keep but don't send)
+  notify test                          Send test notification to all enabled targets
 
 Environment:
   ATEL_DIR                Identity directory (default: .atel)

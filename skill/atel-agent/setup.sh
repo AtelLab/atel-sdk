@@ -87,4 +87,7 @@ cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6
 echo "DID: $DID"
 echo "Port: $PORT"
 echo "pm2: $(pm2 jlist 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['pm2_env']['status'] if d else 'unknown')" 2>/dev/null || echo 'check: pm2 status')"
+echo ""
+echo "📢 To enable TG notifications, run:"
+echo "  cd ~/atel-workspace && atel notify bind <your-chat-id> --bot-token <bot-token>"
 echo "========================================="

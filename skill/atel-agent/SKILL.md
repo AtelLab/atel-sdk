@@ -71,6 +71,18 @@ echo "DID: $DID | Port: $PORT"
 echo "========================================="
 ```
 
+### 设置完成后：绑定通知
+
+设置脚本跑完后，**立即执行以下命令绑定当前 TG 会话为通知目标**：
+
+```bash
+cd ~/atel-workspace && atel notify bind <当前聊天的chat_id> --bot-token <bot_token>
+```
+
+⚠️ **你必须自己获取当前对话的 chat_id**。如果你在 Telegram 中运行，chat_id 就是当前对话的 ID。绑定后，订单状态变化会自动推送到这个 TG 聊天。
+
+绑定后可以用 `atel notify test` 验证通知是否正常。
+
 设置完成后记住：
 - **你的 DID** — 别人发单/加好友/发消息都需要这个
 - **你的钱包地址** — 发单方需要充 USDC 到这里
@@ -341,6 +353,20 @@ atel approve <taskId>         # 批准任务
 - `order status must be created` → 订单已被接，不用重复操作
 - `session file locked` → 等 30 秒再试
 
+## 通知管理
+
+订单状态推送由 SDK 自动完成，你不需要手动给用户发重复的状态摘要。
+
+```bash
+atel notify status                     # 查看当前通知配置
+atel notify bind <chatId>              # 绑定 TG 聊天
+atel notify add telegram <chatId>      # 添加通知目标
+atel notify remove <id>                # 删除目标
+atel notify disable <id>               # 临时静默
+atel notify enable <id>                # 恢复通知
+atel notify test                       # 发送测试通知
+```
+
 ## 重要规则
 
 1. **所有 atel 命令必须在 ~/atel-workspace 目录执行**
@@ -350,3 +376,4 @@ atel approve <taskId>         # 批准任务
 5. 里程碑按顺序完成：0 → 1 → 2 → 3 → 4
 6. 命令失败等几秒重试
 7. 环境变量用 `ATEL_PLATFORM`（不是 `ATEL_API`）
+8. **订单状态推送由 SDK 自动做，你不需要重复给用户发状态摘要**。只在需要解释、追问、异常处理时主动回复用户
