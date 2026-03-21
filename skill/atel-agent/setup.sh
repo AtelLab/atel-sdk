@@ -22,7 +22,7 @@ AGENT_NAME="agent-$(hostname -s 2>/dev/null || echo x)-$$"
 # 4. 初始化身份
 if [ ! -f .atel/identity.json ]; then
   echo "🔑 Creating identity as ${AGENT_NAME}..."
-  echo 'n' | ATEL_API=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
+  echo 'n' | ATEL_PLATFORM=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
 else
   echo "✅ Identity already exists"
   AGENT_NAME=$(python3 -c "import json; print(json.load(open('.atel/identity.json')).get('agent_id','agent-reuse'))" 2>/dev/null || echo "$AGENT_NAME")
@@ -37,7 +37,7 @@ PORT=${ATEL_PORT:-3000}
 
 register_agent() {
   local name="$1" port="$2"
-  ATEL_API=https://api.atelai.org atel register "$name" general "http://${MY_IP}:${port}" 2>&1
+  ATEL_PLATFORM=https://api.atelai.org atel register "$name" general "http://${MY_IP}:${port}" 2>&1
 }
 
 REG_OK=0
@@ -71,7 +71,7 @@ fi
 
 # 7. 启动 atel start（先启动，不阻塞等钱包）
 pm2 delete atel-agent 2>/dev/null || true
-pm2 start "cd ${WORKSPACE} && ATEL_API=https://api.atelai.org atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}" || { echo "❌ pm2 start failed"; exit 1; }
+pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=https://api.atelai.org atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}" || { echo "❌ pm2 start failed"; exit 1; }
 pm2 save 2>/dev/null || true
 
 # 8. 等钱包（短等，不阻塞太久）
@@ -83,7 +83,7 @@ echo ""
 echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 echo "========================================="
-cd "$WORKSPACE" && ATEL_API=https://api.atelai.org atel info 2>&1 | head -6 || true
+cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
 echo "DID: $DID"
 echo "Port: $PORT"
 echo "pm2: $(pm2 jlist 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['pm2_env']['status'] if d else 'unknown')" 2>/dev/null || echo 'check: pm2 status')"

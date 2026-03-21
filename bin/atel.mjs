@@ -2241,6 +2241,30 @@ async function cmdStart(port) {
       }
     }
 
+    // 3.5. Trade event → push status summary to user via NOTIFY_GATEWAY (TG etc.)
+    // This runs BEFORE the hook so user sees status even if hook is slow/fails.
+    const tradeNotifyEvents = {
+      'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body.orderId}\nExecutor 开始工作，进入里程碑流程`,
+      'milestone_submitted': (p) => `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body.orderId}\n等待审核`,
+      'milestone_verified': (p) => `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body.orderId}`,
+      'milestone_rejected': (p) => `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body.orderId}\n原因: ${p.rejectReason || '未说明'}`,
+      'order_settled': (p) => `💰 订单已结算完成\n订单: ${p.orderId || body.orderId}\nUSDC 已支付`,
+    };
+    if (ATEL_NOTIFY_GATEWAY && ATEL_NOTIFY_TARGET && tradeNotifyEvents[event]) {
+      try {
+        const summaryMsg = tradeNotifyEvents[event](payload);
+        const token = (() => { try { return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch { return ''; } })();
+        if (token) {
+          fetch(`${ATEL_NOTIFY_GATEWAY}/tools/invoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', message: summaryMsg, target: ATEL_NOTIFY_TARGET } }),
+            signal: AbortSignal.timeout(5000),
+          }).then(() => log({ event: 'trade_notify_user_sent', eventType: event })).catch(e => log({ event: 'trade_notify_user_failed', eventType: event, error: e.message }));
+        }
+      } catch (e) { log({ event: 'trade_notify_user_error', eventType: event, error: e.message }); }
+    }
+
     // 4. Agent command hook: forward notification to agent's AI
     // Skip order_created — accepting orders requires human confirmation
     // Only auto-trigger for milestone-related events
