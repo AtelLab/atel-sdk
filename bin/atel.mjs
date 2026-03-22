@@ -89,6 +89,8 @@ const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
 const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
 const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
+const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
+const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
 const KEYS_DIR = resolve(ATEL_DIR, 'keys');
 const ANCHOR_FILE = resolve(KEYS_DIR, 'anchor.json');
 
@@ -242,6 +244,102 @@ async function pushTradeNotification(eventType, payload, body) {
   }
   // Best-effort save lastUsedAt
   try { saveNotifyTargets(targets); } catch {}
+}
+
+function appendP2PTaskStatus(entry) {
+  if (!entry?.taskId || !entry?.status) return;
+  ensureDir();
+  appendFileSync(P2P_STATUS_FILE, `${JSON.stringify({ updatedAt: new Date().toISOString(), ...entry })}\n`);
+}
+
+async function pushP2PNotification(eventType, payload = {}) {
+  const targets = loadNotifyTargets();
+  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  if (enabled.length === 0) return;
+
+  const templates = {
+    'p2p_task_sent': (p) => `📤 P2P任务已发送\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_task_received': (p) => `📩 收到新的P2P任务\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_task_started': (p) => `▶️ P2P任务开始处理\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_result_received': (p) => `✅ P2P任务已完成\n任务: ${p.taskId || '?'}\n结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
+    'p2p_task_failed': (p) => `❌ P2P任务失败\n任务: ${p.taskId || '?'}\n原因: ${p.reason || '未知错误'}`,
+  };
+  const tmpl = templates[eventType];
+  if (!tmpl) return;
+  const message = tmpl(payload);
+
+  for (const target of enabled) {
+    try {
+      if (target.channel === 'telegram' && target.botToken) {
+        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      } else if (target.channel === 'gateway') {
+        const gw = discoverGateway();
+        if (gw?.url && gw?.token) {
+          await fetch(`${gw.url}/tools/invoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => {});
+        }
+      }
+      target.lastUsedAt = new Date().toISOString();
+    } catch {}
+  }
+  try { saveNotifyTargets(targets); } catch {}
+}
+
+function loadPendingAgentCallbacksPersisted() {
+  if (!existsSync(PENDING_AGENT_CALLBACKS_FILE)) return {};
+  try {
+    const data = JSON.parse(readFileSync(PENDING_AGENT_CALLBACKS_FILE, 'utf-8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePendingAgentCallbacksPersisted(data) {
+  ensureDir();
+  writeFileSync(PENDING_AGENT_CALLBACKS_FILE, JSON.stringify(data, null, 2));
+}
+
+function persistPendingAgentCallback(dedupeKey, data) {
+  if (!dedupeKey || !data) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  persisted[dedupeKey] = {
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
+  savePendingAgentCallbacksPersisted(persisted);
+}
+
+function markPersistedPendingAgentCallbackCompleted(dedupeKey, meta = {}) {
+  if (!dedupeKey) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  const existing = persisted[dedupeKey];
+  persisted[dedupeKey] = {
+    ...(existing || {}),
+    ...meta,
+    terminal: true,
+    completedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  savePendingAgentCallbacksPersisted(persisted);
+}
+
+function clearPersistedPendingAgentCallback(dedupeKey) {
+  if (!dedupeKey) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  if (!persisted[dedupeKey]) return;
+  delete persisted[dedupeKey];
+  savePendingAgentCallbacksPersisted(persisted);
 }
 
 async function executeRecommendedActionDirect(eventType, action, cwd, dedupeKey) {
@@ -2392,6 +2490,63 @@ async function cmdStart(port) {
     const dedupeKey = body.dedupeKey;
     const pending = dedupeKey ? pendingAgentCallbacks.get(dedupeKey) : null;
     if (!pending) {
+      const persisted = dedupeKey ? loadPendingAgentCallbacksPersisted()[dedupeKey] : null;
+      if (persisted?.terminal) {
+        log({
+          event: 'callback_late_skip',
+          dedupeKey,
+          eventType: persisted.eventType || body?.eventType || 'unknown',
+          callback_source: persisted.source || 'unknown',
+        });
+        res.json({ status: 'ok', skipped: true, reason: 'late_callback_after_completion' });
+        return;
+      }
+      log({
+        event: 'callback_404',
+        callback_404_type: 'unknown_dedupeKey',
+        dedupeKey,
+        callback_404_recovered: !!persisted,
+        callback_source: persisted?.source || 'unknown',
+        eventType: persisted?.eventType || body?.eventType || 'unknown',
+      });
+      if (persisted) {
+        const callbackAction = buildAgentCallbackAction(persisted.eventType, persisted.payload || {}, body);
+        if (callbackAction.ok && callbackAction.action?.type === 'local_result') {
+          try {
+            const localResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                taskId: callbackAction.action.taskId,
+                result: callbackAction.action.result,
+                success: true,
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const localBody = await localResp.json().catch(() => ({}));
+            if (localResp.ok) {
+              clearPersistedPendingAgentCallback(dedupeKey);
+              res.json({ status: 'ok', recovered: true });
+              return;
+            }
+            res.status(500).json({ error: localBody.error || 'local_result_callback_failed', recovered: false });
+            return;
+          } catch (e) {
+            res.status(500).json({ error: e.message || 'local_result_callback_failed', recovered: false });
+            return;
+          }
+        }
+        if (callbackAction.ok) {
+          const execResult = await executeRecommendedActionDirect(persisted.eventType, callbackAction.action, persisted.cwd || process.cwd(), dedupeKey);
+          if (execResult.ok) {
+            clearPersistedPendingAgentCallback(dedupeKey);
+            res.json({ status: 'ok', recovered: true });
+            return;
+          }
+          res.status(500).json({ error: execResult.error || 'callback_action_failed', recovered: false });
+          return;
+        }
+      }
       res.status(404).json({ error: 'Unknown dedupeKey' });
       return;
     }
@@ -2407,6 +2562,7 @@ async function cmdStart(port) {
 
     if (body.status === 'failed') {
       pendingAgentCallbacks.delete(dedupeKey);
+      clearPersistedPendingAgentCallback(dedupeKey);
       pending.resolve({ ok: false, body, error: body.error || 'agent_reported_failed' });
       res.json({ status: 'ok' });
       return;
@@ -2415,12 +2571,14 @@ async function cmdStart(port) {
     const callbackAction = buildAgentCallbackAction(pending.eventType, pending.payload || {}, body);
     if (callbackAction.skipped) {
       pendingAgentCallbacks.delete(dedupeKey);
+      markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', skipped: true, reason: callbackAction.reason });
       pending.resolve({ ok: true, skipped: true, body, reason: callbackAction.reason });
       res.json({ status: 'ok', skipped: true });
       return;
     }
     if (!callbackAction.ok) {
       pendingAgentCallbacks.delete(dedupeKey);
+      clearPersistedPendingAgentCallback(dedupeKey);
       pending.resolve({ ok: false, body, error: callbackAction.error || 'invalid_callback_payload' });
       res.status(400).json({ error: callbackAction.error || 'invalid_callback_payload' });
       return;
@@ -2440,6 +2598,11 @@ async function cmdStart(port) {
         });
         const localBody = await localResp.json().catch(() => ({}));
         pendingAgentCallbacks.delete(dedupeKey);
+        if (localResp.ok) {
+          markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: callbackAction.action, localBody });
+        } else {
+          clearPersistedPendingAgentCallback(dedupeKey);
+        }
         pending.resolve({ ok: localResp.ok, body, action: callbackAction.action, localBody });
         if (!localResp.ok) {
           res.status(500).json({ error: localBody.error || 'local_result_callback_failed' });
@@ -2449,6 +2612,7 @@ async function cmdStart(port) {
         return;
       } catch (e) {
         pendingAgentCallbacks.delete(dedupeKey);
+        clearPersistedPendingAgentCallback(dedupeKey);
         pending.resolve({ ok: false, body, action: callbackAction.action, error: e.message });
         res.status(500).json({ error: e.message || 'local_result_callback_failed' });
         return;
@@ -2457,6 +2621,11 @@ async function cmdStart(port) {
 
     const execResult = await executeRecommendedActionDirect(pending.eventType, callbackAction.action, pending.cwd || process.cwd(), dedupeKey);
     pendingAgentCallbacks.delete(dedupeKey);
+    if (execResult.ok) {
+      markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: callbackAction.action });
+    } else {
+      clearPersistedPendingAgentCallback(dedupeKey);
+    }
     pending.resolve({ ok: execResult.ok, body, action: callbackAction.action, execResult });
     if (!execResult.ok) {
       res.status(500).json({ error: execResult.error || 'callback_action_failed' });
@@ -2554,6 +2723,7 @@ ${callbackFailed}
     return await new Promise(async (resolve) => {
       const timer = setTimeout(() => {
         pendingAgentCallbacks.delete(dedupeKey);
+        persistPendingAgentCallback(dedupeKey, { eventType, payload, cwd, source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main', timeout: true });
         resolve({ ok: false, error: 'agent_callback_timeout' });
       }, timeoutMs);
 
@@ -2566,6 +2736,12 @@ ${callbackFailed}
           clearTimeout(timer);
           resolve(result);
         },
+      });
+      persistPendingAgentCallback(dedupeKey, {
+        eventType,
+        payload,
+        cwd,
+        source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main',
       });
 
       try {
@@ -2586,6 +2762,7 @@ ${callbackFailed}
         });
         if (!resp.ok) {
           pendingAgentCallbacks.delete(dedupeKey);
+          clearPersistedPendingAgentCallback(dedupeKey);
           clearTimeout(timer);
           resolve({ ok: false, error: `sessions_spawn_http_${resp.status}` });
           return;
@@ -2598,6 +2775,7 @@ ${callbackFailed}
         log({ event: 'agent_session_spawned', eventType, dedupeKey, childSessionKey });
       } catch (e) {
         pendingAgentCallbacks.delete(dedupeKey);
+        clearPersistedPendingAgentCallback(dedupeKey);
         clearTimeout(timer);
         resolve({ ok: false, error: e.message });
       }
@@ -2958,7 +3136,24 @@ ${callbackFailed}
   // Result callback: POST /atel/v1/result (executor calls this when done)
   endpoint.app?.post?.('/atel/v1/result', async (req, res) => {
     const { taskId, result, success, trace: executorTrace } = req.body || {};
-    if (!taskId || !pendingTasks[taskId]) { res.status(404).json({ error: 'Unknown taskId' }); return; }
+    if (!taskId || !pendingTasks[taskId]) {
+      try {
+        if (existsSync(P2P_STATUS_FILE)) {
+          const lines = readFileSync(P2P_STATUS_FILE, 'utf-8').split('\n').filter(Boolean);
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const entry = JSON.parse(lines[i]);
+            if (entry?.taskId === taskId && entry?.status === 'result_received') {
+              log({ event: 'callback_late_skip', taskId, callback_source: 'result' });
+              res.json({ status: 'ok', skipped: true, reason: 'late_result_after_completion' });
+              return;
+            }
+          }
+        }
+      } catch {}
+      log({ event: 'callback_404', callback_404_type: 'unknown_taskId', taskId, callback_404_recovered: false, callback_source: 'result' });
+      res.status(404).json({ error: 'Unknown taskId' });
+      return;
+    }
 
     // Milestone auto-execution removed. Agent handles results via its own AI.
     const task = pendingTasks[taskId];
@@ -3242,6 +3437,8 @@ ${callbackFailed}
     }
 
     log({ event: 'result_push_starting', taskId, hasSenderEndpoint: !!task.senderEndpoint, hasSenderCandidates: !!(task.senderCandidates?.length) });
+    appendP2PTaskStatus({ taskId, role: 'executor', peerDid: task.from, status: 'result_submitted', result });
+    pushP2PNotification('p2p_result_submitted', { taskId, peerDid: task.from, result }).catch(() => {});
 
     // Push result back to sender
     // Re-lookup sender if we don't have their endpoint (e.g., lookup failed at accept time)
@@ -3302,6 +3499,13 @@ ${callbackFailed}
     }
     } catch (pushErr) { log({ event: 'result_push_outer_error', taskId, error: pushErr.message, stack: pushErr.stack?.split('\n')[1]?.trim() }); }
 
+    appendP2PTaskStatus({ taskId, role: 'requester', peerDid: task.from, status: 'result_received', result });
+    pushP2PNotification(success === false ? 'p2p_task_failed' : 'p2p_result_received', {
+      taskId,
+      peerDid: task.from,
+      result,
+      reason: success === false ? (result?.error || 'execution_failed') : null,
+    }).catch(() => {});
     delete pendingTasks[taskId]; saveTasks(pendingTasks);
     res.json({ status: 'ok', proof_id: proof.proof_id, anchor_tx: anchor?.txHash || null });
   });
@@ -3483,6 +3687,13 @@ ${callbackFailed}
     // Ignore task-result messages (these are responses, not new tasks)
     if (message.type === 'task-result' || payload.status === 'completed' || payload.status === 'failed') {
       log({ event: 'result_received', type: 'task-result', from: message.from, taskId: payload.taskId, status: payload.status, proof: payload.proof || null, anchor: payload.anchor || null, execution: payload.execution || null, result: payload.result || null, timestamp: new Date().toISOString() });
+      appendP2PTaskStatus({ taskId: payload.taskId, role: 'requester', peerDid: message.from, status: 'result_received', result: payload.result || null });
+      pushP2PNotification(payload.status === 'failed' ? 'p2p_task_failed' : 'p2p_result_received', {
+        taskId: payload.taskId,
+        peerDid: message.from,
+        result: payload.result || null,
+        reason: payload.error || payload.result?.error || null,
+      }).catch(() => {});
       return { status: 'ok', message: 'Result received' };
     }
 
@@ -3597,10 +3808,12 @@ ${callbackFailed}
           encrypted: !!session?.encrypted,
           reason: 'open_mode_requires_confirm'
         };
-        savePending(pending);
-        
-        log({ 
-          event: 'task_queued', 
+      savePending(pending);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      
+      log({ 
+        event: 'task_queued', 
           taskId, 
           from: message.from, 
           action, 
@@ -3659,6 +3872,8 @@ ${callbackFailed}
         encrypted: !!session?.encrypted,
       };
       savePending(pending);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
       log({ event: 'task_queued', taskId, from: message.from, action, reason: taskMode === 'confirm' ? 'task_mode_confirm' : 'autoAcceptP2P_off', timestamp: new Date().toISOString() });
       return { status: 'queued', taskId, message: 'Task queued for manual confirmation. Use: atel approve ' + taskId };
     }
@@ -3690,14 +3905,21 @@ ${callbackFailed}
       sessionId: accessCheck.sessionId
     };
     saveTasks(pendingTasks);
+    appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
     log({ event: 'task_accepted', taskId, from: message.from, action, encrypted: !!session?.encrypted, relationship: accessCheck.relationship, timestamp: new Date().toISOString() });
 
     // Forward to executor, gateway session, or echo fallback
     if (EXECUTOR_URL) {
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
       fetch(EXECUTOR_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId, from: message.from, action, payload, encrypted: !!session?.encrypted, toolProxy: `http://127.0.0.1:${toolProxyPort}` }) }).catch(e => log({ event: 'executor_forward_failed', taskId, error: e.message }));
       return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
     } else {
       const p2pPrompt = `你是 ATEL 接单方 Agent，收到一个 P2P 任务。\n任务类型：${action}\n任务内容：${JSON.stringify(payload?.payload || payload || {}, null, 2)}\n请认真完成任务，并通过回调返回最终结果。`;
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
       const queued = queueAgentHook('p2p_task', `p2p:${taskId}`, p2pPrompt, process.cwd(), { taskId });
       if (queued) {
         return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
@@ -3715,6 +3937,8 @@ ${callbackFailed}
       const anchor = await anchorOnChain(proof.trace_root, { proof_id: proof.proof_id, executorDid: id.did, requesterDid: message.from, action, taskId });
       const echoAcceptedAt = pendingTasks[taskId]?.acceptedAt;
       delete pendingTasks[taskId]; saveTasks(pendingTasks);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_failed', reason: 'no_executor' });
+      pushP2PNotification('p2p_task_failed', { taskId, peerDid: message.from, reason: 'no_executor' }).catch(() => {});
 
       // ── Trust Score + Graph Update (echo mode) ──
       try {
@@ -4346,10 +4570,13 @@ async function cmdTask(target, taskJson) {
     const relayAck = await relaySend('/atel/v1/task', msg);
 
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: 'relay', relay_ack: relayAck, note: 'Relay mode is async. Waiting for result (up to 120s)...' }));
+    const relayTaskId = relayAck?.result?.taskId || msg.id || msg.payload?.taskId;
+    appendP2PTaskStatus({ taskId: relayTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
+    pushP2PNotification('p2p_task_sent', { taskId: relayTaskId, peerDid: remoteDid }).catch(() => {});
 
     // Wait for result to arrive in inbox (poll for task-result)
     // Extract taskId from relay ack (assigned by remote agent), fallback to msg fields
-    const taskId = relayAck?.result?.taskId || msg.id || msg.payload?.taskId;
+    const taskId = relayTaskId;
     let result = null;
     const waitStart = Date.now();
     const WAIT_TIMEOUT = 120000; // 2 minutes
@@ -4429,6 +4656,9 @@ async function cmdTask(target, taskJson) {
     const msg = createMessage({ type: 'task', from: id.did, to: remoteDid, payload: enhancedPayload, secretKey: id.secretKey });
     const result = await client.sendTask(remoteEndpoint, msg, hsManager);
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: remoteEndpoint, result }, null, 2));
+    const directTaskId = result?.taskId || taskRequest.taskId || msg.id || msg.payload?.taskId;
+    appendP2PTaskStatus({ taskId: directTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
+    pushP2PNotification('p2p_task_sent', { taskId: directTaskId, peerDid: remoteDid }).catch(() => {});
 
     // Update local trust history
     const success = result?.status !== 'rejected' && result?.status !== 'failed';
