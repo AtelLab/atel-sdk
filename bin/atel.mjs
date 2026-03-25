@@ -5614,6 +5614,24 @@ async function cmdBalance() {
       console.log(`  ${chain.toUpperCase()}: query failed (${e.message})`);
     }
   }
+
+  // Platform ledger balance
+  try {
+    const balResp = await fetch(`${PLATFORM_URL}/account/v1/balance?did=${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
+    if (balResp.ok) {
+      const bal = await balResp.json();
+      const available = parseFloat(bal.available ?? bal.balance ?? 0).toFixed(2);
+      const frozen = parseFloat(bal.frozen ?? 0).toFixed(2);
+      const total = (parseFloat(available) + parseFloat(frozen)).toFixed(2);
+      console.log(`  Platform: $${total}`);
+      console.log(`    Available: $${available}`);
+      console.log(`    Frozen: $${frozen}`);
+    } else {
+      console.log(`  Platform: query failed (HTTP ${balResp.status})`);
+    }
+  } catch (e) {
+    console.log(`  Platform: query failed (${e.message})`);
+  }
 }
 
 async function cmdDeposit(amount, channel) {
@@ -6548,6 +6566,17 @@ async function cmdOfferList(did) {
   } else {
     console.log('  No active offers found.');
   }
+}
+
+async function cmdOfferInfo(offerId) {
+  if (!offerId) { console.error('Usage: atel offer-info <offerId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/offer/${encodeURIComponent(offerId)}`, { signal: AbortSignal.timeout(10000) });
+  if (!resp.ok) {
+    console.error(`Error: Failed to fetch offer (HTTP ${resp.status})`);
+    process.exit(1);
+  }
+  const data = await resp.json();
+  console.log(JSON.stringify(data, null, 2));
 }
 
 async function cmdOfferUpdate(offerId) {
@@ -7847,7 +7876,7 @@ const commands = {
   // Offers
   offer: () => cmdOfferCreate(args[0], args[1]),
   offers: () => cmdOfferList(args[0]),
-  'offer-info': () => cmdOfferList(args[0]), // alias — single offer uses GET /offer/:id
+  'offer-info': () => cmdOfferInfo(args[0]),
   'offer-update': () => cmdOfferUpdate(args[0]),
   'offer-close': () => cmdOfferClose(args[0]),
   'offer-buy': () => cmdOfferBuy(args[0], args[1]),
