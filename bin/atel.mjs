@@ -5632,6 +5632,21 @@ async function cmdWithdraw(amount, address, chain) {
   }
   // Smart wallet withdrawal (new flow)
   chain = chain || 'base';
+
+  // Validate destination address
+  const channel = 'crypto_' + chain;
+  if (channel === 'crypto_base' || channel === 'crypto_bsc') {
+    if (!address.match(/^0x[0-9a-fA-F]{40}$/)) {
+      console.error('Invalid EVM address. Must be 0x followed by 40 hex characters.');
+      process.exit(1);
+    }
+  } else if (channel === 'crypto_solana') {
+    if (!address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      console.error('Invalid Solana address.');
+      process.exit(1);
+    }
+  }
+
   try {
     const data = await signedFetch('POST', '/trade/v1/wallet/withdraw', {
       amount: parseFloat(amount),
