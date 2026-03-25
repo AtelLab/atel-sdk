@@ -3086,7 +3086,8 @@ ${callbackFailed}
   function sanitizeHookSessionId(value) {
     const raw = String(value || '').trim();
     if (!raw) return `atel-hook-${Date.now()}`;
-    const cleaned = raw.replace(/[^a-zA-Z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '');
+    // Replace colons with dashes — openclaw rejects colons in session IDs
+    const cleaned = raw.replace(/:/g, '-').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
     return (cleaned || `atel-hook-${Date.now()}`).slice(0, 120);
   }
 
@@ -5768,6 +5769,10 @@ async function cmdTradeTask(capability, description) {
 
 async function cmdOrder(executorDid, capType, price) {
   if (!executorDid || !capType || !price) { console.error('Usage: atel order <executorDid> <capabilityType> <price> [--desc "task description"]'); process.exit(1); }
+  // Resolve @alias to full DID
+  if (executorDid.startsWith('@')) {
+    try { executorDid = resolveDID(executorDid); } catch (e) { console.error(e.message); process.exit(1); }
+  }
   const description = rawArgs.find((a, i) => rawArgs[i-1] === '--desc') || '';
   const id = requireIdentity();
   
