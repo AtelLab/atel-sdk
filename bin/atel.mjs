@@ -3679,6 +3679,26 @@ ${callbackFailed}
             return;
           }
           if (localAction.ok && !localAction.skipped) {
+            // Guard: if agent hook already submitted via its own shell command during execution,
+            // the milestone status will have changed. Re-check before double-submitting.
+            if (['milestone_rejected', 'milestone_verified', 'milestone_plan_confirmed'].includes(hookEvent)) {
+              const guardCmd = localAction.action?.command;
+              if (Array.isArray(guardCmd) && guardCmd[0] === 'atel' && guardCmd[1] === 'milestone-submit' && guardCmd[2]) {
+                try {
+                  const guardResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${guardCmd[2]}/milestones`, { signal: AbortSignal.timeout(8000) });
+                  if (guardResp.ok) {
+                    const guardState = await guardResp.json();
+                    const guardIdx = Number.parseInt(String(guardCmd[3]), 10);
+                    const guardMs = Array.isArray(guardState?.milestones) ? guardState.milestones.find(m => m.index === guardIdx) : null;
+                    if (guardMs && guardMs.status === 'submitted') {
+                      log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey });
+                      finishHook();
+                      return;
+                    }
+                  }
+                } catch {}
+              }
+            }
             executeRecommendedActionDirect(hookEvent, localAction.action, hookCwd || process.cwd(), hookKey)
               .then((execResult) => {
                 if (execResult.ok) {
