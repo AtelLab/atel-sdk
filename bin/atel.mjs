@@ -5271,108 +5271,68 @@ async function cmdResult(taskId, resultJson) {
 
 async function cmdCheck(targetDid, riskLevel, options) {
   const risk = riskLevel || 'low';
-  const chainMode = options?.chain || !!process.env.ATEL_SOLANA_RPC_URL;
   const policy = loadPolicy();
   const tp = policy.trustPolicy || DEFAULT_POLICY.trustPolicy;
+  const RISK_THRESHOLDS = { low: 0, medium: 30, high: 50, critical: 75 };
 
-  console.log(JSON.stringify({ event: 'checking_trust', did: targetDid, risk, mode: chainMode ? 'chain-verified' : 'local-only' }));
+  console.log(JSON.stringify({ event: 'checking_trust', did: targetDid, risk }));
 
-  // 1. Get Registry info (reference only, includes wallets)
-  let registryScore = null;
-  let agentName = null;
-  let peerWallets = null;
+  // 1. Fetch agent profile from Platform (primary source of truth)
+  let platformAgent = null;
+  let platformScore = null;
+  let platformReachable = true;
   try {
-    const r = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`${ATEL_PLATFORM}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      platformAgent = await r.json();
+      platformScore = platformAgent.trustScore;
+    }
+  } catch {
+    platformReachable = false;
+  }
+
+  // 2. Fetch trust history from Platform
+  let trustEvents = [];
+  try {
+    const r = await fetch(`${ATEL_PLATFORM}/registry/v1/agent/${encodeURIComponent(targetDid)}/trust-history`, { signal: AbortSignal.timeout(5000) });
     if (r.ok) {
       const d = await r.json();
-      registryScore = d.trustScore;
-      agentName = d.name;
-      if (d.wallets) peerWallets = d.wallets;
+      trustEvents = d.events || [];
     }
   } catch {}
 
-  // 2. Local interaction history
+  // 3. Local interaction history (secondary/fallback)
   const localHistoryFile = resolve(ATEL_DIR, 'trust-history.json');
   let history = {};
   try { history = JSON.parse(readFileSync(localHistoryFile, 'utf-8')); } catch {}
   const agentHistory = history[targetDid] || { tasks: 0, successes: 0, failures: 0, lastSeen: null, proofs: [] };
+  const localScore = computeTrustScore(agentHistory);
 
-  // 3. Chain-verified mode: query all three chains by wallet address
-  let chainVerification = null;
-  if (chainMode) {
-    const chainResults = { solana: null, base: null, bsc: null, totalRecords: 0, matchingDid: 0 };
-
-    // 3a. Verify unverified local proofs on-chain
-    const unverifiedProofs = agentHistory.proofs.filter(p => !p.verified && p.anchor_tx);
-    if (unverifiedProofs.length > 0) {
-      console.log(JSON.stringify({ event: 'verifying_local_proofs', count: unverifiedProofs.length }));
-      const result = await verifyAnchorTxList(unverifiedProofs, targetDid);
-      for (const vp of result.proofs) {
-        const existing = agentHistory.proofs.find(p => p.anchor_tx === vp.anchor_tx);
-        if (existing) existing.verified = true;
-      }
-      history[targetDid] = agentHistory;
-      try { writeFileSync(localHistoryFile, JSON.stringify(history, null, 2)); } catch {}
-    }
-
-    // 3b. Query peer's wallet addresses on all three chains
-    if (peerWallets) {
-      console.log(JSON.stringify({ event: 'querying_chain_history', wallets: peerWallets }));
-
-      // Solana
-      if (peerWallets.solana) {
-        try {
-          const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-          const provider = new SolanaAnchorProvider({ rpcUrl });
-          const records = await provider.queryByWallet(peerWallets.solana, { limit: 100, filterDid: targetDid });
-          chainResults.solana = { wallet: peerWallets.solana, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.solana = { error: e.message }; }
-      }
-
-      // Base
-      if (peerWallets.base) {
-        try {
-          const { BaseAnchorProvider } = await import('@lawrenceliang-btc/atel-sdk');
-          const baseRpc = process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org';
-          const provider = new BaseAnchorProvider({ rpcUrl: baseRpc });
-          const explorerApi = process.env.ATEL_BASE_EXPLORER_API || 'https://api.basescan.org/api';
-          const apiKey = process.env.ATEL_BASE_EXPLORER_KEY;
-          const records = await provider.queryByWallet(peerWallets.base, explorerApi, apiKey, { limit: 100, filterDid: targetDid });
-          chainResults.base = { wallet: peerWallets.base, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.base = { error: e.message }; }
-      }
-
-      // BSC
-      if (peerWallets.bsc) {
-        try {
-          const { BSCAnchorProvider } = await import('@lawrenceliang-btc/atel-sdk');
-          const bscRpc = process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
-          const provider = new BSCAnchorProvider({ rpcUrl: bscRpc });
-          const explorerApi = process.env.ATEL_BSC_EXPLORER_API || 'https://api.bscscan.com/api';
-          const apiKey = process.env.ATEL_BSC_EXPLORER_KEY;
-          const records = await provider.queryByWallet(peerWallets.bsc, explorerApi, apiKey, { limit: 100, filterDid: targetDid });
-          chainResults.bsc = { wallet: peerWallets.bsc, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.bsc = { error: e.message }; }
+  // 4. Local TrustGraph info (supplementary)
+  let graphInfo = null;
+  try {
+    const saved = JSON.parse(readFileSync(resolve(ATEL_DIR, 'trust-graph.json'), 'utf-8'));
+    if (saved.interactions) {
+      const tg = new TrustGraph();
+      for (const i of saved.interactions) tg.recordInteraction(i);
+      const directConns = saved.interactions.filter(
+        i => i.from === targetDid || i.to === targetDid
+      );
+      if (directConns.length > 0) {
+        const stats = tg.getStats();
+        graphInfo = { directConnections: directConns.length, stats };
       }
     }
+  } catch {}
 
-    chainVerification = chainResults;
-  }
+  // 5. Determine effective score: Platform is primary, local is fallback
+  const effectiveScore = platformScore !== null ? platformScore : localScore;
+  const scoreSource = platformScore !== null ? 'platform' : 'local';
+  const trustLevel = computeTrustLevel(effectiveScore);
 
-  // 4. Compute unified trust score and level
-  const computedScore = computeTrustScore(agentHistory);
-  const trustLevel = computeTrustLevel(computedScore);
-
-  // 5. Apply trust policy
-  const threshold = tp.riskThresholds?.[risk] ?? 0;
-  const effectiveScore = computedScore > 0 ? computedScore : (registryScore || 0);
-  const isNewAgent = agentHistory.tasks === 0;
+  // 6. Apply trust policy (allow/deny decision)
+  const threshold = RISK_THRESHOLDS[risk] ?? (tp.riskThresholds?.[risk] ?? 0);
+  const isNewAgent = platformAgent === null && agentHistory.tasks === 0;
   let decision = 'allow';
   let reason = '';
 
@@ -5391,28 +5351,82 @@ async function cmdCheck(targetDid, riskLevel, options) {
     reason = `Score ${effectiveScore} meets threshold ${threshold} for ${risk} risk`;
   }
 
+  // 7. Build human-readable output
+  const lines = [];
+  lines.push(`Trust Check: ${targetDid}`);
+  if (platformAgent?.name) lines.push(`  Name: ${platformAgent.name}`);
+  lines.push(`  Platform Score: ${effectiveScore} / 100${scoreSource === 'local' ? ' (fallback: local)' : ''}`);
+  lines.push(`  Decision: ${decision} (threshold: ${threshold} for ${risk} risk)`);
+  if (reason) lines.push(`  Reason: ${reason}`);
+
+  // Recent events from Platform
+  if (trustEvents.length > 0) {
+    lines.push(`  Recent Events:`);
+    for (const ev of trustEvents.slice(0, 10)) {
+      const delta = ev.scoreDelta >= 0 ? `+${ev.scoreDelta}` : `${ev.scoreDelta}`;
+      const date = ev.createdAt ? ev.createdAt.split('T')[0] : '';
+      const ref = ev.referenceId || '';
+      lines.push(`    ${delta.padEnd(8)} ${ev.eventType.padEnd(22)} ${ref.padEnd(16)} ${date}`);
+    }
+    if (trustEvents.length > 10) lines.push(`    ... and ${trustEvents.length - 10} more`);
+  }
+
+  // Stats from Platform
+  if (platformAgent?.stats) {
+    const s = platformAgent.stats;
+    const successPct = s.successRate != null ? `${Math.round(s.successRate * 100)}%` : 'n/a';
+    lines.push(`  Stats: ${s.totalTasks} tasks, ${successPct} success${s.avgRating ? `, avg rating: ${s.avgRating.toFixed(1)}` : ''}`);
+  } else if (agentHistory.tasks > 0) {
+    const successPct = agentHistory.tasks > 0 ? `${Math.round((agentHistory.successes / agentHistory.tasks) * 100)}%` : 'n/a';
+    lines.push(`  Stats: ${agentHistory.tasks} tasks, ${successPct} success (local)`);
+  }
+
+  // Verified & Certification from Platform
+  if (platformAgent) {
+    lines.push(`  Verified: ${platformAgent.verified || false}`);
+    if (platformAgent.certification) {
+      lines.push(`  Certification: ${platformAgent.certification.level} (since ${platformAgent.certification.since})`);
+    }
+    if (platformAgent.boost?.active) {
+      lines.push(`  Boost: ${platformAgent.boost.tier} (active)`);
+    }
+  }
+
+  // Local TrustGraph supplementary info
+  if (graphInfo) {
+    lines.push(`  Local Graph: ${graphInfo.directConnections} direct connection${graphInfo.directConnections !== 1 ? 's' : ''}`);
+  }
+
+  // Fallback warning
+  if (!platformReachable) {
+    lines.push(`  Warning: Platform unreachable, using local score as fallback`);
+  }
+
+  // Print human-readable output
+  console.log(lines.join('\n'));
+
+  // Also emit structured JSON for machine consumption
   const output = {
     did: targetDid,
-    name: agentName,
-    mode: chainMode ? 'chain-verified' : 'local-only',
-    trust: {
-      computed_score: computedScore,
-      registry_score: registryScore,
-      effective_score: effectiveScore,
-      level: trustLevel.level,
-      level_name: trustLevel.name,
-      max_risk: trustLevel.maxRisk,
-      total_tasks: agentHistory.tasks,
-      successes: agentHistory.successes,
-      failures: agentHistory.failures,
-      verified_proofs: agentHistory.proofs.filter(p => p.verified).length,
-      total_proofs: agentHistory.proofs.length,
-    },
-    policy: { risk, threshold, decision, reason },
+    name: platformAgent?.name || null,
+    score: effectiveScore,
+    scoreSource,
+    level: trustLevel.level,
+    levelName: trustLevel.name,
+    decision,
+    risk,
+    threshold,
+    reason,
+    verified: platformAgent?.verified || false,
+    certification: platformAgent?.certification || null,
+    stats: platformAgent?.stats || null,
+    recentEvents: trustEvents.slice(0, 10),
+    localGraph: graphInfo,
+    platformReachable,
   };
-  if (chainVerification) output.chain_verification = chainVerification;
-  if (!chainMode) output.note = 'Local-only mode: score based on direct interaction history only. Set ATEL_SOLANA_RPC_URL or use --chain for on-chain verification.';
-
+  if (localScore > 0 && scoreSource === 'platform') {
+    output.localScore = localScore;
+  }
   console.log(JSON.stringify(output, null, 2));
 }
 
