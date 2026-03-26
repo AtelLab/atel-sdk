@@ -5772,7 +5772,9 @@ async function cmdTradeTask(capability, description) {
   while (Date.now() - startTime < timeout) {
     await new Promise(r => setTimeout(r, 3000));
     try {
-      const info = await signedFetch('GET', `/trade/v1/order/${orderId}`);
+      const pollResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+      if (!pollResp.ok) throw new Error(`HTTP ${pollResp.status}`);
+      const info = await pollResp.json();
       if (info.status !== lastStatus) {
         console.error(`[trade-task] Status: ${lastStatus} → ${info.status}`);
         lastStatus = info.status;
