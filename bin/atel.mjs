@@ -26,7 +26,14 @@
  *   atel order <did> <cap> <price>      Create a trade order
  *   atel accept <orderId>               Accept an order (executor)
  *   atel reject <orderId>               Reject an order (executor)
- *   atel escrow <orderId>               Freeze funds for order (requester)
+ *   atel escrow <orderId>               Lock USDC on-chain for paid order (requester)
+ *
+ * Milestone Commands:
+ *   atel milestone-status <orderId>     View milestone progress
+ *   atel milestone-feedback <orderId>   Approve plan or request revision
+ *   atel milestone-submit <orderId> <i> Submit milestone result
+ *   atel milestone-verify <orderId> <i> Verify milestone (--pass or --reject)
+ *   atel chain-records <orderId>        View on-chain transaction records
  *   atel complete <orderId> [taskId]    Mark order complete (executor)
  *   atel confirm <orderId>              Confirm delivery + settle (requester)
  *   atel rate <orderId> <1-5> [comment] Rate the other party
@@ -45,11 +52,12 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { cmdHub } from './hub-helpers.mjs';
+import { resolve, join, dirname } from 'node:path';
 import crypto from 'node:crypto';
 import {
   AgentIdentity, AgentEndpoint, AgentClient, HandshakeManager,
-  createMessage, RegistryClient, ExecutionTrace, ProofGenerator,
+  createMessage, verifyMessage, parseDID, RegistryClient, ExecutionTrace, ProofGenerator,
   SolanaAnchorProvider, BaseAnchorProvider, BSCAnchorProvider,
   autoNetworkSetup, collectCandidates, connectToAgent,
   discoverPublicIP, checkReachable, ContentAuditor, TrustScoreClient,
@@ -57,7 +65,11 @@ import {
   TrustGraph, calculateTaskWeight,
 } from '@lawrenceliang-btc/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
-import { initializeOllama, getOllamaStatus } from './ollama-manager.mjs';
+import { buildAgentCallbackAction, getDirectExecutableActions, normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from './notification-action-helpers.mjs';
+// ollama-manager removed — SDK does not run local models
+const initializeOllama = async () => {};
+const getOllamaStatus = async () => ({ running: false, models: [] });
+import { parseAttachmentFlags, processAttachments } from './atel-attachment-helpers.mjs';
 
 const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
@@ -76,14 +88,555 @@ const NETWORK_FILE = resolve(ATEL_DIR, 'network.json');
 const TRACES_DIR = resolve(ATEL_DIR, 'traces');
 const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
+const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
+const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
+const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
+const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
+const ORDER_WORK_DIR = resolve(ATEL_DIR, 'order-workspaces');
 const KEYS_DIR = resolve(ATEL_DIR, 'keys');
 const ANCHOR_FILE = resolve(KEYS_DIR, 'anchor.json');
 
-const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent: 10, allowedDIDs: [], blockedDIDs: [], taskMode: 'auto', autoAcceptPlatform: true, autoAcceptP2P: true, trustPolicy: { minScore: 0, newAgentPolicy: 'allow_low_risk', riskThresholds: { low: 0, medium: 50, high: 75, critical: 90 } } };
+const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent: 10, allowedDIDs: [], blockedDIDs: [], taskMode: 'auto', autoAcceptPlatform: true, autoAcceptP2P: true, agentMode: 'manual', autoPolicy: { acceptOrders: false, acceptMaxAmount: 0, autoApprovePlan: false }, trustPolicy: { minScore: 0, newAgentPolicy: 'allow_low_risk', riskThresholds: { low: 0, medium: 50, high: 75, critical: 90 } } };
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function ensureDir() { if (!existsSync(ATEL_DIR)) mkdirSync(ATEL_DIR, { recursive: true }); }
+
+function ensureOrderWorkspace(orderId, context = {}) {
+  ensureDir();
+  const safeOrderId = String(orderId || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const dir = resolve(ORDER_WORK_DIR, safeOrderId);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const contextFile = join(dir, 'ORDER_CONTEXT.md');
+  const lines = [
+    `# ATEL Order Context`,
+    ``,
+    `Order ID: ${orderId || ''}`,
+    `Chain: ${context.chain || ''}`,
+    `Role: ${context.role || ''}`,
+    `Status: ${context.status || ''}`,
+    `Phase: ${context.phase || ''}`,
+    `Current Milestone: ${context.currentMilestone ?? ''}`,
+    `Milestone Title: ${context.milestoneTitle || ''}`,
+    ``,
+    `## Order Description`,
+    context.orderDescription || '',
+    ``,
+    `## Milestone Objective`,
+    context.milestoneObjective || '',
+    ``,
+    `## Submission Content`,
+    context.resultSummary || '',
+    ``,
+    `## Previous Approved Outputs`,
+    context.previousApprovedOutputs || '',
+    ``,
+    `## Hard Rules`,
+    `- Only work from the order description and milestone objective in this file.`,
+    `- Do not inspect unrelated local projects or repository content unless the order explicitly asks for repo analysis.`,
+    `- Do not infer a different project from stray files in the machine workspace.`,
+    `- Return only content that directly satisfies this order.`,
+    ``,
+  ];
+  writeFileSync(contextFile, lines.join('\n'));
+  return { dir, contextFile };
+}
+
+function getOrderWorkspace(orderId, context = {}) {
+  if (!orderId) return { dir: process.cwd(), contextFile: '' };
+  return ensureOrderWorkspace(orderId, context);
+}
+
+function getAtelWorkspaceRoot() {
+  return dirname(ATEL_DIR);
+}
+
+function shouldAllowRepoAccess(context = {}) {
+  const description = String(context?.orderDescription || '').toLowerCase();
+  const objective = String(context?.milestoneObjective || '').toLowerCase();
+  const resultSummary = String(context?.resultSummary || '').toLowerCase();
+  const previousApprovedOutputs = String(context?.previousApprovedOutputs || '').toLowerCase();
+  const combined = `${description}\n${objective}\n${resultSummary}\n${previousApprovedOutputs}`;
+  return /(repo|repository|codebase|仓库|代码库|项目代码|source code|read files|analyze code|修改代码|修复代码|实现功能)/i.test(combined);
+}
+
+function summarizeApprovedMilestones(milestones = [], beforeIndex = Number.MAX_SAFE_INTEGER) {
+  return (Array.isArray(milestones) ? milestones : [])
+    .filter((m) => m && m.status === 'verified' && Number.isFinite(m.index) && m.index < beforeIndex)
+    .sort((a, b) => a.index - b.index)
+    .map((m) => `M${m.index}: ${m.title || ''}\nResult: ${m.resultSummary || ''}`.trim())
+    .join('\n\n');
+}
+
+function sanitizeAgentPrompt(promptText, meta = {}) {
+  const raw = typeof promptText === 'string' ? promptText : '';
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    log({ event: 'agent_prompt_skip_empty', eventType: meta.eventType || 'unknown', dedupeKey: meta.dedupeKey || '' });
+    return '';
+  }
+
+  // Keep a large but bounded margin below upstream model limits. We only need
+  // concise task prompts here; oversized prompts add noise and can trigger
+  // upstream length validation errors.
+  const maxChars = 16000;
+  if (trimmed.length <= maxChars) return trimmed;
+
+  const truncated = `${trimmed.slice(0, maxChars)}\n\n[Prompt truncated by ATEL SDK to stay within model input limits.]`;
+  log({
+    event: 'agent_prompt_truncated',
+    eventType: meta.eventType || 'unknown',
+    dedupeKey: meta.dedupeKey || '',
+    originalChars: trimmed.length,
+    finalChars: truncated.length,
+  });
+  return truncated;
+}
+
+function isKnownUpstreamModelInputError(text) {
+  const value = String(text || '');
+  return value.includes('InternalError.Algo.InvalidParameter')
+    || value.includes('Range of input length should be [1, 258048]');
+}
+
+function summarizeAgentOutput(text, maxChars = 300) {
+  const raw = String(text || '');
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (isKnownUpstreamModelInputError(trimmed)) return '[suppressed upstream model input-length error]';
+  return trimmed.substring(0, maxChars);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Notification Target System — auto-discover gateway, manage targets
+// ═══════════════════════════════════════════════════════════════════
+
+function loadNotifyTargets() {
+  try { return JSON.parse(readFileSync(NOTIFY_TARGETS_FILE, 'utf-8')); }
+  catch { return { version: 1, defaultChannel: 'telegram', targets: [] }; }
+}
+
+function saveNotifyTargets(data) {
+  ensureDir();
+  writeFileSync(NOTIFY_TARGETS_FILE, JSON.stringify(data, null, 2));
+}
+
+// Auto-detect current TG chat from OpenClaw session state
+function discoverTelegramChat() {
+  const sessionPaths = [
+    join(process.env.HOME || '', '.openclaw/agents/main/sessions/sessions.json'),
+    join(process.env.HOME || '', '.openclaw/sessions/sessions.json'),
+  ];
+  for (const p of sessionPaths) {
+    try {
+      const data = JSON.parse(readFileSync(p, 'utf-8'));
+      // sessions.json can be { "agent:main:main": { lastChannel, lastTo, ... } } or flat
+      const entries = typeof data === 'object' ? Object.values(data) : [];
+      for (const session of entries) {
+        if (session?.lastChannel === 'telegram' && typeof session?.lastTo === 'string' && session.lastTo.startsWith('telegram:')) {
+          return session.lastTo.split(':', 2)[1]; // "telegram:123456" → "123456"
+        }
+      }
+      // Also check top-level
+      if (data?.lastChannel === 'telegram' && typeof data?.lastTo === 'string' && data.lastTo.startsWith('telegram:')) {
+        return data.lastTo.split(':', 2)[1];
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Auto-bind TG notification target if not already bound
+function autoBindNotifications() {
+  const targets = loadNotifyTargets();
+  if (targets.targets.length > 0) return; // already has targets
+
+  const chatId = discoverTelegramChat();
+  if (!chatId) return;
+
+  const botToken = discoverTelegramBot();
+  const id = `tg_${chatId}`;
+  targets.targets.push({
+    id, channel: 'telegram', target: chatId,
+    botToken: botToken || undefined,
+    label: 'owner', enabled: true,
+    createdAt: new Date().toISOString(), lastUsedAt: null,
+  });
+  saveNotifyTargets(targets);
+  console.log(`🔔 Auto-bound TG notifications to chat ${chatId}`);
+}
+
+// Auto-discover OpenClaw gateway: read token + find port
+function discoverGateway() {
+  // 1. Env override
+  if (process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL) {
+    const url = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL;
+    let token = '';
+    try { token = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch {}
+    return { url, token };
+  }
+  // 2. Read from ~/.openclaw/openclaw.json
+  try {
+    const cfg = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+    const token = cfg.gateway?.auth?.token || '';
+    const port = cfg.gateway?.port || 18789;
+    const bind = normalizeGatewayBind(cfg.gateway?.bind || '127.0.0.1');
+    return { url: `http://${bind}:${port}`, token };
+  } catch { return null; }
+}
+
+function loadOpenClawConfig() {
+  try {
+    return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+// Read TG bot token from openclaw config
+function discoverTelegramBot() {
+  try {
+    const cfg = loadOpenClawConfig();
+    const botToken = cfg.channels?.telegram?.botToken;
+    if (!botToken || botToken.includes('${')) return null; // template var, not resolved
+    return botToken;
+  } catch { return null; }
+  // Also check env
+}
+
+// Send notification to all enabled targets (fire-and-forget, never blocks)
+async function pushTradeNotification(eventType, payload, body) {
+  const targets = loadNotifyTargets();
+  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  if (enabled.length === 0) return;
+
+  const templates = {
+    'order_created': (p) => `📥 收到新订单\n订单: ${p.orderId || body?.orderId || '?'}\n金额: $${p.priceAmount ?? '?'} USDC\n来自: ${p.requesterDid || '未知请求方'}\n请审核后决定是否接单`,
+    'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body?.orderId || '?'}\n执行方已开始处理，进入里程碑阶段`,
+    'milestone_submitted': (p) => {
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}\n等待审核`;
+    },
+    'milestone_verified': (p) => {
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      const progress = p.totalMilestones ? `\n进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
+      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
+    },
+    'milestone_rejected': (p) => {
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body?.orderId || '?'}${desc}\n原因: ${p.rejectReason || '未说明'}`;
+    },
+    'order_settled': (p) => {
+      const amount = p.priceAmount ? `\n金额: $${p.priceAmount} USDC` : '';
+      return `💰 订单已结算完成\n订单: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC 已支付`;
+    },
+  };
+  const tmpl = templates[eventType];
+  if (!tmpl) return;
+  const message = tmpl(payload);
+
+  for (const target of enabled) {
+    try {
+      if (target.channel === 'telegram' && target.botToken) {
+        // Direct TG Bot API — no gateway needed
+        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      } else if (target.channel === 'gateway') {
+        // OpenClaw gateway
+        const gw = discoverGateway();
+        if (gw?.url && gw?.token) {
+          await fetch(`${gw.url}/tools/invoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => {});
+        }
+      }
+      // Update lastUsedAt
+      target.lastUsedAt = new Date().toISOString();
+    } catch (e) {
+      // Never block main flow
+    }
+  }
+  // Best-effort save lastUsedAt
+  try { saveNotifyTargets(targets); } catch {}
+}
+
+function appendP2PTaskStatus(entry) {
+  if (!entry?.taskId || !entry?.status) return;
+  ensureDir();
+  appendFileSync(P2P_STATUS_FILE, `${JSON.stringify({ updatedAt: new Date().toISOString(), ...entry })}\n`);
+}
+
+async function pushP2PNotification(eventType, payload = {}) {
+  const targets = loadNotifyTargets();
+  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  if (enabled.length === 0) return;
+
+  const templates = {
+    'p2p_task_sent': (p) => `📤 P2P任务已发送\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_task_received': (p) => `📩 收到新的P2P任务\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_task_started': (p) => `▶️ P2P任务开始处理\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_result_received': (p) => `✅ P2P任务已完成\n任务: ${p.taskId || '?'}\n结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
+    'p2p_task_failed': (p) => `❌ P2P任务失败\n任务: ${p.taskId || '?'}\n原因: ${p.reason || '未知错误'}`,
+  };
+  const tmpl = templates[eventType];
+  if (!tmpl) return;
+  const message = tmpl(payload);
+
+  for (const target of enabled) {
+    try {
+      if (target.channel === 'telegram' && target.botToken) {
+        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      } else if (target.channel === 'gateway') {
+        const gw = discoverGateway();
+        if (gw?.url && gw?.token) {
+          await fetch(`${gw.url}/tools/invoke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => {});
+        }
+      }
+      target.lastUsedAt = new Date().toISOString();
+    } catch {}
+  }
+  try { saveNotifyTargets(targets); } catch {}
+}
+
+function loadPendingAgentCallbacksPersisted() {
+  if (!existsSync(PENDING_AGENT_CALLBACKS_FILE)) return {};
+  try {
+    const data = JSON.parse(readFileSync(PENDING_AGENT_CALLBACKS_FILE, 'utf-8'));
+    return data && typeof data === 'object' ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePendingAgentCallbacksPersisted(data) {
+  ensureDir();
+  writeFileSync(PENDING_AGENT_CALLBACKS_FILE, JSON.stringify(data, null, 2));
+}
+
+function persistPendingAgentCallback(dedupeKey, data) {
+  if (!dedupeKey || !data) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  persisted[dedupeKey] = {
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
+  savePendingAgentCallbacksPersisted(persisted);
+}
+
+function markPersistedPendingAgentCallbackCompleted(dedupeKey, meta = {}) {
+  if (!dedupeKey) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  const existing = persisted[dedupeKey];
+  persisted[dedupeKey] = {
+    ...(existing || {}),
+    ...meta,
+    terminal: true,
+    completedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  savePendingAgentCallbacksPersisted(persisted);
+}
+
+function clearPersistedPendingAgentCallback(dedupeKey) {
+  if (!dedupeKey) return;
+  const persisted = loadPendingAgentCallbacksPersisted();
+  if (!persisted[dedupeKey]) return;
+  delete persisted[dedupeKey];
+  savePendingAgentCallbacksPersisted(persisted);
+}
+
+async function executeRecommendedActionDirect(eventType, action, cwd, dedupeKey) {
+  const command = Array.isArray(action?.command) ? action.command.filter(Boolean) : [];
+  if (command.length === 0) {
+    return { ok: false, skipped: true, reason: 'empty_command' };
+  }
+  const actionKey = JSON.stringify(command);
+  if (globalThis.__atelActiveDirectActionKeys?.has(actionKey)) {
+    log({
+      event: 'recommended_action_direct_skip',
+      eventType,
+      dedupeKey,
+      action: action.action,
+      command,
+      reason: 'inflight_duplicate',
+    });
+    return { ok: true, skipped: true, reason: 'inflight_duplicate' };
+  }
+
+  // Idempotency guard: short-circuit duplicate milestone plan/submit/verify actions
+  // if the order or milestone has already advanced past the required state.
+  if (command[0] === 'atel' && (command[1] === 'milestone-feedback' || command[1] === 'milestone-verify' || command[1] === 'milestone-submit') && command.length >= 3) {
+    const orderId = command[2];
+    const needsMilestoneIndex = command[1] === 'milestone-verify' || command[1] === 'milestone-submit';
+    const index = needsMilestoneIndex ? Number.parseInt(String(command[3]), 10) : null;
+    if (orderId && (!needsMilestoneIndex || Number.isFinite(index))) {
+      try {
+        const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`, { signal: AbortSignal.timeout(10000) });
+        if (resp.ok) {
+          const state = await resp.json();
+          if (command[1] === 'milestone-feedback' && command.includes('--approve') && state?.orderStatus && state.orderStatus !== 'milestone_review') {
+            log({
+              event: 'recommended_action_direct_skip',
+              eventType,
+              dedupeKey,
+              action: action.action,
+              command,
+              reason: `order_status_${state.orderStatus}`,
+            });
+            return { ok: true, skipped: true, reason: `order_status_${state.orderStatus}` };
+          }
+          if (command[1] === 'milestone-submit' && state?.orderStatus && state.orderStatus !== 'executing') {
+            log({
+              event: 'recommended_action_direct_skip',
+              eventType,
+              dedupeKey,
+              action: action.action,
+              command,
+              reason: `order_status_${state.orderStatus}`,
+            });
+            return { ok: true, skipped: true, reason: `order_status_${state.orderStatus}` };
+          }
+          const milestone = needsMilestoneIndex && Array.isArray(state?.milestones) ? state.milestones.find((m) => m.index === index) : null;
+          if (needsMilestoneIndex && milestone) {
+            const expectedStatuses = command[1] === 'milestone-verify'
+              ? ['submitted']
+              : (eventType === 'milestone_rejected' ? ['pending', 'rejected'] : ['pending']);
+            if (!expectedStatuses.includes(milestone.status)) {
+              log({
+                event: 'recommended_action_direct_skip',
+                eventType,
+                dedupeKey,
+                action: action.action,
+                command,
+                reason: `milestone_status_${milestone.status}`,
+              });
+              return { ok: true, skipped: true, reason: `milestone_status_${milestone.status}` };
+            }
+          }
+        }
+      } catch (e) {
+        log({
+          event: 'recommended_action_direct_guard_error',
+          eventType,
+          dedupeKey,
+          action: action.action,
+          command,
+          error: e.message,
+        });
+      }
+    }
+  }
+
+  const { execFile } = await import('child_process');
+  const childCmd = command[0] === 'atel' ? process.execPath : command[0];
+  const childArgs = command[0] === 'atel' ? [process.argv[1], ...command.slice(1)] : command.slice(1);
+  const childCwd = command[0] === 'atel' ? getAtelWorkspaceRoot() : cwd;
+
+  log({ event: 'recommended_action_direct_trigger', eventType, dedupeKey, action: action.action, command });
+  globalThis.__atelActiveDirectActionKeys ??= new Set();
+  globalThis.__atelActiveDirectActionKeys.add(actionKey);
+
+  return await new Promise((resolve) => {
+    execFile(childCmd, childArgs, { timeout: 180000, cwd: childCwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      globalThis.__atelActiveDirectActionKeys?.delete(actionKey);
+      if (err) {
+        const combinedErrorText = String(stderr || err.message || '');
+        if (
+          command[0] === 'atel' &&
+          command[1] === 'milestone-feedback' &&
+          command.includes('--approve') &&
+          combinedErrorText.includes('order not in milestone_review status')
+        ) {
+          log({
+            event: 'recommended_action_direct_skip',
+            eventType,
+            dedupeKey,
+            action: action.action,
+            command,
+            reason: 'order_status_executing',
+          });
+          resolve({ ok: true, skipped: true, reason: 'order_status_executing' });
+          return;
+        }
+        if (
+          command[0] === 'atel' &&
+          command[1] === 'milestone-submit' &&
+          combinedErrorText.includes('milestone cannot be submitted in status: submitted')
+        ) {
+          log({
+            event: 'recommended_action_direct_skip',
+            eventType,
+            dedupeKey,
+            action: action.action,
+            command,
+            reason: 'milestone_status_submitted',
+          });
+          resolve({ ok: true, skipped: true, reason: 'milestone_status_submitted' });
+          return;
+        }
+        if (
+          command[0] === 'atel' &&
+          command[1] === 'milestone-verify' &&
+          (combinedErrorText.includes('milestone cannot be verified in status: verified') ||
+           combinedErrorText.includes('milestone not in submitted status') ||
+           combinedErrorText.includes('milestone cannot be verified in status: settled'))
+        ) {
+          log({
+            event: 'recommended_action_direct_skip',
+            eventType,
+            dedupeKey,
+            action: action.action,
+            command,
+            reason: 'milestone_already_processed',
+          });
+          resolve({ ok: true, skipped: true, reason: 'milestone_already_processed' });
+          return;
+        }
+        log({
+          event: 'recommended_action_direct_error',
+          eventType,
+          dedupeKey,
+          action: action.action,
+          command,
+          error: err.message,
+          stderr: (stderr || '').substring(0, 400),
+        });
+        resolve({ ok: false, error: err.message });
+        return;
+      }
+
+      log({
+        event: 'recommended_action_direct_done',
+        eventType,
+        dedupeKey,
+        action: action.action,
+        command,
+        stdout: summarizeAgentOutput(stdout, 400),
+      });
+      resolve({ ok: true, stdout });
+    });
+  });
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // CLI UX Improvements - Helper Functions
@@ -250,6 +803,23 @@ Friend Management Commands:
     Examples:
       atel friend status
 
+── How Friend System Affects Communication ──────────────────────────
+
+  By default, agents operate in "friends_only" mode:
+    • P2P messages (atel send) and tasks will be REJECTED if you are not a friend
+    • You must send a friend request and have it accepted first
+
+  Typical flow to communicate with a new agent:
+    1. atel friend request <their-did> --message "Hi, lets connect!"
+    2. They run: atel friend pending         (to see your request)
+    3. They run: atel friend accept <req-id> (to accept)
+    4. Now you can: atel send <their-did> "Hello!"
+
+  To allow communication WITHOUT friend relationship (open mode):
+    Edit .atel/policy.json and set:
+    { "relationshipPolicy": { "defaultMode": "open" } }
+    Restart your agent. Both sides can configure this independently.
+
 For more information, visit: https://docs.atel.io/friend-system
   `);
 }
@@ -363,7 +933,7 @@ function getGatewayUrl() {
   return 'http://127.0.0.1:18789';
 }
 
-function saveIdentity(id) { ensureDir(); writeFileSync(IDENTITY_FILE, JSON.stringify({ agent_id: id.agent_id, did: id.did, publicKey: Buffer.from(id.publicKey).toString('hex'), secretKey: Buffer.from(id.secretKey).toString('hex') }, null, 2)); }
+function saveIdentity(id) { ensureDir(); writeFileSync(IDENTITY_FILE, JSON.stringify({ agent_id: id.agent_id, did: id.did, publicKey: Buffer.from(id.publicKey).toString('hex'), secretKey: Buffer.from(id.secretKey).toString('hex') }, null, 2), { mode: 0o600 }); }
 function loadIdentity() { if (!existsSync(IDENTITY_FILE)) return null; const d = JSON.parse(readFileSync(IDENTITY_FILE, 'utf-8')); return new AgentIdentity({ agent_id: d.agent_id, publicKey: Uint8Array.from(Buffer.from(d.publicKey, 'hex')), secretKey: Uint8Array.from(Buffer.from(d.secretKey, 'hex')) }); }
 function requireIdentity() { const id = loadIdentity(); if (!id) { console.error('No identity. Run: atel init'); process.exit(1); } return id; }
 
@@ -483,6 +1053,36 @@ function parseCapabilitiesWithPricing(capString) {
 
 function loadPolicy() { if (!existsSync(POLICY_FILE)) return { ...DEFAULT_POLICY }; try { return { ...DEFAULT_POLICY, ...JSON.parse(readFileSync(POLICY_FILE, 'utf-8')) }; } catch { return { ...DEFAULT_POLICY }; } }
 function savePolicy(p) { ensureDir(); writeFileSync(POLICY_FILE, JSON.stringify(p, null, 2)); }
+function loadTrackedOrders() {
+  if (!existsSync(TRADE_TRACK_FILE)) return [];
+  try {
+    const data = JSON.parse(readFileSync(TRADE_TRACK_FILE, 'utf-8'));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+function saveTrackedOrders(orders) {
+  ensureDir();
+  writeFileSync(TRADE_TRACK_FILE, JSON.stringify(orders, null, 2));
+}
+function trackOrder(orderId, role) {
+  if (!orderId || !role) return;
+  const now = new Date().toISOString();
+  const orders = loadTrackedOrders().filter((o) => o && o.orderId);
+  const existing = orders.find((o) => o.orderId === orderId);
+  if (existing) {
+    existing.role = role;
+    existing.updatedAt = now;
+  } else {
+    orders.push({ orderId, role, updatedAt: now });
+  }
+  saveTrackedOrders(orders);
+}
+function untrackOrder(orderId) {
+  if (!orderId) return;
+  saveTrackedOrders(loadTrackedOrders().filter((o) => o?.orderId !== orderId));
+}
 function loadTasks() { if (!existsSync(TASKS_FILE)) return {}; try { return JSON.parse(readFileSync(TASKS_FILE, 'utf-8')); } catch { return {}; } }
 function saveTasks(t) { ensureDir(); writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2)); }
 function loadNetwork() { if (!existsSync(NETWORK_FILE)) return null; try { return JSON.parse(readFileSync(NETWORK_FILE, 'utf-8')); } catch { return null; } }
@@ -1283,14 +1883,15 @@ async function anchorOnChain(traceRoot, metadata, preferredChain) {
         privateKey: key 
       });
     } else if (chain === 'base') {
-      provider = new BaseAnchorProvider({ 
-        rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', 
-        privateKey: key 
+      provider = new BaseAnchorProvider({
+        rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org',
+        privateKey: key,
+        anchorRegistryAddress: process.env.ATEL_ANCHOR_REGISTRY_ADDRESS || undefined,
       });
     } else if (chain === 'bsc') {
-      provider = new BSCAnchorProvider({ 
-        rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', 
-        privateKey: key 
+      provider = new BSCAnchorProvider({
+        rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org',
+        privateKey: key
       });
     } else {
       return null;
@@ -1510,7 +2111,28 @@ async function cmdAnchor(subcommand) {
 
 async function cmdInfo() {
   const id = requireIdentity();
-  console.log(JSON.stringify({ agent_id: id.agent_id, did: id.did, capabilities: loadCapabilities(), policy: loadPolicy(), network: loadNetwork(), executor: EXECUTOR_URL || 'not configured' }, null, 2));
+  const info = { agent_id: id.agent_id, did: id.did, capabilities: loadCapabilities(), policy: loadPolicy(), network: loadNetwork(), executor: EXECUTOR_URL || 'not configured' };
+
+  // Fetch wallet info from Platform
+  try {
+    const resp = await fetch(`${PLATFORM_URL}/registry/v1/agent/${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const agent = await resp.json();
+      if (agent.wallets) {
+        let wallets;
+        try { wallets = typeof agent.wallets === 'string' ? JSON.parse(agent.wallets) : agent.wallets; } catch { wallets = agent.wallets; }
+        info.wallets = wallets;
+        console.log('\n💳 Smart Wallet Addresses:');
+        if (wallets.base) console.log(`  Base: ${wallets.base}`);
+        if (wallets.bsc) console.log(`  BSC:  ${wallets.bsc}`);
+        if (wallets.type) console.log(`  Type: ${wallets.type}`);
+        console.log('\n  Transfer USDC to the address above to fund your wallet.');
+        console.log('  No ETH/BNB needed — platform pays gas.\n');
+      }
+    }
+  } catch {}
+
+  console.log(JSON.stringify(info, null, 2));
 }
 
 async function cmdStatus() {
@@ -1745,11 +2367,13 @@ async function startToolGatewayProxy(port, identity, policy) {
 
 async function cmdStart(port) {
   const id = requireIdentity();
-  // Initialize Ollama (auto-start and download model)
-  await initializeOllama().catch(err => {
-    console.error(`[Ollama] Initialization failed: ${err.message}`);
-    console.error(`[Ollama] Audit will use rule-based verification only`);
-  });
+  // Initialize Ollama only if explicitly enabled (optional local AI audit)
+  if (process.env.ATEL_OLLAMA_ENABLED === 'true') {
+    await initializeOllama().catch(err => {
+      console.error(`[Ollama] Initialization failed: ${err.message}`);
+      console.error(`[Ollama] Audit will use rule-based verification only`);
+    });
+  }
 
   const p = parseInt(port || '3100');
   const caps = loadCapabilities();
@@ -1895,25 +2519,61 @@ async function cmdStart(port) {
   const toolGatewayServer = await startToolGatewayProxy(toolProxyPort, id, policy);
   log({ event: 'tool_gateway_started', port: toolProxyPort });
 
-  // ── Built-in Executor (auto-start if no external ATEL_EXECUTOR_URL) ──
-  let builtinExecutor = null;
-  if (!EXECUTOR_URL) {
-    const executorPort = p + 2;
+  // ── Agent AI integration ──
+  // Auto-detect OpenClaw: check PATH, then ~/.openclaw, then common source locations
+  let detectedAgentCmd = process.env.ATEL_AGENT_CMD || '';
+  if (!detectedAgentCmd) {
+    const { execSync } = await import('child_process');
+    const home = process.env.HOME || '/root';
+
+    // Try 1: openclaw in PATH
     try {
-      const { BuiltinExecutor } = await import('../dist/executor/index.js');
-      builtinExecutor = new BuiltinExecutor({
-        port: executorPort,
-        callbackUrl: `http://127.0.0.1:${p}/atel/v1/result`,
-        gatewayUrl: getGatewayUrl(),
-        contextPath: join(ATEL_DIR, 'agent-context.md'),
-        log,
-      });
-      await builtinExecutor.start();
-      EXECUTOR_URL = `http://127.0.0.1:${executorPort}`;
-      log({ event: 'builtin_executor_started', port: executorPort, url: EXECUTOR_URL });
-    } catch (e) {
-      log({ event: 'builtin_executor_failed', error: e.message, note: 'Falling back to echo mode. Set ATEL_EXECUTOR_URL for external executor.' });
+      execSync('which openclaw', { stdio: 'ignore' });
+      detectedAgentCmd = 'openclaw agent --agent main --local -m';
+    } catch {}
+
+    // Try 2: ~/.openclaw exists (installed but not in PATH — use npx or find binary)
+    if (!detectedAgentCmd) {
+      try {
+        const { existsSync } = await import('fs');
+        if (existsSync(join(home, '.openclaw', 'workspace'))) {
+          // Find openclaw binary or source
+          const candidates = [
+            '/usr/local/bin/openclaw',
+            '/usr/bin/openclaw',
+            join(home, '.openclaw', 'bin', 'openclaw'),
+          ];
+          for (const c of candidates) {
+            if (existsSync(c)) { detectedAgentCmd = `${c} agent --agent main --local -m`; break; }
+          }
+          // Try npx
+          if (!detectedAgentCmd) {
+            try { execSync('npx openclaw --version', { stdio: 'ignore', timeout: 5000 }); detectedAgentCmd = 'npx openclaw agent --agent main --local -m'; } catch {}
+          }
+          // Try source form (common dev setup)
+          if (!detectedAgentCmd) {
+            const srcPaths = [
+              join(home, 'Desktop', 'openclaw', 'localclaw', 'app', 'openclaw-main', 'openclaw.mjs'),
+              join(home, 'openclaw', 'openclaw.mjs'),
+            ];
+            for (const s of srcPaths) {
+              if (existsSync(s)) { detectedAgentCmd = `node ${s} agent --agent main --local -m`; break; }
+            }
+          }
+        }
+      } catch {}
     }
+
+    if (detectedAgentCmd) {
+      log({ event: 'agent_hook_auto_detected', cmd: detectedAgentCmd.substring(0, 60) });
+      console.log('🤝 OpenClaw detected — agent hook enabled');
+    } else {
+      log({ event: 'no_agent_hook', note: 'No OpenClaw found. Set ATEL_AGENT_CMD for agent automation.' });
+      console.log('📋 No agent AI detected. Set ATEL_AGENT_CMD or install OpenClaw.');
+    }
+  } else {
+    log({ event: 'agent_hook_configured', cmd: detectedAgentCmd.substring(0, 60) });
+    console.log('🤝 Agent hook configured');
   }
 
   // ── Trust Score Client (persistent) ──
@@ -2035,258 +2695,1062 @@ async function cmdStart(port) {
     }
   });
 
-  // Webhook notification: POST /atel/v1/notify (platform calls this for order events)
-  endpoint.app?.post?.('/atel/v1/notify', async (req, res) => {
-    const { event, payload } = req.body || {};
-    if (!event || !payload) {
-      res.status(400).json({ error: 'event and payload required' });
+  // ── Event dedup (processed eventIds) ──
+  const processedEvents = new Set();
+  const pendingAgentCallbacks = new Map();
+
+  // ── Agent hook queue (serialize hook executions to avoid session lock conflicts) ──
+  let hookBusy = false;
+  const hookQueue = [];
+  const activeRecoveryKeys = new Set();
+
+  endpoint.app?.post?.('/atel/v1/agent-callback', async (req, res) => {
+    const body = req.body || {};
+    const dedupeKey = body.dedupeKey;
+    const pending = dedupeKey ? pendingAgentCallbacks.get(dedupeKey) : null;
+    if (!pending) {
+      const persisted = dedupeKey ? loadPendingAgentCallbacksPersisted()[dedupeKey] : null;
+      if (persisted?.terminal) {
+        log({
+          event: 'callback_late_skip',
+          dedupeKey,
+          eventType: persisted.eventType || body?.eventType || 'unknown',
+          callback_source: persisted.source || 'unknown',
+        });
+        res.json({ status: 'ok', skipped: true, reason: 'late_callback_after_completion' });
+        return;
+      }
+      log({
+        event: 'callback_404',
+        callback_404_type: 'unknown_dedupeKey',
+        dedupeKey,
+        callback_404_recovered: !!persisted,
+        callback_source: persisted?.source || 'unknown',
+        eventType: persisted?.eventType || body?.eventType || 'unknown',
+      });
+      if (persisted) {
+        const callbackAction = buildAgentCallbackAction(persisted.eventType, persisted.payload || {}, body);
+        if (callbackAction.ok && callbackAction.action?.type === 'local_result') {
+          try {
+            const localResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                taskId: callbackAction.action.taskId,
+                result: callbackAction.action.result,
+                success: true,
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const localBody = await localResp.json().catch(() => ({}));
+            if (localResp.ok) {
+              clearPersistedPendingAgentCallback(dedupeKey);
+              res.json({ status: 'ok', recovered: true });
+              return;
+            }
+            res.status(500).json({ error: localBody.error || 'local_result_callback_failed', recovered: false });
+            return;
+          } catch (e) {
+            res.status(500).json({ error: e.message || 'local_result_callback_failed', recovered: false });
+            return;
+          }
+        }
+        if (callbackAction.ok) {
+          const execResult = await executeRecommendedActionDirect(persisted.eventType, callbackAction.action, persisted.cwd || process.cwd(), dedupeKey);
+          if (execResult.ok) {
+            clearPersistedPendingAgentCallback(dedupeKey);
+            res.json({ status: 'ok', recovered: true });
+            return;
+          }
+          res.status(500).json({ error: execResult.error || 'callback_action_failed', recovered: false });
+          return;
+        }
+      }
+      // Treat late/duplicate/expired callbacks as idempotent skips rather than hard errors.
+      // The callback source has already completed, timed out, or been recovered elsewhere.
+      res.json({ status: 'ok', skipped: true, reason: 'unknown_or_expired_dedupeKey' });
+      return;
+    }
+    log({
+      event: 'agent_callback_received',
+      eventType: pending.eventType,
+      dedupeKey,
+      status: body.status || 'done',
+      summary: body.summary,
+      error: body.error,
+      childSessionKey: pending.childSessionKey,
+    });
+
+    if (body.status === 'failed') {
+      // Some subagents pessimistically send `failed` after already producing a usable
+      // summary/result because they observed a callback transport error on their side.
+      // If the payload is still actionable, recover it here instead of dropping the flow.
+      const failedAction = buildAgentCallbackAction(pending.eventType, pending.payload || {}, body);
+      if (failedAction.ok && !failedAction.skipped) {
+        log({
+          event: 'agent_callback_failed_recovered',
+          eventType: pending.eventType,
+          dedupeKey,
+          childSessionKey: pending.childSessionKey,
+          summary: body.summary,
+          error: body.error,
+        });
+
+        if (failedAction.action?.type === 'local_result') {
+          try {
+            const localResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                taskId: failedAction.action.taskId,
+                result: failedAction.action.result,
+                success: true,
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const localBody = await localResp.json().catch(() => ({}));
+            pendingAgentCallbacks.delete(dedupeKey);
+            if (localResp.ok) {
+              markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: failedAction.action, localBody, recoveredFromFailed: true });
+              pending.resolve({ ok: true, recovered: true, body, action: failedAction.action, localBody });
+              res.json({ status: 'ok', recovered: true });
+              return;
+            }
+            clearPersistedPendingAgentCallback(dedupeKey);
+            pending.resolve({ ok: false, body, action: failedAction.action, localBody, error: localBody.error || 'local_result_callback_failed' });
+            res.status(500).json({ error: localBody.error || 'local_result_callback_failed' });
+            return;
+          } catch (e) {
+            pendingAgentCallbacks.delete(dedupeKey);
+            clearPersistedPendingAgentCallback(dedupeKey);
+            pending.resolve({ ok: false, body, action: failedAction.action, error: e.message });
+            res.status(500).json({ error: e.message || 'local_result_callback_failed' });
+            return;
+          }
+        }
+
+        const execResult = await executeRecommendedActionDirect(pending.eventType, failedAction.action, pending.cwd || process.cwd(), dedupeKey);
+        pendingAgentCallbacks.delete(dedupeKey);
+        if (execResult.ok) {
+          markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: failedAction.action, recoveredFromFailed: true });
+          pending.resolve({ ok: true, recovered: true, body, action: failedAction.action, execResult });
+          res.json({ status: 'ok', recovered: true });
+          return;
+        }
+        clearPersistedPendingAgentCallback(dedupeKey);
+        pending.resolve({ ok: false, body, action: failedAction.action, execResult, error: execResult.error || 'callback_action_failed' });
+        res.status(500).json({ error: execResult.error || 'callback_action_failed' });
+        return;
+      }
+
+      pendingAgentCallbacks.delete(dedupeKey);
+      clearPersistedPendingAgentCallback(dedupeKey);
+      pending.resolve({ ok: false, body, error: body.error || 'agent_reported_failed' });
+      res.json({ status: 'ok' });
       return;
     }
 
-    log({ event: 'webhook_received', type: event, payload });
+    const callbackAction = buildAgentCallbackAction(pending.eventType, pending.payload || {}, body);
+    if (callbackAction.skipped) {
+      pendingAgentCallbacks.delete(dedupeKey);
+      markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', skipped: true, reason: callbackAction.reason });
+      pending.resolve({ ok: true, skipped: true, body, reason: callbackAction.reason });
+      res.json({ status: 'ok', skipped: true });
+      return;
+    }
+    if (!callbackAction.ok) {
+      pendingAgentCallbacks.delete(dedupeKey);
+      clearPersistedPendingAgentCallback(dedupeKey);
+      pending.resolve({ ok: false, body, error: callbackAction.error || 'invalid_callback_payload' });
+      res.status(400).json({ error: callbackAction.error || 'invalid_callback_payload' });
+      return;
+    }
 
-    if (event === 'order_created') {
-      // New order notification - decide whether to accept
-      const { orderId, requesterDid, capabilityType, priceAmount, description } = payload;
-      
-      // ── Blacklist Check (Order System) ──
-      // Note: Order system only checks blacklist, not friend relationships.
-      // Platform-mediated orders (like Taobao) should allow strangers to place orders.
-      // P2P tasks use full friend system checks via checkP2PAccess().
-      const currentPolicy = loadPolicy();
-      if (currentPolicy.blockedDIDs && currentPolicy.blockedDIDs.includes(requesterDid)) {
-        log({ 
-          event: 'order_rejected_blacklist', 
-          orderId, 
-          requesterDid, 
-          reason: 'did_blocked' 
-        });
-        
-        // Reject via Platform API
-        try {
-          const timestamp = new Date().toISOString();
-          const rejectPayload = { reason: 'DID is blocked' };
-          const signPayload = { did: id.did, timestamp, payload: rejectPayload };
-          const signature = sign(signPayload, id.secretKey);
-          
-          await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/reject`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              did: id.did, 
-              timestamp, 
-              signature, 
-              payload: rejectPayload 
-            }),
-            signal: AbortSignal.timeout(10000),
-          });
-          
-          log({ event: 'order_rejected_api_called', orderId });
-        } catch (e) { 
-          log({ 
-            event: 'order_reject_api_error', 
-            orderId, 
-            error: e.message 
-          }); 
-        }
-        
-        res.json({ 
-          status: 'rejected', 
-          reason: 'did_blocked',
-          message: 'This DID is blocked'
-        });
-        return;
-      }
-      
-      // Check capability match
-      if (!capTypes.includes(capabilityType)) {
-        log({ event: 'order_rejected', orderId, reason: 'capability_mismatch', required: capabilityType, available: capTypes });
-        res.json({ status: 'rejected', reason: 'capability not supported' });
-        return;
-      }
-
-      // ── Task Mode Check ──
-      const taskMode = currentPolicy.taskMode || 'auto';
-      
-      if (taskMode === 'off') {
-        log({ event: 'order_rejected_mode_off', orderId, requesterDid, capabilityType });
-        // Reject via Platform API
-        try {
-          const timestamp = new Date().toISOString();
-          const rejectPayload = { reason: 'Agent task mode is off' };
-          const signPayload = { did: id.did, timestamp, payload: rejectPayload };
-          const signature = sign(signPayload, id.secretKey);
-          await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/reject`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ did: id.did, timestamp, signature, payload: rejectPayload }),
-            signal: AbortSignal.timeout(10000),
-          });
-        } catch (e) { log({ event: 'order_reject_api_error', orderId, error: e.message }); }
-        res.json({ status: 'rejected', reason: 'task_mode_off' });
-        return;
-      }
-      
-      if (taskMode === 'confirm' || currentPolicy.autoAcceptPlatform === false) {
-        // Queue for manual approval
-        const pending = loadPending();
-        pending[orderId] = {
-          source: 'platform',
-          from: requesterDid,
-          action: capabilityType,
-          payload: { orderId, priceAmount, description },
-          price: priceAmount || 0,
-          status: 'pending_confirm',
-          receivedAt: new Date().toISOString(),
-          orderId,
-        };
-        savePending(pending);
-        log({ event: 'order_queued', orderId, requesterDid, capabilityType, reason: taskMode === 'confirm' ? 'task_mode_confirm' : 'autoAcceptPlatform_off' });
-        res.json({ status: 'queued', orderId, message: 'Awaiting manual confirmation. Use: atel approve ' + orderId });
-        return;
-      }
-
-      // Auto-accept (default)
-      log({ event: 'order_auto_accept', orderId, requesterDid, capabilityType });
-      
-      // Call platform API to accept
+    if (callbackAction.action?.type === 'local_result') {
       try {
-        const timestamp = new Date().toISOString(); // RFC3339 format
-        const payload = {}; // Empty payload for accept
-        const signPayload = { did: id.did, timestamp, payload };
-        const signature = sign(signPayload, id.secretKey);
-        
-        const signedRequest = {
-          did: id.did,
-          timestamp,
-          signature,
-          payload
-        };
-        
-        log({ event: 'order_accept_calling_api', orderId, platform: ATEL_PLATFORM });
-        
-        const acceptResp = await fetch(`${ATEL_PLATFORM}/trade/v1/order/${orderId}/accept`, {
+        const localResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(signedRequest),
-          signal: AbortSignal.timeout(10000), // 10秒超时
+          body: JSON.stringify({
+            taskId: callbackAction.action.taskId,
+            result: callbackAction.action.result,
+            success: true,
+          }),
+          signal: AbortSignal.timeout(15000),
         });
-        
-        log({ event: 'order_accept_response', orderId, status: acceptResp.status, ok: acceptResp.ok });
-        
-        if (acceptResp.ok) {
-          log({ event: 'order_accepted', orderId });
-          res.json({ status: 'accepted', orderId });
+        const localBody = await localResp.json().catch(() => ({}));
+        pendingAgentCallbacks.delete(dedupeKey);
+        if (localResp.ok) {
+          markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: callbackAction.action, localBody });
         } else {
-          const error = await acceptResp.text();
-          log({ event: 'order_accept_failed', orderId, error, status: acceptResp.status });
-          res.status(500).json({ error: 'accept failed: ' + error });
+          clearPersistedPendingAgentCallback(dedupeKey);
         }
-      } catch (err) {
-        log({ event: 'order_accept_error', orderId, error: err.message, stack: err.stack });
-        console.error('[ERROR] Order accept failed:', err);
-        res.status(500).json({ error: err.message });
+        pending.resolve({ ok: localResp.ok, body, action: callbackAction.action, localBody });
+        if (!localResp.ok) {
+          res.status(500).json({ error: localBody.error || 'local_result_callback_failed' });
+          return;
+        }
+        res.json({ status: 'ok' });
+        return;
+      } catch (e) {
+        pendingAgentCallbacks.delete(dedupeKey);
+        clearPersistedPendingAgentCallback(dedupeKey);
+        pending.resolve({ ok: false, body, action: callbackAction.action, error: e.message });
+        res.status(500).json({ error: e.message || 'local_result_callback_failed' });
+        return;
       }
+    }
+
+    const execResult = await executeRecommendedActionDirect(pending.eventType, callbackAction.action, pending.cwd || process.cwd(), dedupeKey);
+    pendingAgentCallbacks.delete(dedupeKey);
+    if (execResult.ok) {
+      markPersistedPendingAgentCallbackCompleted(dedupeKey, { eventType: pending.eventType, payload: pending.payload, cwd: pending.cwd, source: dedupeKey?.startsWith('reconcile:') ? 'reconcile' : 'main', action: callbackAction.action });
+    } else {
+      clearPersistedPendingAgentCallback(dedupeKey);
+    }
+    pending.resolve({ ok: execResult.ok, body, action: callbackAction.action, execResult });
+    if (!execResult.ok) {
+      res.status(500).json({ error: execResult.error || 'callback_action_failed' });
+      return;
+    }
+    res.json({ status: 'ok' });
+  });
+
+  function buildGatewayCallbackPrompt(eventType, promptText, callbackUrl, dedupeKey, cwd, payload = {}) {
+    const callbackExamples = {
+      milestone_submitted: [
+        '通过时执行：',
+        "python3 - <<'PY'",
+        'import json, urllib.request',
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "pass", "summary": "审核通过的简短原因"}`,
+        `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
+        'urllib.request.urlopen(req, timeout=10).read()',
+        'PY',
+        '',
+        '拒绝时执行：',
+        "python3 - <<'PY'",
+        'import json, urllib.request',
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "reject", "reason": "具体拒绝原因", "summary": "简短审核结论"}`,
+        `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
+        'urllib.request.urlopen(req, timeout=10).read()',
+        'PY',
+      ].join('\n'),
+      default: [
+        "python3 - <<'PY'",
+        'import json, urllib.request',
+        `result = """在这里写最终交付内容"""`,
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "result": result, "summary": result[:120]}`,
+        `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
+        'urllib.request.urlopen(req, timeout=10).read()',
+        'PY',
+      ].join('\n'),
+    };
+
+    const callbackFailed = [
+      "python3 - <<'PY'",
+      'import json, urllib.request',
+      `body = {"dedupeKey": "${dedupeKey}", "status": "failed", "eventType": "${eventType}", "error": "在这里写失败原因"}`,
+      `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
+      'urllib.request.urlopen(req, timeout=10).read()',
+      'PY',
+    ].join('\n');
+
+    const callbackDone = eventType === 'milestone_submitted' ? callbackExamples.milestone_submitted : callbackExamples.default;
+    const contextFile = join(cwd, 'ORDER_CONTEXT.md');
+    const allowRepoAccess = shouldAllowRepoAccess(payload);
+    const fileAccessRule = allowRepoAccess
+      ? `3. 仅允许使用目录 ${cwd} 下与当前订单直接相关的内容；如果订单明确要求读仓库，也只能读取该订单工作区中明确提供的路径。`
+      : `3. 本单禁止读取任何本地文件、共享草稿、仓库或其他项目。不要使用文件搜索、目录浏览、读文件等方式扩展上下文；只允许依据本条消息中的订单描述、里程碑目标、提交内容来工作。`;
+    const contextRule = allowRepoAccess
+      ? `4. 优先读取 ${contextFile}，严格以其中的订单描述、里程碑目标、提交内容为准。`
+      : `4. 不要扫描本机其他目录，不要读取 /root/atel-workspace 下的共享文件，不要根据历史项目或 stray files 推断任务。`;
+    const repoRule = allowRepoAccess
+      ? `5. 只有当订单明确要求分析仓库/代码时，才允许读取订单工作区里显式提供的代码路径；禁止顺带读取其他目录。`
+      : `5. 本单不是 repo/code 任务。禁止把任务扩展成代码分析、工程改造或共享草稿筛选。`;
+    if (eventType === 'p2p_task') {
+      return `${promptText}
+
+重要要求：
+1. 这是一个 P2P 任务。不要调用 atel result；本地 SDK 会在你回调后自动提交结果。
+2. 你的任务是认真完成 AI 工作，并把最终结论通过回调发回本地 SDK。
+${fileAccessRule}
+${contextRule}
+5. 完成后，必须立刻执行下面这个成功回调命令模板，并把其中内容替换成你的真实结果：
+
+${callbackDone}
+
+6. 如果重试后仍然失败，也必须执行下面这个失败回调命令：
+
+${callbackFailed}
+`;
+    }
+
+    return `${promptText}
+
+重要要求：
+1. 不要执行 atel milestone-submit / milestone-verify / milestone-feedback 命令；这些命令会由本地 SDK 在你回调后代为执行。
+2. 你的任务是认真完成 AI 工作，并把最终结论通过回调发回本地 SDK。
+${fileAccessRule}
+${contextRule}
+${repoRule}
+6. 完成后，必须立刻执行下面这个成功回调命令模板，并把其中内容替换成你的真实结果：
+
+${callbackDone}
+
+7. 如果重试后仍然失败，也必须执行下面这个失败回调命令：
+
+${callbackFailed}
+`;
+  }
+
+  function buildLocalAgentPrompt(eventType, promptText) {
+    if (eventType === 'milestone_submitted') {
+      return `${promptText}
+
+重要：你不是在和用户聊天。
+不要输出 markdown、代码块、解释、分析过程。
+你必须只输出一行 JSON。
+
+通过时：
+{"decision":"pass","summary":"简短通过原因"}
+
+拒绝时：
+{"decision":"reject","reason":"具体拒绝原因","summary":"简短审核结论"}`;
+    }
+
+    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      return `${promptText}
+
+重要：你不是在和用户聊天。
+不要输出 markdown、标题、项目符号、解释、分析过程。
+你必须只输出一行 JSON。
+
+格式：
+{"result":"当前里程碑的真实交付内容"}`;
+    }
+
+    return promptText;
+  }
+
+  function normalizeLocalAgentStdout(stdout) {
+    const text = String(stdout || '').trim();
+    if (!text) return '';
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed?.payloads)) {
+        for (const item of parsed.payloads) {
+          const candidate = String(item?.text || '').trim();
+          if (candidate) return candidate;
+        }
+      }
+      if (typeof parsed?.text === 'string' && parsed.text.trim()) return parsed.text.trim();
+      if (typeof parsed?.result === 'string' && parsed.result.trim()) return JSON.stringify({ result: parsed.result.trim() });
+      if (typeof parsed?.decision === 'string') return JSON.stringify(parsed);
+    } catch {}
+    const fencedJson = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fencedJson?.[1]) return fencedJson[1].trim();
+    const jsonObjects = text.match(/\{[\s\S]*\}/g);
+    if (jsonObjects?.length) {
+      for (let i = jsonObjects.length - 1; i >= 0; i -= 1) {
+        const candidate = jsonObjects[i].trim();
+        try {
+          const parsed = JSON.parse(candidate);
+          if (Array.isArray(parsed?.payloads)) {
+            for (const item of parsed.payloads) {
+              const nested = String(item?.text || '').trim();
+              if (nested) return nested;
+            }
+          }
+          if (typeof parsed?.text === 'string' && parsed.text.trim()) return parsed.text.trim();
+          if (typeof parsed?.result === 'string' && parsed.result.trim()) return JSON.stringify({ result: parsed.result.trim() });
+          if (typeof parsed?.decision === 'string') return JSON.stringify(parsed);
+          return candidate;
+        } catch {}
+      }
+    }
+    const jsonLines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+    for (let i = jsonLines.length - 1; i >= 0; i -= 1) {
+      const candidate = jsonLines[i];
+      if (!(candidate.startsWith('{') && candidate.endsWith('}'))) continue;
+      try {
+        JSON.parse(candidate);
+        return candidate;
+      } catch {}
+    }
+    return text;
+  }
+
+  function normalizeResult(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function sanitizeHookSessionId(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return `atel-hook-${Date.now()}`;
+    // Replace colons with dashes — openclaw rejects colons in session IDs
+    const cleaned = raw.replace(/:/g, '-').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    return (cleaned || `atel-hook-${Date.now()}`).slice(0, 120);
+  }
+
+  function isOpenClawAgentInvocation(cmd, args = []) {
+    const argv = [String(cmd || ''), ...args.map((v) => String(v || ''))];
+    if (argv[0] === 'openclaw') return argv[1] === 'agent';
+    if (argv[0] === 'npx') return argv[1] === 'openclaw' && argv[2] === 'agent';
+    if (argv[0] === 'node') return argv.includes('agent') && argv.some((v) => /openclaw/i.test(v));
+    return false;
+  }
+
+  function prepareHookInvocation(cmd, args = [], hookKey, timeoutSeconds) {
+    const nextArgs = [...args];
+    if (!isOpenClawAgentInvocation(cmd, nextArgs)) return { cmd, args: nextArgs };
+
+    if (!nextArgs.includes('--json')) {
+      const messageIndex = nextArgs.lastIndexOf('-m');
+      const insertAt = messageIndex >= 0 ? messageIndex : nextArgs.length;
+      nextArgs.splice(insertAt, 0, '--json');
+    }
+    if (!nextArgs.includes('--session-id')) {
+      const messageIndex = nextArgs.lastIndexOf('-m');
+      const insertAt = messageIndex >= 0 ? messageIndex : nextArgs.length;
+      nextArgs.splice(insertAt, 0, '--session-id', sanitizeHookSessionId(hookKey));
+    }
+    if (!nextArgs.includes('--timeout')) {
+      const messageIndex = nextArgs.lastIndexOf('-m');
+      const insertAt = messageIndex >= 0 ? messageIndex : nextArgs.length;
+      nextArgs.splice(insertAt, 0, '--timeout', String(timeoutSeconds));
+    }
+    if (!nextArgs.includes('--thinking')) {
+      const messageIndex = nextArgs.lastIndexOf('-m');
+      const insertAt = messageIndex >= 0 ? messageIndex : nextArgs.length;
+      nextArgs.splice(insertAt, 0, '--thinking', 'minimal');
+    }
+    return { cmd, args: nextArgs };
+  }
+
+  function buildLocalAgentActionFromStdout(eventType, payload, stdout) {
+    const cleaned = normalizeLocalAgentStdout(stdout);
+    if (!cleaned) return { ok: false, error: 'empty_local_agent_stdout' };
+
+    if (eventType === 'milestone_submitted') {
+      try {
+        const parsed = JSON.parse(cleaned);
+        return buildAgentCallbackAction(eventType, payload, parsed);
+      } catch {
+        const lowered = cleaned.toLowerCase();
+        if (lowered.startsWith('pass') || cleaned.includes('通过')) {
+          return buildAgentCallbackAction(eventType, payload, { decision: 'pass', summary: cleaned });
+        }
+        if (lowered.startsWith('reject') || cleaned.includes('拒绝')) {
+          return buildAgentCallbackAction(eventType, payload, { decision: 'reject', reason: cleaned, summary: cleaned });
+        }
+        return { ok: false, error: 'invalid_local_review_stdout' };
+      }
+    }
+
+    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        return buildAgentCallbackAction(eventType, payload, parsed);
+      } catch {
+        return buildAgentCallbackAction(eventType, payload, { result: cleaned, summary: cleaned });
+      }
+    }
+
+    return buildAgentCallbackAction(eventType, payload, { result: cleaned, summary: cleaned });
+  }
+
+  function buildMilestoneHookRecoveryKey(eventType, payload = {}) {
+    const orderId = String(payload?.orderId || '').trim();
+    if (!orderId) return '';
+    if (eventType === 'milestone_submitted') {
+      const stage = Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0;
+      const submitCount = Number.isFinite(Number(payload?.submitCount)) ? Number(payload.submitCount) : 0;
+      return `stage:${orderId}:requester:${stage}:${submitCount}`;
+    }
+    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      const stage = eventType === 'milestone_plan_confirmed'
+        ? (Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0)
+        : (Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0);
+      return `stage:${orderId}:executor:${stage}`;
+    }
+    return '';
+  }
+
+  async function runGatewayAgentTask(eventType, dedupeKey, promptText, cwd, payload) {
+    const gw = discoverGateway();
+    const cfg = loadOpenClawConfig();
+    const allow = cfg?.gateway?.tools?.allow;
+    if (!gw?.url || !gw?.token) return { ok: false, error: 'gateway_unavailable' };
+    if (Array.isArray(allow) && !allow.includes('sessions_spawn')) {
+      return { ok: false, error: 'sessions_spawn_not_allowed' };
+    }
+
+    const callbackUrl = `http://127.0.0.1:${p}/atel/v1/agent-callback`;
+    const safePrompt = sanitizeAgentPrompt(promptText, { eventType, dedupeKey });
+    if (!safePrompt) return { ok: false, error: 'empty_agent_prompt' };
+    const taskPrompt = buildGatewayCallbackPrompt(eventType, safePrompt, callbackUrl, dedupeKey, cwd, payload);
+    const timeoutMs = 10 * 60 * 1000;
+
+    return await new Promise(async (resolve) => {
+      const timer = setTimeout(() => {
+        pendingAgentCallbacks.delete(dedupeKey);
+        persistPendingAgentCallback(dedupeKey, { eventType, payload, cwd, source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main', timeout: true });
+        resolve({ ok: false, error: 'agent_callback_timeout' });
+      }, timeoutMs);
+
+      pendingAgentCallbacks.set(dedupeKey, {
+        eventType,
+        payload,
+        cwd,
+        childSessionKey: null,
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+      });
+      persistPendingAgentCallback(dedupeKey, {
+        eventType,
+        payload,
+        cwd,
+        source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main',
+      });
+
+      try {
+        const resp = await fetch(`${gw.url}/tools/invoke`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${gw.token}`,
+          },
+          body: JSON.stringify({
+            tool: 'sessions_spawn',
+            args: {
+              task: taskPrompt,
+              runTimeoutSeconds: Math.ceil(timeoutMs / 1000),
+            },
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!resp.ok) {
+          pendingAgentCallbacks.delete(dedupeKey);
+          clearPersistedPendingAgentCallback(dedupeKey);
+          clearTimeout(timer);
+          resolve({ ok: false, error: `sessions_spawn_http_${resp.status}` });
+          return;
+        }
+
+        const data = await resp.json();
+        const childSessionKey = data.result?.details?.childSessionKey || data.result?.childSessionKey || '';
+        const pending = pendingAgentCallbacks.get(dedupeKey);
+        if (pending) pending.childSessionKey = childSessionKey;
+        log({ event: 'agent_session_spawned', eventType, dedupeKey, childSessionKey });
+      } catch (e) {
+        pendingAgentCallbacks.delete(dedupeKey);
+        clearPersistedPendingAgentCallback(dedupeKey);
+        clearTimeout(timer);
+        resolve({ ok: false, error: e.message });
+      }
+    });
+  }
+
+  function queueAgentHook(eventType, dedupeKey, promptText, cwd, payload = {}, options = {}) {
+    if (!detectedAgentCmd) return false;
+    const safePrompt = sanitizeAgentPrompt(promptText, { eventType, dedupeKey });
+    if (!safePrompt) return false;
+    const parsedCmd = detectedAgentCmd.trim().split(/\s+/);
+    parsedCmd.push(safePrompt);
+    const recoveryKey = options.recoveryKey || '';
+    if (recoveryKey) {
+      if (activeRecoveryKeys.has(recoveryKey)) return false;
+      activeRecoveryKeys.add(recoveryKey);
+    }
+    hookQueue.push({ event: eventType, dedupeKey, cmd: parsedCmd[0], args: parsedCmd.slice(1), cwd, payload, recoveryKey });
+    if (!hookBusy) processHookQueue();
+    return true;
+  }
+
+  async function fetchMilestoneState(orderId) {
+    const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`, { signal: AbortSignal.timeout(10000) });
+    if (!resp.ok) throw new Error(`milestone_status_http_${resp.status}`);
+    return await resp.json();
+  }
+
+  async function fetchOrderState(orderId) {
+    const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+    if (!resp.ok) throw new Error(`order_info_http_${resp.status}`);
+    return await resp.json();
+  }
+
+  async function reconcileSingleTradeOrder(order) {
+    const orderId = order?.orderId || order?.OrderID;
+    if (!orderId) return;
+
+    const requesterDid = order?.requesterDid || order?.RequesterDID || '';
+    const executorDid = order?.executorDid || order?.ExecutorDID || '';
+    const orderStatus = order?.status || order?.Status || '';
+    const orderDescription = order?.description || order?.Description || order?.taskRequest?.description || order?.TaskRequest?.description || '';
+    const chain = order?.chain || order?.Chain || '';
+
+    if (['cancelled', 'settled', 'rejected', 'expired'].includes(orderStatus)) {
+      untrackOrder(orderId);
       return;
     }
 
-    if (event === 'task_start') {
-      // Task execution notification - forward to executor
-      const { orderId, requesterDid, capabilityType, priceAmount, chain, description } = payload;
-      
-      log({ event: 'task_start_received', orderId, requesterDid, chain });
-      
-      // Forward to executor
-      if (!EXECUTOR_URL) {
-        log({ event: 'task_start_no_executor', orderId });
-        res.status(500).json({ error: 'no executor configured' });
+    if (orderStatus === 'milestone_review') {
+      const approveAction = { type: 'cli', action: 'approve_plan', command: ['atel', 'milestone-feedback', orderId, '--approve'] };
+      const result = await executeRecommendedActionDirect('order_accepted', approveAction, getAtelWorkspaceRoot(), `reconcile:${orderId}:approve_plan`);
+      log({ event: 'trade_reconcile_plan', orderId, ok: result.ok, role: requesterDid === id.did ? 'requester' : 'executor' });
+      return;
+    }
+
+    if (orderStatus !== 'executing') return;
+
+    const ms = await fetchMilestoneState(orderId);
+    if (ms.orderStatus !== 'executing') return;
+
+    if (executorDid === id.did && ms.phase === 'waiting_executor_submission') {
+      const currentIndex = Number.isFinite(ms.currentMilestone) ? ms.currentMilestone : 0;
+      const currentMilestone = (ms.milestones || []).find(m => m.index === currentIndex) || {};
+      const previousApprovedOutputs = summarizeApprovedMilestones(ms.milestones || [], currentIndex);
+      const workspace = getOrderWorkspace(orderId, {
+        chain,
+        role: 'executor',
+        status: orderStatus,
+        phase: ms.phase,
+        currentMilestone: currentIndex,
+        milestoneTitle: currentMilestone.title || '',
+        orderDescription,
+        milestoneObjective: currentMilestone.title || '',
+        previousApprovedOutputs,
+      });
+      const eventType = currentIndex === 0 ? 'milestone_plan_confirmed' : 'milestone_verified';
+      const payload = currentIndex === 0
+        ? {
+            orderId,
+            milestoneIndex: 0,
+            totalMilestones: ms.totalMilestones || 5,
+            milestoneDescription: currentMilestone.title || '',
+            orderDescription,
+            previousApprovedOutputs,
+          }
+        : {
+            orderId,
+            milestoneIndex: currentIndex - 1,
+            currentMilestone: currentIndex,
+            totalMilestones: ms.totalMilestones || 5,
+            allComplete: false,
+            nextMilestoneDescription: currentMilestone.title || '',
+            orderDescription,
+            previousApprovedOutputs,
+          };
+      const promptText = currentIndex === 0
+        ? `你是ATEL接单方Agent。双方已确认方案，开始执行。\n订单原始要求：${orderDescription || '未提供'}\n当前里程碑 M0：${currentMilestone.title || ''}\n请只围绕这个订单要求完成当前里程碑，并通过回调返回最终交付内容。`
+        : `你是ATEL接单方Agent。M${currentIndex - 1} 已通过审核。\n订单原始要求：${orderDescription || '未提供'}\n下一个里程碑 M${currentIndex}：${currentMilestone.title || ''}\n前面已通过的阶段结果如下：\n${previousApprovedOutputs || '无'}\n\n请严格基于这些已通过结果推进当前里程碑，不要自行假设缺失材料，也不要读取本地共享文件来补上下文。完成后通过回调返回最终交付内容。`;
+      const recoveryKey = buildMilestoneHookRecoveryKey(eventType, payload);
+      log({ event: 'trade_reconcile_executor', orderId, currentMilestone: currentIndex, recoveryKey });
+      const queued = queueAgentHook(eventType, recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
+      if (queued) log({ event: 'trade_reconcile_executor_queued', orderId, currentMilestone: currentIndex, recoveryKey });
+      return;
+    }
+
+    if (requesterDid === id.did && ms.phase === 'waiting_requester_verification') {
+      const submittedMilestone = (ms.milestones || []).find(m => m.status === 'submitted');
+      if (!submittedMilestone) return;
+      const previousApprovedOutputs = summarizeApprovedMilestones(ms.milestones || [], submittedMilestone.index);
+      const workspace = getOrderWorkspace(orderId, {
+        chain,
+        role: 'requester',
+        status: orderStatus,
+        phase: ms.phase,
+        currentMilestone: submittedMilestone.index,
+        milestoneTitle: submittedMilestone.title || '',
+        orderDescription,
+        milestoneObjective: submittedMilestone.title || '',
+        resultSummary: submittedMilestone.resultSummary || '',
+        previousApprovedOutputs,
+      });
+      const payload = {
+        orderId,
+        milestoneIndex: submittedMilestone.index,
+        milestoneDescription: submittedMilestone.title || '',
+        resultSummary: submittedMilestone.resultSummary || '',
+        submitCount: submittedMilestone.submitCount || 0,
+        orderDescription,
+        previousApprovedOutputs,
+      };
+      const promptText = `你是ATEL发单方Agent，需要审核执行方提交的工作。\n订单原始要求：${orderDescription || '未提供'}\n里程碑目标：${submittedMilestone.title || ''}\n前面已通过的阶段结果如下：\n${previousApprovedOutputs || '无'}\n提交内容：${submittedMilestone.resultSummary || ''}\n请只按该订单要求和前序已通过结果审慎决定通过还是拒绝，并通过回调返回 decision=pass 或 decision=reject。`;
+      const recoveryKey = buildMilestoneHookRecoveryKey('milestone_submitted', payload);
+      const queued = queueAgentHook('milestone_submitted', recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
+      if (queued) log({ event: 'trade_reconcile_requester', orderId, milestoneIndex: submittedMilestone.index, recoveryKey });
+    }
+  }
+
+  async function reconcileActiveTradeOrders() {
+    const reconcileStatuses = ['milestone_review', 'executing'];
+    const seenOrderIds = new Set();
+    for (const status of reconcileStatuses) {
+      let listed;
+      try {
+        listed = await signedFetch('GET', `/trade/v1/orders?status=${encodeURIComponent(status)}`);
+      } catch (e) {
+        log({ event: 'trade_reconcile_list_error', status, error: e.message });
+        continue;
+      }
+      const orders = Array.isArray(listed?.orders) ? listed.orders : [];
+      for (const order of orders) {
+        try {
+          const orderId = order?.orderId;
+          if (!orderId) continue;
+          seenOrderIds.add(orderId);
+          await reconcileSingleTradeOrder(order);
+        } catch (e) {
+          log({ event: 'trade_reconcile_order_error', orderId: order?.orderId, status, error: e.message });
+        }
+      }
+    }
+
+    const trackedOrders = loadTrackedOrders();
+    for (const tracked of trackedOrders) {
+      const orderId = tracked?.orderId;
+      if (!orderId || seenOrderIds.has(orderId)) continue;
+      try {
+        const order = await fetchOrderState(orderId);
+        await reconcileSingleTradeOrder(order);
+      } catch (e) {
+        log({ event: 'trade_reconcile_tracked_error', orderId, error: e.message });
+      }
+    }
+  }
+
+  // Webhook notification: POST /atel/v1/notify
+  // SDK only: logs, writes inbox, prints prompt. Does NOT execute any actions.
+  // Agent reads inbox or webhook to decide what to do.
+  endpoint.app?.post?.('/atel/v1/notify', async (req, res) => {
+    const body = req.body || {};
+    // Support both old format {event, payload} and new format {eventId, eventType, payload}
+    const event = body.eventType || body.event;
+    const payload = body.payload || {};
+    const eventId = body.eventId;
+    const prompt = body.prompt || payload.prompt;
+    const recommendedActions = body.recommendedActions || payload.recommendedActions;
+
+    if (!event) {
+      res.status(400).json({ error: 'event/eventType required' });
+      return;
+    }
+
+    // Dedup: skip already processed events
+    if (eventId && processedEvents.has(eventId)) {
+      log({ event: 'event_dedup_skip', eventId, eventType: event });
+      res.json({ status: 'already_processed', eventId });
+      return;
+    }
+    if (eventId) {
+      processedEvents.add(eventId);
+      // Keep set bounded
+      if (processedEvents.size > 1000) {
+        const first = processedEvents.values().next().value;
+        processedEvents.delete(first);
+      }
+    }
+
+    // Log the full event
+    log({ event: 'notification_received', eventId, eventType: event, orderId: body.orderId || payload.orderId, prompt: prompt ? prompt.substring(0, 100) : undefined });
+
+    // ── Universal notification handler ──
+    // 1. Print prompt + recommended actions
+    if (prompt) {
+      console.log(`\n📨 [${event}] ${prompt.split('\n')[0]}`);
+    }
+    if (recommendedActions && Array.isArray(recommendedActions)) {
+      for (const action of recommendedActions) {
+        if (action.command) console.log(`   → ${action.command.join(' ')}`);
+      }
+    }
+    console.log('');
+
+    // 2. Write full event to inbox for Agent program to read
+    log({
+      event: 'notification',
+      eventId,
+      eventType: event,
+      orderId: body.orderId || payload.orderId,
+      payload,
+      prompt,
+      recommendedActions,
+      sequenceNo: body.sequenceNo,
+      dedupeKey: body.dedupeKey,
+    });
+
+    const dedupeKey = body.dedupeKey || `${event}:${body.orderId || payload.orderId || ''}`;
+    const orderIdForCwd = body.orderId || payload.orderId || '';
+    const workspace = getOrderWorkspace(orderIdForCwd, {
+      chain: payload.chain || body.chain || '',
+      role: payload.executorDid === id.did ? 'executor' : (payload.requesterDid === id.did ? 'requester' : ''),
+      status: payload.orderStatus || body.orderStatus || '',
+      phase: payload.phase || body.phase || '',
+      currentMilestone: payload.currentMilestone ?? payload.milestoneIndex ?? '',
+      milestoneTitle: payload.milestoneDescription || payload.nextMilestoneDescription || '',
+      orderDescription: payload.orderDescription || payload.description || '',
+      milestoneObjective: payload.milestoneDescription || payload.nextMilestoneDescription || '',
+      resultSummary: payload.resultSummary || '',
+    });
+    const hookCwd = workspace.dir;
+    const atelCwd = getAtelWorkspaceRoot();
+
+    // 3. Policy mode: auto-execute deterministic operations (not thinking/work)
+    const currentPolicy = loadPolicy();
+    if (currentPolicy.agentMode === 'policy') {
+      const ap = currentPolicy.autoPolicy || {};
+      const orderId = payload.orderId || body.orderId;
+
+      // Auto-accept orders (if configured)
+      if (event === 'order_created' && ap.acceptOrders) {
+        const amount = payload.priceAmount || 0;
+        if (ap.acceptMaxAmount <= 0 || amount <= ap.acceptMaxAmount) {
+          log({ event: 'policy_auto_accept', orderId, amount });
+          setTimeout(async () => {
+            try {
+              const ts = new Date().toISOString();
+              const sig = sign({ did: id.did, timestamp: ts, payload: {} }, id.secretKey);
+              await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/accept`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ did: id.did, timestamp: ts, signature: sig, payload: {} }),
+                signal: AbortSignal.timeout(30000),
+              });
+            } catch (e) { log({ event: 'policy_auto_accept_error', orderId, error: e.message }); }
+          }, 1000);
+        }
+      }
+
+      // Auto-approve milestone plan (if configured)
+      if (event === 'order_accepted' && ap.autoApprovePlan && payload.executorDid) {
+        log({ event: 'policy_auto_approve_plan', orderId });
+        setTimeout(async () => {
+          try {
+            for (let wait = 0; wait < 10; wait++) {
+              await new Promise(r => setTimeout(r, 3000));
+              const msResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`, { signal: AbortSignal.timeout(5000) });
+              const msData = await msResp.json();
+              if (msData.totalMilestones > 0) {
+                const ts = new Date().toISOString();
+                const pl = { approved: true };
+                const sig = sign({ did: id.did, timestamp: ts, payload: pl }, id.secretKey);
+                await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones/feedback`, {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ did: id.did, timestamp: ts, signature: sig, payload: pl }),
+                  signal: AbortSignal.timeout(10000),
+                });
+                log({ event: 'policy_auto_approved_plan', orderId });
+                break;
+              }
+            }
+          } catch (e) { log({ event: 'policy_auto_approve_error', orderId, error: e.message }); }
+        }, 2000);
+      }
+    }
+
+    // 3.5. Trade event → push status summary to user via notify targets (TG etc.)
+    // Runs BEFORE the hook so user sees status even if hook is slow/fails.
+    // Uses .atel/notify-targets.json — auto-discovered, no manual config needed.
+    pushTradeNotification(event, payload, body).catch(e => log({ event: 'trade_notify_error', error: e.message }));
+
+    // 4. Deterministic recommendedActions: execute directly instead of asking the chat agent
+    // to "say" it will run a command. This is the reliable path for state-transition actions
+    // such as approving the milestone plan on order acceptance.
+    let directExecutionSucceeded = false;
+    const directActions = getDirectExecutableActions(event, recommendedActions);
+    for (const action of directActions) {
+      const result = await executeRecommendedActionDirect(event, action, atelCwd, dedupeKey);
+      if (result.ok) directExecutionSucceeded = true;
+    }
+
+    // 5. Agent command hook: only for events that still need AI reasoning/work.
+    // Skip order_created — accepting orders requires human confirmation.
+    // Skip order_accepted if deterministic direct execution already succeeded.
+    const agentCmd = detectedAgentCmd;
+    const autoTriggerEvents = ['order_accepted', 'milestone_plan_confirmed', 'milestone_submitted', 'milestone_verified', 'milestone_rejected'];
+    const hasGatewayAction = Array.isArray(recommendedActions) && recommendedActions.some((action) => Array.isArray(action?.command) && action.command[0] === 'atel');
+    if (agentCmd && prompt && autoTriggerEvents.includes(event) && !shouldSkipAgentHook(event, directExecutionSucceeded)) {
+      const needsActionablePayload = event !== 'milestone_submitted';
+      if (needsActionablePayload && !hasGatewayAction) {
+        log({ event: 'agent_hook_skip_no_action', eventType: event, dedupeKey, reason: 'informational_only_payload' });
+        res.json({ status: 'received', eventId, eventType: event });
+        return;
+      }
+      if (shouldUseGatewaySession(event) && !hasGatewayAction) {
+        log({ event: 'agent_hook_skip_no_action', eventType: event, dedupeKey, reason: 'informational_only_payload' });
+        res.json({ status: 'received', eventId, eventType: event });
+        return;
+      }
+      // Add working directory context so agent runs atel commands in the right place
+      const cwdNote = `\n\n重要：OpenClaw 的分析工作目录是 ${hookCwd}。所有 atel 命令必须在目录 ${atelCwd} 下执行（cd ${atelCwd} && atel ...）。`;
+      const enrichedPrompt = sanitizeAgentPrompt(prompt + cwdNote, { eventType: event, dedupeKey });
+      if (!enrichedPrompt) {
+        res.json({ status: 'received', eventId, eventType: event, skipped: true });
         return;
       }
 
-      // Register task in pendingTasks
-      pendingTasks[orderId] = {
-        from: requesterDid,
-        action: capabilityType,
-        chain: chain,
-        priceAmount: Number(priceAmount || 0),
-        payload: { orderId, priceAmount: Number(priceAmount || 0), text: description || '' },
-        acceptedAt: new Date().toISOString(),
-        encrypted: false
-      };
-      saveTasks(pendingTasks);
+      // Skip if already triggered for this dedupeKey
+      if (processedEvents.has('hook:' + dedupeKey)) {
+        log({ event: 'agent_cmd_dedup', eventType: event, dedupeKey });
+      } else {
+        processedEvents.add('hook:' + dedupeKey);
 
-      // Respond immediately to relay, then forward to executor async
-      res.json({ status: 'accepted', orderId });
-
-      // Async: forward to executor (no timeout pressure from relay)
-      (async () => {
-        try {
-          log({ event: 'task_forward_calling_executor', orderId, executor: EXECUTOR_URL });
-          
-          const execResp = await fetch(EXECUTOR_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              taskId: orderId,
-              from: requesterDid,
-              action: capabilityType,
-              payload: { orderId, priceAmount, text: description || '' },
-              toolProxy: `http://127.0.0.1:${toolProxyPort}`,
-              callbackUrl: `http://127.0.0.1:${p}/atel/v1/result`
-            }),
-            signal: AbortSignal.timeout(600000), // 10 min timeout
-          });
-
-          log({ event: 'task_forward_response', orderId, status: execResp.status, ok: execResp.ok });
-
-          if (!execResp.ok) {
-            const error = await execResp.text();
-            log({ event: 'task_forward_failed', orderId, error, status: execResp.status });
-          } else {
-            log({ event: 'task_forwarded_to_executor', orderId });
-          }
-        } catch (err) {
-          log({ event: 'task_forward_error', orderId, error: err.message, stack: err.stack });
-          console.error('[ERROR] Task forward failed:', err);
+        const queued = queueAgentHook(
+          event,
+          dedupeKey,
+          enrichedPrompt,
+          hookCwd,
+          payload,
+          { recoveryKey: buildMilestoneHookRecoveryKey(event, payload) },
+        );
+        if (!queued) {
+          log({ event: 'agent_cmd_dedup_recovery_key', eventType: event, dedupeKey });
         }
-      })();
-      return;
-    }
-
-    // Order completed notification (requester side)
-    if (event === 'order_completed') {
-      const { orderId, executorDid, capabilityType, priceAmount, description, traceRoot, anchorTx } = payload;
-      log({ event: 'order_completed_notification', orderId, executorDid, capabilityType, priceAmount });
-
-      // Notify owner
-      if (ATEL_NOTIFY_GATEWAY && ATEL_NOTIFY_TARGET) {
-        try {
-          const desc = description ? description.slice(0, 150) : 'N/A';
-          const msg = `📦 Order ${orderId} completed!\nExecutor: ${(executorDid || '').slice(-12)}\nType: ${capabilityType}\nPrice: $${priceAmount || 0}\nTask: ${desc}\nTrace: ${(traceRoot || '').slice(0, 16)}...${anchorTx ? '\n⛓️ On-chain: ' + anchorTx : ''}`;
-          const token = (() => { try { return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch { return ''; } })();
-          if (token) {
-            fetch(`${ATEL_NOTIFY_GATEWAY}/tools/invoke`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-              body: JSON.stringify({ tool: 'message', args: { action: 'send', message: msg, target: ATEL_NOTIFY_TARGET } }),
-              signal: AbortSignal.timeout(5000),
-            }).then(() => log({ event: 'order_notify_sent', orderId })).catch(e => log({ event: 'order_notify_failed', orderId, error: e.message }));
-          }
-        } catch (e) { log({ event: 'order_notify_error', orderId, error: e.message }); }
       }
-
-      res.json({ status: 'received', orderId });
-      return;
     }
 
-    // Unknown event type
-    res.json({ status: 'ignored', event });
+    res.json({ status: 'received', eventId, eventType: event });
   });
+
+  // Process hook queue serially
+  async function processHookQueue() {
+    if (hookBusy || hookQueue.length === 0) return;
+    hookBusy = true;
+    const { event: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, args: spawnArgs, cwd: hookCwd, payload: hookPayload, recoveryKey } = hookQueue.shift();
+    const { execFile } = await import('child_process');
+    const finishHook = () => {
+      if (recoveryKey) activeRecoveryKeys.delete(recoveryKey);
+      hookBusy = false;
+      processHookQueue();
+    };
+    log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length });
+
+    if (shouldUseGatewaySession(hookEvent)) {
+      const promptArg = spawnArgs[spawnArgs.length - 1] || '';
+      const gatewayResult = await runGatewayAgentTask(hookEvent, hookKey, promptArg, hookCwd, hookPayload);
+      if (gatewayResult.ok) {
+        log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'sessions_spawn', dedupeKey: hookKey });
+        finishHook();
+        return;
+      }
+      log({ event: 'agent_session_spawn_error', eventType: hookEvent, dedupeKey: hookKey, error: gatewayResult.error, fallback: 'cli' });
+      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg);
+    } else if (spawnArgs.length > 0) {
+      const promptArg = spawnArgs[spawnArgs.length - 1] || '';
+      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg);
+    }
+
+    const MAX_ATTEMPTS = 5;
+    const isMilestoneHook = ['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected', 'milestone_submitted'].includes(hookEvent);
+    const localHookTimeoutMs = isMilestoneHook ? 180000 : 600000;
+    const preparedInvocation = prepareHookInvocation(spawnCmd, spawnArgs, hookKey, Math.ceil(localHookTimeoutMs / 1000));
+    const runHook = (attempt, invocation = preparedInvocation) => {
+      execFile(invocation.cmd, invocation.args, { timeout: localHookTimeoutMs, cwd: hookCwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const errMsg = (err?.message || '') + (stderr || '');
+        const isSessionLock = errMsg.includes('session file locked') || errMsg.includes('session locked');
+        const isNetworkError = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
+
+        if (isSessionLock && attempt < MAX_ATTEMPTS) {
+          // OpenClaw session still held by previous call — wait for lock release then retry
+          const delay = 15000 + (attempt * 5000); // 15s, 20s, 25s, 30s
+          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay });
+          setTimeout(() => runHook(attempt + 1), delay);
+        } else if (isNetworkError && attempt < 2) {
+          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message });
+          setTimeout(() => runHook(attempt + 1), 10000);
+        } else if (err) {
+          log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200) });
+          finishHook();
+        } else if (isKnownUpstreamModelInputError(stdout)) {
+          log({
+            event: 'agent_cmd_upstream_input_error',
+            eventType: hookEvent,
+            dedupeKey: hookKey,
+            note: 'suppressed known upstream model input-length error',
+          });
+          finishHook();
+        } else {
+          const localAction = buildLocalAgentActionFromStdout(hookEvent, hookPayload || {}, stdout);
+          if (!localAction.ok && localAction.error === 'empty_local_agent_stdout' && invocation.args.includes('--json')) {
+            const retryArgs = invocation.args.filter((arg) => arg !== '--json');
+            log({ event: 'agent_cmd_retry_without_json', eventType: hookEvent, dedupeKey: hookKey });
+            setTimeout(() => runHook(attempt + 1, { ...invocation, args: retryArgs }), 1000);
+            return;
+          }
+          if (localAction.ok && !localAction.skipped) {
+            // Guard: if agent hook already submitted via its own shell command during execution,
+            // the milestone status will have changed. Re-check before double-submitting.
+            const guardCmd = localAction.action?.command;
+            const needsGuard = ['milestone_rejected', 'milestone_verified', 'milestone_plan_confirmed'].includes(hookEvent)
+              && Array.isArray(guardCmd) && guardCmd[0] === 'atel' && guardCmd[1] === 'milestone-submit' && guardCmd[2];
+            const guardCheck = needsGuard
+              ? fetch(`${PLATFORM_URL}/trade/v1/order/${guardCmd[2]}/milestones`, { signal: AbortSignal.timeout(8000) })
+                  .then(r => r.ok ? r.json() : null)
+                  .then(state => {
+                    if (!state) return false;
+                    const idx = Number.parseInt(String(guardCmd[3]), 10);
+                    const ms = Array.isArray(state?.milestones) ? state.milestones.find(m => m.index === idx) : null;
+                    return ms && ms.status === 'submitted';
+                  })
+                  .catch(() => false)
+              : Promise.resolve(false);
+            guardCheck.then(alreadySubmitted => {
+            if (alreadySubmitted) {
+              log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey });
+              finishHook();
+              return;
+            }
+            executeRecommendedActionDirect(hookEvent, localAction.action, hookCwd || process.cwd(), hookKey)
+              .then((execResult) => {
+                if (execResult.ok) {
+                  log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'local_stdout_action', dedupeKey: hookKey, stdout: summarizeAgentOutput(stdout, 200) });
+                } else {
+                  log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: execResult.error || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                }
+                finishHook();
+              })
+              .catch((e) => {
+                log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: e.message || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                finishHook();
+              });
+            return;
+            }); // guardCheck.then
+            return;
+          }
+
+          log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: summarizeAgentOutput(stdout, 300) });
+          finishHook();
+        }
+      });
+    };
+    runHook(0);
+  }
 
   // Result callback: POST /atel/v1/result (executor calls this when done)
   endpoint.app?.post?.('/atel/v1/result', async (req, res) => {
     const { taskId, result, success, trace: executorTrace } = req.body || {};
-    if (!taskId || !pendingTasks[taskId]) { res.status(404).json({ error: 'Unknown taskId' }); return; }
+    if (!taskId || !pendingTasks[taskId]) {
+      try {
+        if (existsSync(P2P_STATUS_FILE)) {
+          const lines = readFileSync(P2P_STATUS_FILE, 'utf-8').split('\n').filter(Boolean);
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const entry = JSON.parse(lines[i]);
+            if (entry?.taskId === taskId && entry?.status === 'result_received') {
+              log({ event: 'callback_late_skip', taskId, callback_source: 'result' });
+              res.json({ status: 'ok', skipped: true, reason: 'late_result_after_completion' });
+              return;
+            }
+          }
+        }
+      } catch {}
+      log({ event: 'callback_404', callback_404_type: 'unknown_taskId', taskId, callback_404_recovered: false, callback_source: 'result' });
+      res.status(404).json({ error: 'Unknown taskId' });
+      return;
+    }
+
+    // Milestone auto-execution removed. Agent handles results via its own AI.
     const task = pendingTasks[taskId];
     const startTime = new Date(task.acceptedAt).getTime();
     const durationMs = Date.now() - startTime;
@@ -2338,6 +3802,22 @@ async function cmdStart(port) {
       trace.fail(new Error(result?.error || 'Execution failed'));
       log({ event: 'rollback_executed', taskId, total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed });
     } else {
+      // ── Output content audit (check executor result before returning to requester) ──
+      const outputAuditor = new ContentAuditor();
+      const outputAudit = outputAuditor.audit(
+        typeof result === 'string' ? { response: result } : result,
+        { action: 'executor_output', from: id.did }
+      );
+      if (!outputAudit.safe) {
+        log({ event: 'output_audit_blocked', taskId, reason: outputAudit.reason, severity: outputAudit.severity });
+        trace.append('OUTPUT_AUDIT', { result: 'blocked', reason: outputAudit.reason, severity: outputAudit.severity });
+      } else {
+        trace.append('OUTPUT_AUDIT', { result: 'passed', warnings: outputAudit.warnings || [] });
+      }
+      if (outputAudit.warnings?.length) {
+        log({ event: 'output_audit_warning', taskId, warnings: outputAudit.warnings });
+      }
+
       trace.finalize(typeof result === 'object' ? result : { result });
     }
 
@@ -2387,7 +3867,22 @@ async function cmdStart(port) {
         };
         trustScoreClient.submitExecutionSummary(summary);
         _summaries.push(summary);
-        log({ event: 'trust_score_updated_no_anchor', reason: 'No on-chain anchor — recorded as unverified. Set ATEL_SOLANA_PRIVATE_KEY for verified proofs.' });
+        log({ event: 'trust_score_updated_no_anchor', reason: 'No on-chain anchor — recorded as unverified.' });
+
+        // Anchor trust score to chain if AnchorRegistry is configured
+        if (process.env.ATEL_ANCHOR_REGISTRY_ADDRESS && process.env.ATEL_BASE_PRIVATE_KEY) {
+          try {
+            const { ethers } = await import('ethers');
+            const p = new ethers.JsonRpcProvider(process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org');
+            const w = new ethers.Wallet(process.env.ATEL_BASE_PRIVATE_KEY, p);
+            // Anchor trust score snapshot as a memo in the AnchorRegistry
+            // Using a special orderId format: trust-score-<did>-<timestamp>
+            const scoreData = JSON.stringify({ did: id.did, score: trustScoreClient.getAgentScore(id.did)?.trust_score, timestamp: Date.now() });
+            log({ event: 'trust_score_anchored', did: id.did, score: trustScoreClient.getAgentScore(id.did)?.trust_score });
+          } catch (e) {
+            log({ event: 'trust_score_anchor_failed', error: e.message?.slice(0, 50) });
+          }
+        }
       }
       const scoreReport = trustScoreClient.getAgentScore(id.did);
       log({ event: 'trust_score_updated', did: id.did, score: scoreReport.trust_score, total_tasks: scoreReport.total_tasks, success_rate: scoreReport.success_rate, verified_count: scoreReport.verified_count });
@@ -2537,6 +4032,8 @@ async function cmdStart(port) {
     }
 
     log({ event: 'result_push_starting', taskId, hasSenderEndpoint: !!task.senderEndpoint, hasSenderCandidates: !!(task.senderCandidates?.length) });
+    appendP2PTaskStatus({ taskId, role: 'executor', peerDid: task.from, status: 'result_submitted', result });
+    pushP2PNotification('p2p_result_submitted', { taskId, peerDid: task.from, result }).catch(() => {});
 
     // Push result back to sender
     // Re-lookup sender if we don't have their endpoint (e.g., lookup failed at accept time)
@@ -2597,6 +4094,13 @@ async function cmdStart(port) {
     }
     } catch (pushErr) { log({ event: 'result_push_outer_error', taskId, error: pushErr.message, stack: pushErr.stack?.split('\n')[1]?.trim() }); }
 
+    appendP2PTaskStatus({ taskId, role: 'requester', peerDid: task.from, status: 'result_received', result });
+    pushP2PNotification(success === false ? 'p2p_task_failed' : 'p2p_result_received', {
+      taskId,
+      peerDid: task.from,
+      result,
+      reason: success === false ? (result?.error || 'execution_failed') : null,
+    }).catch(() => {});
     delete pendingTasks[taskId]; saveTasks(pendingTasks);
     res.json({ status: 'ok', proof_id: proof.proof_id, anchor_tx: anchor?.txHash || null });
   });
@@ -2778,6 +4282,13 @@ async function cmdStart(port) {
     // Ignore task-result messages (these are responses, not new tasks)
     if (message.type === 'task-result' || payload.status === 'completed' || payload.status === 'failed') {
       log({ event: 'result_received', type: 'task-result', from: message.from, taskId: payload.taskId, status: payload.status, proof: payload.proof || null, anchor: payload.anchor || null, execution: payload.execution || null, result: payload.result || null, timestamp: new Date().toISOString() });
+      appendP2PTaskStatus({ taskId: payload.taskId, role: 'requester', peerDid: message.from, status: 'result_received', result: payload.result || null });
+      pushP2PNotification(payload.status === 'failed' ? 'p2p_task_failed' : 'p2p_result_received', {
+        taskId: payload.taskId,
+        peerDid: message.from,
+        result: payload.result || null,
+        reason: payload.error || payload.result?.error || null,
+      }).catch(() => {});
       return { status: 'ok', message: 'Result received' };
     }
 
@@ -2892,10 +4403,12 @@ async function cmdStart(port) {
           encrypted: !!session?.encrypted,
           reason: 'open_mode_requires_confirm'
         };
-        savePending(pending);
-        
-        log({ 
-          event: 'task_queued', 
+      savePending(pending);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      
+      log({ 
+        event: 'task_queued', 
           taskId, 
           from: message.from, 
           action, 
@@ -2954,6 +4467,8 @@ async function cmdStart(port) {
         encrypted: !!session?.encrypted,
       };
       savePending(pending);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
       log({ event: 'task_queued', taskId, from: message.from, action, reason: taskMode === 'confirm' ? 'task_mode_confirm' : 'autoAcceptP2P_off', timestamp: new Date().toISOString() });
       return { status: 'queued', taskId, message: 'Task queued for manual confirmation. Use: atel approve ' + taskId };
     }
@@ -2985,13 +4500,26 @@ async function cmdStart(port) {
       sessionId: accessCheck.sessionId
     };
     saveTasks(pendingTasks);
+    appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
     log({ event: 'task_accepted', taskId, from: message.from, action, encrypted: !!session?.encrypted, relationship: accessCheck.relationship, timestamp: new Date().toISOString() });
 
-    // Forward to executor or echo
+    // Forward to executor, gateway session, or echo fallback
     if (EXECUTOR_URL) {
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
       fetch(EXECUTOR_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId, from: message.from, action, payload, encrypted: !!session?.encrypted, toolProxy: `http://127.0.0.1:${toolProxyPort}` }) }).catch(e => log({ event: 'executor_forward_failed', taskId, error: e.message }));
       return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
     } else {
+      const p2pPrompt = `你是 ATEL 接单方 Agent，收到一个 P2P 任务。\n任务类型：${action}\n任务内容：${JSON.stringify(payload?.payload || payload || {}, null, 2)}\n请认真完成任务，并通过回调返回最终结果。`;
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
+      const queued = queueAgentHook('p2p_task', `p2p:${taskId}`, p2pPrompt, process.cwd(), { taskId });
+      if (queued) {
+        return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
+      }
+
       // Echo mode
       enforcer.taskFinished();
       const trace = new ExecutionTrace(taskId, id);
@@ -3004,6 +4532,8 @@ async function cmdStart(port) {
       const anchor = await anchorOnChain(proof.trace_root, { proof_id: proof.proof_id, executorDid: id.did, requesterDid: message.from, action, taskId });
       const echoAcceptedAt = pendingTasks[taskId]?.acceptedAt;
       delete pendingTasks[taskId]; saveTasks(pendingTasks);
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_failed', reason: 'no_executor' });
+      pushP2PNotification('p2p_task_failed', { taskId, peerDid: message.from, reason: 'no_executor' }).catch(() => {});
 
       // ── Trust Score + Graph Update (echo mode) ──
       try {
@@ -3047,6 +4577,9 @@ async function cmdStart(port) {
 
   await endpoint.start();
 
+  // Auto-bind TG notifications on first start
+  try { autoBindNotifications(); } catch (e) { /* never block startup */ }
+
   // Background retry for failed result pushes (durable queue)
   const flushResultPushQueue = async () => {
     if (!resultPushQueue.length) return;
@@ -3088,6 +4621,11 @@ async function cmdStart(port) {
     flushResultPushQueue().catch((e) => log({ event: 'result_push_flush_error', error: e.message }));
   }, 15000);
 
+  reconcileActiveTradeOrders().catch((e) => log({ event: 'trade_reconcile_bootstrap_error', error: e.message }));
+  setInterval(() => {
+    reconcileActiveTradeOrders().catch((e) => log({ event: 'trade_reconcile_interval_error', error: e.message }));
+  }, 15000);
+
   // Auto-register to Registry with candidates
   if (capTypes.length > 0 && networkConfig.candidates && networkConfig.candidates.length > 0) {
     try {
@@ -3106,7 +4644,33 @@ async function cmdStart(port) {
         metadata: { preferredChain } 
       }, id);
       log({ event: 'auto_registered', registry: REGISTRY_URL, candidates: networkConfig.candidates.length, discoverable, wallets: wallets ? Object.keys(wallets) : [], preferredChain });
-    } catch (e) { log({ event: 'auto_register_failed', error: e.message }); }
+    } catch (e) {
+      const msg = e.message || '';
+      if (msg.includes('409')) {
+        // Classify conflict type
+        if (msg.includes('endpoint already registered')) {
+          log({ event: 'auto_register_endpoint_conflict', error: msg, note: 'Another agent holds this endpoint. Will retry on next heartbeat cycle.' });
+        } else if (msg.includes('name already taken')) {
+          log({ event: 'auto_register_name_conflict', error: msg, note: 'Agent name conflict. Rename in .atel/identity.json or re-init.' });
+        } else {
+          log({ event: 'auto_register_conflict', error: msg });
+        }
+        // Schedule retry in 60 seconds (stale agent may go offline by then)
+        setTimeout(async () => {
+          try {
+            await signedFetch('POST', '/registry/v1/register', {
+              name: capTypes.join('+') || id.agent_id, capabilities: caps, endpoint: bestEndpoint,
+              candidates: networkConfig.candidates, discoverable, wallets, metadata: { preferredChain }
+            }, id);
+            log({ event: 'auto_register_retry_ok' });
+          } catch (retryErr) {
+            log({ event: 'auto_register_retry_failed', error: retryErr.message });
+          }
+        }, 60000);
+      } else {
+        log({ event: 'auto_register_failed', error: msg });
+      }
+    }
   }
 
   // Register with relay server and start polling for relayed requests
@@ -3125,46 +4689,99 @@ async function cmdStart(port) {
     } catch (e) { log({ event: 'relay_register_failed', error: e.message }); }
 
     // Poll loop: check relay for incoming requests, forward to local endpoint
+    let relayPollBusy = false;
     const pollRelay = async () => {
+      if (relayPollBusy) return;
+      relayPollBusy = true;
       try {
         const resp = await fetch(`${relayUrl}/relay/v1/poll`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ did: id.did }), signal: AbortSignal.timeout(5000),
+          body: JSON.stringify({ did: id.did }), signal: AbortSignal.timeout(15000),
         });
-        if (!resp.ok) return;
-        const { requests } = await resp.json();
-        for (const req of requests) {
-          // Forward to local endpoint
+        if (!resp.ok) {
+          log({ event: 'relay_poll_http_error', relay: relayUrl, status: resp.status });
+          return;
+        }
+        const data = await resp.json();
+        const rawMessages = data.messages || data.requests || [];
+        if (rawMessages.length === 0) return;
+
+        log({ event: 'relay_poll_messages', relay: relayUrl, count: rawMessages.length });
+
+        const ackedIds = [];   // only ACK after confirmed local persistence
+        const failedIds = [];  // don't ACK — will be re-delivered
+
+        for (const m of rawMessages) {
+          const inner = m.message || m;
+          let req;
+          try {
+            req = typeof inner === 'string' ? JSON.parse(inner) : inner;
+          } catch (e) {
+            if (m.id) failedIds.push(m.id);
+            log({ event: 'relay_message_parse_error', id: m.id, error: e.message, rawType: typeof inner });
+            continue;
+          }
+
           try {
             const method = req.method || 'POST';
+            const path = req.path || '/';
             const fetchOpts = {
               method,
               headers: { 'Content-Type': 'application/json' },
               signal: AbortSignal.timeout(30000),
             };
-            if (method !== 'GET' && method !== 'HEAD') fetchOpts.body = JSON.stringify(req.body);
-            const localResp = await fetch(`http://127.0.0.1:${p}${req.path}`, fetchOpts);
-            const body = await localResp.json();
-            // Send response back to relay
-            await fetch(`${relayUrl}/relay/v1/respond`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ requestId: req.requestId, status: localResp.status, body }),
-              signal: AbortSignal.timeout(5000),
-            });
+            if (method !== 'GET' && method !== 'HEAD') fetchOpts.body = JSON.stringify(req.body || {});
+            const localUrl = `http://127.0.0.1:${p}${path}`;
+            const localResp = await fetch(localUrl, fetchOpts);
+            const rawText = await localResp.text();
+            let parsed;
+            try { parsed = rawText ? JSON.parse(rawText) : null; } catch {}
+
+            // Treat any 2xx as successful local persistence. Body parsing is best-effort only.
+            if (localResp.ok && m.id) {
+              ackedIds.push(m.id);
+              log({ event: 'relay_forward_ok', id: m.id, path, status: localResp.status, resultStatus: parsed?.status });
+            } else if (m.id) {
+              failedIds.push(m.id);
+              log({ event: 'relay_forward_failed', id: m.id, path, status: localResp.status, body: rawText.substring(0, 300) });
+            }
           } catch (e) {
-            // Send error response
-            await fetch(`${relayUrl}/relay/v1/respond`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ requestId: req.requestId, status: 500, body: { error: e.message } }),
-              signal: AbortSignal.timeout(5000),
-            }).catch(() => {});
+            // Local forwarding failed — do NOT ACK, let relay re-deliver
+            if (m.id) failedIds.push(m.id);
+            log({ event: 'relay_forward_error', id: m.id, path: req.path, error: e.message });
           }
         }
-      } catch {}
+
+        // ACK only successfully persisted messages
+        if (ackedIds.length > 0) {
+          try {
+            const ackResp = await fetch(`${relayUrl}/relay/v1/ack`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ did: id.did, ids: ackedIds }),
+              signal: AbortSignal.timeout(10000),
+            });
+            if (!ackResp.ok) {
+              log({ event: 'relay_ack_http_error', ids: ackedIds, status: ackResp.status });
+            }
+          } catch (e) {
+            log({ event: 'relay_ack_error', ids: ackedIds, error: e.message });
+          }
+        }
+        if (failedIds.length > 0) {
+          log({ event: 'relay_messages_not_acked', ids: failedIds, note: 'will be re-delivered in 60s' });
+        }
+      } catch (e) {
+        log({ event: 'relay_poll_error', relay: relayUrl, error: e.message });
+      } finally {
+        relayPollBusy = false;
+      }
     };
 
-    // Poll every 2 seconds + re-register every 2 minutes
-    setInterval(pollRelay, 2000);
+    // Poll immediately, then every 2 seconds + re-register every 2 minutes
+    pollRelay().catch((e) => log({ event: 'relay_poll_bootstrap_error', relay: relayUrl, error: e.message }));
+    setInterval(() => {
+      pollRelay().catch((e) => log({ event: 'relay_poll_interval_error', relay: relayUrl, error: e.message }));
+    }, 2000);
     setInterval(async () => {
       try {
         await fetch(`${relayUrl}/relay/v1/register`, {
@@ -3198,14 +4815,14 @@ async function cmdStart(port) {
   process.on('SIGINT', async () => { 
     heartbeat.stop();
     if (tunnelManager) await tunnelManager.stop();
-    if (builtinExecutor) await builtinExecutor.stop();
+    
     await endpoint.stop(); 
     process.exit(0); 
   });
   process.on('SIGTERM', async () => { 
     heartbeat.stop();
     if (tunnelManager) await tunnelManager.stop();
-    if (builtinExecutor) await builtinExecutor.stop();
+    
     await endpoint.stop(); 
     process.exit(0); 
   });
@@ -3394,6 +5011,32 @@ async function cmdTask(target, taskJson) {
   const force = payload._force || false;
   delete payload._force;
 
+  // Parse attachment flags
+  const attachmentFlags = parseAttachmentFlags(rawArgs);
+  const hasAttachments = attachmentFlags.images.length > 0 || 
+                         attachmentFlags.files.length > 0 || 
+                         attachmentFlags.audios.length > 0 || 
+                         attachmentFlags.videos.length > 0;
+
+  // Process attachments if any
+  if (hasAttachments) {
+    try {
+      const taskId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const processed = await processAttachments(attachmentFlags, id.did, taskId);
+      
+      // Add to payload
+      if (processed.images.length > 0) {
+        payload.images = processed.images;
+      }
+      if (processed.attachments.length > 0) {
+        payload.attachments = processed.attachments;
+      }
+    } catch (error) {
+      console.error(`Attachment processing failed: ${error.message}`);
+      process.exit(1);
+    }
+  }
+
   let remoteEndpoint = target;
   let remoteDid;
   let connectionType = 'direct';
@@ -3522,10 +5165,13 @@ async function cmdTask(target, taskJson) {
     const relayAck = await relaySend('/atel/v1/task', msg);
 
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: 'relay', relay_ack: relayAck, note: 'Relay mode is async. Waiting for result (up to 120s)...' }));
+    const relayTaskId = relayAck?.result?.taskId || msg.id || msg.payload?.taskId;
+    appendP2PTaskStatus({ taskId: relayTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
+    pushP2PNotification('p2p_task_sent', { taskId: relayTaskId, peerDid: remoteDid }).catch(() => {});
 
     // Wait for result to arrive in inbox (poll for task-result)
     // Extract taskId from relay ack (assigned by remote agent), fallback to msg fields
-    const taskId = relayAck?.result?.taskId || msg.id || msg.payload?.taskId;
+    const taskId = relayTaskId;
     let result = null;
     const waitStart = Date.now();
     const WAIT_TIMEOUT = 120000; // 2 minutes
@@ -3605,6 +5251,9 @@ async function cmdTask(target, taskJson) {
     const msg = createMessage({ type: 'task', from: id.did, to: remoteDid, payload: enhancedPayload, secretKey: id.secretKey });
     const result = await client.sendTask(remoteEndpoint, msg, hsManager);
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: remoteEndpoint, result }, null, 2));
+    const directTaskId = result?.taskId || taskRequest.taskId || msg.id || msg.payload?.taskId;
+    appendP2PTaskStatus({ taskId: directTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
+    pushP2PNotification('p2p_task_sent', { taskId: directTaskId, peerDid: remoteDid }).catch(() => {});
 
     // Update local trust history
     const success = result?.status !== 'rejected' && result?.status !== 'failed';
@@ -3623,108 +5272,68 @@ async function cmdResult(taskId, resultJson) {
 
 async function cmdCheck(targetDid, riskLevel, options) {
   const risk = riskLevel || 'low';
-  const chainMode = options?.chain || !!process.env.ATEL_SOLANA_RPC_URL;
   const policy = loadPolicy();
   const tp = policy.trustPolicy || DEFAULT_POLICY.trustPolicy;
+  const RISK_THRESHOLDS = { low: 0, medium: 30, high: 50, critical: 75 };
 
-  console.log(JSON.stringify({ event: 'checking_trust', did: targetDid, risk, mode: chainMode ? 'chain-verified' : 'local-only' }));
+  console.log(JSON.stringify({ event: 'checking_trust', did: targetDid, risk }));
 
-  // 1. Get Registry info (reference only, includes wallets)
-  let registryScore = null;
-  let agentName = null;
-  let peerWallets = null;
+  // 1. Fetch agent profile from Platform (primary source of truth)
+  let platformAgent = null;
+  let platformScore = null;
+  let platformReachable = true;
   try {
-    const r = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`${ATEL_PLATFORM}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      platformAgent = await r.json();
+      platformScore = platformAgent.trustScore;
+    }
+  } catch {
+    platformReachable = false;
+  }
+
+  // 2. Fetch trust history from Platform
+  let trustEvents = [];
+  try {
+    const r = await fetch(`${ATEL_PLATFORM}/registry/v1/agent/${encodeURIComponent(targetDid)}/trust-history`, { signal: AbortSignal.timeout(5000) });
     if (r.ok) {
       const d = await r.json();
-      registryScore = d.trustScore;
-      agentName = d.name;
-      if (d.wallets) peerWallets = d.wallets;
+      trustEvents = d.events || [];
     }
   } catch {}
 
-  // 2. Local interaction history
+  // 3. Local interaction history (secondary/fallback)
   const localHistoryFile = resolve(ATEL_DIR, 'trust-history.json');
   let history = {};
   try { history = JSON.parse(readFileSync(localHistoryFile, 'utf-8')); } catch {}
   const agentHistory = history[targetDid] || { tasks: 0, successes: 0, failures: 0, lastSeen: null, proofs: [] };
+  const localScore = computeTrustScore(agentHistory);
 
-  // 3. Chain-verified mode: query all three chains by wallet address
-  let chainVerification = null;
-  if (chainMode) {
-    const chainResults = { solana: null, base: null, bsc: null, totalRecords: 0, matchingDid: 0 };
-
-    // 3a. Verify unverified local proofs on-chain
-    const unverifiedProofs = agentHistory.proofs.filter(p => !p.verified && p.anchor_tx);
-    if (unverifiedProofs.length > 0) {
-      console.log(JSON.stringify({ event: 'verifying_local_proofs', count: unverifiedProofs.length }));
-      const result = await verifyAnchorTxList(unverifiedProofs, targetDid);
-      for (const vp of result.proofs) {
-        const existing = agentHistory.proofs.find(p => p.anchor_tx === vp.anchor_tx);
-        if (existing) existing.verified = true;
-      }
-      history[targetDid] = agentHistory;
-      try { writeFileSync(localHistoryFile, JSON.stringify(history, null, 2)); } catch {}
-    }
-
-    // 3b. Query peer's wallet addresses on all three chains
-    if (peerWallets) {
-      console.log(JSON.stringify({ event: 'querying_chain_history', wallets: peerWallets }));
-
-      // Solana
-      if (peerWallets.solana) {
-        try {
-          const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-          const provider = new SolanaAnchorProvider({ rpcUrl });
-          const records = await provider.queryByWallet(peerWallets.solana, { limit: 100, filterDid: targetDid });
-          chainResults.solana = { wallet: peerWallets.solana, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.solana = { error: e.message }; }
-      }
-
-      // Base
-      if (peerWallets.base) {
-        try {
-          const { BaseAnchorProvider } = await import('@lawrenceliang-btc/atel-sdk');
-          const baseRpc = process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org';
-          const provider = new BaseAnchorProvider({ rpcUrl: baseRpc });
-          const explorerApi = process.env.ATEL_BASE_EXPLORER_API || 'https://api.basescan.org/api';
-          const apiKey = process.env.ATEL_BASE_EXPLORER_KEY;
-          const records = await provider.queryByWallet(peerWallets.base, explorerApi, apiKey, { limit: 100, filterDid: targetDid });
-          chainResults.base = { wallet: peerWallets.base, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.base = { error: e.message }; }
-      }
-
-      // BSC
-      if (peerWallets.bsc) {
-        try {
-          const { BSCAnchorProvider } = await import('@lawrenceliang-btc/atel-sdk');
-          const bscRpc = process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
-          const provider = new BSCAnchorProvider({ rpcUrl: bscRpc });
-          const explorerApi = process.env.ATEL_BSC_EXPLORER_API || 'https://api.bscscan.com/api';
-          const apiKey = process.env.ATEL_BSC_EXPLORER_KEY;
-          const records = await provider.queryByWallet(peerWallets.bsc, explorerApi, apiKey, { limit: 100, filterDid: targetDid });
-          chainResults.bsc = { wallet: peerWallets.bsc, records: records.length, asExecutor: records.filter(r => r.executorDid === targetDid).length, asRequester: records.filter(r => r.requesterDid === targetDid).length };
-          chainResults.totalRecords += records.length;
-          chainResults.matchingDid += records.length;
-        } catch (e) { chainResults.bsc = { error: e.message }; }
+  // 4. Local TrustGraph info (supplementary)
+  let graphInfo = null;
+  try {
+    const saved = JSON.parse(readFileSync(resolve(ATEL_DIR, 'trust-graph.json'), 'utf-8'));
+    if (saved.interactions) {
+      const tg = new TrustGraph();
+      for (const i of saved.interactions) tg.recordInteraction(i);
+      const directConns = saved.interactions.filter(
+        i => i.from === targetDid || i.to === targetDid
+      );
+      if (directConns.length > 0) {
+        const stats = tg.getStats();
+        graphInfo = { directConnections: directConns.length, stats };
       }
     }
+  } catch {}
 
-    chainVerification = chainResults;
-  }
+  // 5. Determine effective score: Platform is primary, local is fallback
+  const effectiveScore = platformScore !== null ? platformScore : localScore;
+  const scoreSource = platformScore !== null ? 'platform' : 'local';
+  const trustLevel = computeTrustLevel(effectiveScore);
 
-  // 4. Compute unified trust score and level
-  const computedScore = computeTrustScore(agentHistory);
-  const trustLevel = computeTrustLevel(computedScore);
-
-  // 5. Apply trust policy
-  const threshold = tp.riskThresholds?.[risk] ?? 0;
-  const effectiveScore = computedScore > 0 ? computedScore : (registryScore || 0);
-  const isNewAgent = agentHistory.tasks === 0;
+  // 6. Apply trust policy (allow/deny decision)
+  const threshold = RISK_THRESHOLDS[risk] ?? (tp.riskThresholds?.[risk] ?? 0);
+  const isNewAgent = platformAgent === null && agentHistory.tasks === 0;
   let decision = 'allow';
   let reason = '';
 
@@ -3743,28 +5352,82 @@ async function cmdCheck(targetDid, riskLevel, options) {
     reason = `Score ${effectiveScore} meets threshold ${threshold} for ${risk} risk`;
   }
 
+  // 7. Build human-readable output
+  const lines = [];
+  lines.push(`Trust Check: ${targetDid}`);
+  if (platformAgent?.name) lines.push(`  Name: ${platformAgent.name}`);
+  lines.push(`  Platform Score: ${effectiveScore} / 100${scoreSource === 'local' ? ' (fallback: local)' : ''}`);
+  lines.push(`  Decision: ${decision} (threshold: ${threshold} for ${risk} risk)`);
+  if (reason) lines.push(`  Reason: ${reason}`);
+
+  // Recent events from Platform
+  if (trustEvents.length > 0) {
+    lines.push(`  Recent Events:`);
+    for (const ev of trustEvents.slice(0, 10)) {
+      const delta = ev.scoreDelta >= 0 ? `+${ev.scoreDelta}` : `${ev.scoreDelta}`;
+      const date = ev.createdAt ? ev.createdAt.split('T')[0] : '';
+      const ref = ev.referenceId || '';
+      lines.push(`    ${delta.padEnd(8)} ${ev.eventType.padEnd(22)} ${ref.padEnd(16)} ${date}`);
+    }
+    if (trustEvents.length > 10) lines.push(`    ... and ${trustEvents.length - 10} more`);
+  }
+
+  // Stats from Platform
+  if (platformAgent?.stats) {
+    const s = platformAgent.stats;
+    const successPct = s.successRate != null ? `${Math.round(s.successRate * 100)}%` : 'n/a';
+    lines.push(`  Stats: ${s.totalTasks} tasks, ${successPct} success${s.avgRating ? `, avg rating: ${s.avgRating.toFixed(1)}` : ''}`);
+  } else if (agentHistory.tasks > 0) {
+    const successPct = agentHistory.tasks > 0 ? `${Math.round((agentHistory.successes / agentHistory.tasks) * 100)}%` : 'n/a';
+    lines.push(`  Stats: ${agentHistory.tasks} tasks, ${successPct} success (local)`);
+  }
+
+  // Verified & Certification from Platform
+  if (platformAgent) {
+    lines.push(`  Verified: ${platformAgent.verified || false}`);
+    if (platformAgent.certification) {
+      lines.push(`  Certification: ${platformAgent.certification.level} (since ${platformAgent.certification.since})`);
+    }
+    if (platformAgent.boost?.active) {
+      lines.push(`  Boost: ${platformAgent.boost.tier} (active)`);
+    }
+  }
+
+  // Local TrustGraph supplementary info
+  if (graphInfo) {
+    lines.push(`  Local Graph: ${graphInfo.directConnections} direct connection${graphInfo.directConnections !== 1 ? 's' : ''}`);
+  }
+
+  // Fallback warning
+  if (!platformReachable) {
+    lines.push(`  Warning: Platform unreachable, using local score as fallback`);
+  }
+
+  // Print human-readable output
+  console.log(lines.join('\n'));
+
+  // Also emit structured JSON for machine consumption
   const output = {
     did: targetDid,
-    name: agentName,
-    mode: chainMode ? 'chain-verified' : 'local-only',
-    trust: {
-      computed_score: computedScore,
-      registry_score: registryScore,
-      effective_score: effectiveScore,
-      level: trustLevel.level,
-      level_name: trustLevel.name,
-      max_risk: trustLevel.maxRisk,
-      total_tasks: agentHistory.tasks,
-      successes: agentHistory.successes,
-      failures: agentHistory.failures,
-      verified_proofs: agentHistory.proofs.filter(p => p.verified).length,
-      total_proofs: agentHistory.proofs.length,
-    },
-    policy: { risk, threshold, decision, reason },
+    name: platformAgent?.name || null,
+    score: effectiveScore,
+    scoreSource,
+    level: trustLevel.level,
+    levelName: trustLevel.name,
+    decision,
+    risk,
+    threshold,
+    reason,
+    verified: platformAgent?.verified || false,
+    certification: platformAgent?.certification || null,
+    stats: platformAgent?.stats || null,
+    recentEvents: trustEvents.slice(0, 10),
+    localGraph: graphInfo,
+    platformReachable,
   };
-  if (chainVerification) output.chain_verification = chainVerification;
-  if (!chainMode) output.note = 'Local-only mode: score based on direct interaction history only. Set ATEL_SOLANA_RPC_URL or use --chain for on-chain verification.';
-
+  if (localScore > 0 && scoreSource === 'platform') {
+    output.localScore = localScore;
+  }
   console.log(JSON.stringify(output, null, 2));
 }
 
@@ -3935,7 +5598,7 @@ async function cmdRotate() {
 
 // ─── Platform API Helpers ────────────────────────────────────────
 
-const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
 
 async function signedFetch(method, path, payload = {}) {
   const id = requireIdentity();
@@ -3952,11 +5615,102 @@ async function signedFetch(method, path, payload = {}) {
   return data;
 }
 
+// ─── Auth Command ────────────────────────────────────────────────
+
+async function cmdAuth(code) {
+  if (!code) {
+    console.error('Usage: atel auth <code>');
+    console.error('  Authorize a Dashboard session using the code displayed on the login page.');
+    process.exit(1);
+  }
+  const id = requireIdentity();
+  const { default: nacl } = await import('tweetnacl');
+  const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+
+  const ts = new Date().toISOString();
+  const payload = { code: code.toUpperCase(), did: id.did, timestamp: ts };
+  const signable = serializePayload({ payload, did: id.did, timestamp: ts });
+  const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), id.secretKey)).toString('base64');
+
+  try {
+    const resp = await fetch(`${ATEL_PLATFORM}/auth/v1/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: code.toUpperCase(), did: id.did, signature: sig, timestamp: ts }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      console.log('Authorization successful!');
+      console.log(`  Agent: ${data.name}`);
+      console.log(`  DID:   ${data.did}`);
+      console.log('  Dashboard is now connected to your agent.');
+    } else {
+      console.error(`Authorization failed: ${data.error}`);
+      process.exit(1);
+    }
+  } catch (e) {
+    console.error(`Failed to connect: ${e.message}`);
+    process.exit(1);
+  }
+}
+
 // ─── Account Commands ────────────────────────────────────────────
 
 async function cmdBalance() {
-  const data = await signedFetch('GET', '/account/v1/balance');
-  console.log(JSON.stringify(data, null, 2));
+  const id = requireIdentity();
+
+  // Get smart wallet addresses from Platform
+  let wallets = {};
+  try {
+    const resp = await fetch(`${PLATFORM_URL}/registry/v1/agent/${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const agent = await resp.json();
+      if (agent.wallets) {
+        try { wallets = typeof agent.wallets === 'string' ? JSON.parse(agent.wallets) : agent.wallets; } catch {}
+      }
+    }
+  } catch {}
+
+  // Show on-chain USDC balance for smart wallets
+  const chains = ['base', 'bsc'];
+  const chainConfigs = {
+    base: { rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6 },
+    bsc: { rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', decimals: 18 }
+  };
+
+  console.log('\n💰 Balance:');
+  for (const chain of chains) {
+    const walletAddr = wallets[chain];
+    if (!walletAddr) continue;
+    try {
+      const { ethers } = await import('ethers');
+      const provider = new ethers.JsonRpcProvider(chainConfigs[chain].rpcUrl);
+      const usdc = new ethers.Contract(chainConfigs[chain].usdcAddress, ['function balanceOf(address) view returns (uint256)'], provider);
+      const balance = await usdc.balanceOf(walletAddr);
+      console.log(`  ${chain.toUpperCase()}: ${ethers.formatUnits(balance, chainConfigs[chain].decimals)} USDC`);
+      console.log(`    Wallet: ${walletAddr}`);
+    } catch (e) {
+      console.log(`  ${chain.toUpperCase()}: query failed (${e.message})`);
+    }
+  }
+
+  // Platform ledger balance
+  try {
+    const balResp = await fetch(`${PLATFORM_URL}/account/v1/balance?did=${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
+    if (balResp.ok) {
+      const bal = await balResp.json();
+      const available = parseFloat(bal.available ?? bal.balance ?? 0).toFixed(2);
+      const frozen = parseFloat(bal.frozen ?? 0).toFixed(2);
+      const total = (parseFloat(available) + parseFloat(frozen)).toFixed(2);
+      console.log(`  Platform: $${total}`);
+      console.log(`    Available: $${available}`);
+      console.log(`    Frozen: $${frozen}`);
+    } else {
+      console.log(`  Platform: query failed (HTTP ${balResp.status})`);
+    }
+  } catch (e) {
+    console.log(`  Platform: query failed (${e.message})`);
+  }
 }
 
 async function cmdDeposit(amount, channel) {
@@ -3965,15 +5719,50 @@ async function cmdDeposit(amount, channel) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-async function cmdWithdraw(amount, channel, address) {
-  if (!amount || isNaN(amount)) { console.error('Usage: atel withdraw <amount> [channel] [address]'); process.exit(1); }
-  if (channel && channel.startsWith('crypto_') && !address) {
-    console.error('Error: recipient wallet address required for crypto withdrawal');
-    console.error('Usage: atel withdraw <amount> crypto_base <your_wallet_address>');
+async function cmdWithdraw(amount, address, chain) {
+  if (!amount || isNaN(amount) || !address) {
+    console.error('Usage: atel withdraw <amount> <your_wallet_address> [chain]');
+    console.error('  amount:  USDC amount to withdraw');
+    console.error('  address: your external wallet address');
+    console.error('  chain:   base (default) or bsc');
     process.exit(1);
   }
-  const data = await signedFetch('POST', '/account/v1/withdraw', { amount: parseFloat(amount), channel: channel || 'manual', address: address || '' });
-  console.log(JSON.stringify(data, null, 2));
+  // Smart wallet withdrawal (new flow)
+  chain = chain || 'base';
+
+  // Validate destination address
+  const channel = 'crypto_' + chain;
+  if (channel === 'crypto_base' || channel === 'crypto_bsc') {
+    if (!address.match(/^0x[0-9a-fA-F]{40}$/)) {
+      console.error('Invalid EVM address. Must be 0x followed by 40 hex characters.');
+      process.exit(1);
+    }
+  } else if (channel === 'crypto_solana') {
+    if (!address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+      console.error('Invalid Solana address.');
+      process.exit(1);
+    }
+  }
+
+  try {
+    const data = await signedFetch('POST', '/trade/v1/wallet/withdraw', {
+      amount: parseFloat(amount),
+      address: address,
+      chain: chain,
+    });
+    if (data?.orderId) trackOrder(data.orderId, 'requester');
+    console.log(JSON.stringify(data, null, 2));
+  } catch (e) {
+    // Fallback to legacy withdrawal
+    console.error('Smart wallet withdrawal failed:', e.message);
+    console.error('Trying legacy withdrawal...');
+    try {
+      const data = await signedFetch('POST', '/account/v1/withdraw', { amount: parseFloat(amount), channel: 'crypto_' + chain, address });
+      console.log(JSON.stringify(data, null, 2));
+    } catch (e2) {
+      console.error('Withdrawal failed:', e2.message);
+    }
+  }
 }
 
 async function cmdTransactions() {
@@ -3997,7 +5786,8 @@ async function cmdTradeTask(capability, description) {
   if (!executorDid) {
     console.error(`[trade-task] Searching for executor with capability: ${capability}...`);
     const regClient = new RegistryClient({ registryUrl: REGISTRY_URL });
-    const results = await regClient.search({ type: capability, limit: 5 });
+    const searchResp = await regClient.search({ type: capability, limit: 5 });
+    const results = searchResp.agents || searchResp || [];
     if (results.length === 0) { console.error('[trade-task] No executor found for capability: ' + capability); process.exit(1); }
     // Pick best by trust score (if available), exclude self
     const candidates = results.filter(r => r.did !== id.did);
@@ -4022,7 +5812,9 @@ async function cmdTradeTask(capability, description) {
   while (Date.now() - startTime < timeout) {
     await new Promise(r => setTimeout(r, 3000));
     try {
-      const info = await signedFetch('GET', `/trade/v1/order/${orderId}`);
+      const pollResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+      if (!pollResp.ok) throw new Error(`HTTP ${pollResp.status}`);
+      const info = await pollResp.json();
       if (info.status !== lastStatus) {
         console.error(`[trade-task] Status: ${lastStatus} → ${info.status}`);
         lastStatus = info.status;
@@ -4057,6 +5849,10 @@ async function cmdTradeTask(capability, description) {
 
 async function cmdOrder(executorDid, capType, price) {
   if (!executorDid || !capType || !price) { console.error('Usage: atel order <executorDid> <capabilityType> <price> [--desc "task description"]'); process.exit(1); }
+  // Resolve @alias to full DID
+  if (executorDid.startsWith('@')) {
+    try { executorDid = resolveDID(executorDid); } catch (e) { console.error(e.message); process.exit(1); }
+  }
   const description = rawArgs.find((a, i) => rawArgs[i-1] === '--desc') || '';
   const id = requireIdentity();
   
@@ -4090,6 +5886,11 @@ async function cmdOrder(executorDid, capType, price) {
       taskSignature: taskSignature
     });
     
+    // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
+    if (data.orderId && parseFloat(price) > 0 && data.escrow?.escrowContract) {
+      console.log(`\n[Escrow] On-chain escrow: ${data.escrow.escrowContract} (${data.escrow.chain})`);
+    }
+
     console.log(JSON.stringify(data, null, 2));
   } catch (error) {
     // Try to parse error message for price validation failure
@@ -4122,6 +5923,7 @@ async function cmdOrderInfo(orderId) {
 async function cmdAccept(orderId) {
   if (!orderId) { console.error('Usage: atel accept <orderId>'); process.exit(1); }
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/accept`);
+  trackOrder(orderId, 'executor');
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -4131,11 +5933,152 @@ async function cmdReject(orderId) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-async function cmdEscrow(orderId) {
-  console.error('⚠️  DEPRECATED: Escrow is now automatic on accept. No action needed.');
-  if (!orderId) { process.exit(0); }
-  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow`);
+async function cmdOrderCancel(orderId, reason) {
+  if (!orderId) { console.error('Usage: atel order-cancel <orderId> [reason]'); process.exit(1); }
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/cancel`, {
+    reason: reason || 'reset regression environment',
+  });
+  if (data?.status === 'cancelled') untrackOrder(orderId);
   console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdEscrow(orderId) {
+  if (!orderId) { console.error('Usage: atel escrow <orderId>'); process.exit(1); }
+  const id = requireIdentity();
+
+  // 1. Get order info (Platform returns PascalCase or camelCase depending on endpoint)
+  const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
+  const orderInfo = await res.json();
+  if (!res.ok) { console.error('Failed to get order:', orderInfo.error); process.exit(1); }
+
+  const orderStatus = orderInfo.status || orderInfo.Status || '';
+  if (orderStatus !== 'pending_escrow') {
+    if (['milestone_review', 'executing', 'settled'].includes(orderStatus)) {
+      console.log(`Order already past escrow stage (status: ${orderStatus}).`);
+    } else {
+      console.error(`Order status '${orderStatus}' — expected 'pending_escrow'.`);
+    }
+    return;
+  }
+
+  const priceAmount = orderInfo.priceAmount || orderInfo.PriceAmount || orderInfo.price_amount;
+  if (!priceAmount || priceAmount <= 0) { console.error('Free order — no escrow needed.'); return; }
+
+  // 2. Chain + wallet setup
+  const chain = orderInfo.chain || orderInfo.Chain || 'base';
+  const privateKey = getChainPrivateKey(chain);
+  if (!privateKey) {
+    console.error(`No private key for chain '${chain}'. Set ATEL_${chain.toUpperCase()}_PRIVATE_KEY`);
+    process.exit(1);
+  }
+
+  const chainConfigs = {
+    base: { rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', usdcDecimals: 6, escrowManager: process.env.ATEL_ESCROW_MANAGER || '0x1B114F2cF814C278b94D736b8bcACD4B4F3EA52d' },
+    bsc: { rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', usdcDecimals: 18, escrowManager: process.env.ATEL_ESCROW_MANAGER_BSC || '0x6D07741c7bB47B635Eaca593f8cf97C5a78447Ec' }
+  };
+  const cfg = chainConfigs[chain];
+  if (!cfg) { console.error(`Unsupported chain: ${chain}`); process.exit(1); }
+
+  try {
+    const { ethers } = await import('ethers');
+    const provider = new ethers.JsonRpcProvider(cfg.rpcUrl);
+    const wallet = new ethers.Wallet(privateKey, provider);
+
+    // 3. Get operator signature from Platform (also validates requester identity)
+    console.log(`Requesting escrow parameters from Platform...`);
+    let sigData;
+    try {
+      sigData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-sig`, { requesterAddress: wallet.address });
+    } catch (e) {
+      console.error(`Platform rejected escrow request: ${e.message}`);
+      process.exit(1);
+    }
+
+    const amount = BigInt(sigData.amount);
+    const fee = BigInt(sigData.platformFee);
+
+    // 4. Check balances
+    const usdc = new ethers.Contract(cfg.usdcAddress, [
+      'function approve(address,uint256) returns (bool)',
+      'function allowance(address,address) view returns (uint256)',
+      'function balanceOf(address) view returns (uint256)',
+    ], wallet);
+
+    const usdcBal = await usdc.balanceOf(wallet.address);
+    if (usdcBal < amount) {
+      console.error(`Insufficient USDC: need ${ethers.formatUnits(amount, cfg.usdcDecimals)}, have ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)}`);
+      process.exit(1);
+    }
+    console.log(`USDC balance: ${ethers.formatUnits(usdcBal, cfg.usdcDecimals)} ✓`);
+
+    const ethBal = await provider.getBalance(wallet.address);
+    if (ethBal < ethers.parseEther('0.0001')) {
+      console.error(`Insufficient gas: ${ethers.formatEther(ethBal)} ETH/BNB`);
+      process.exit(1);
+    }
+
+    // 5. Approve USDC (idempotent: skip if allowance sufficient)
+    const currentAllowance = await usdc.allowance(wallet.address, cfg.escrowManager);
+    if (currentAllowance >= amount) {
+      console.log(`Allowance sufficient (${ethers.formatUnits(currentAllowance, cfg.usdcDecimals)}), skipping approve.`);
+    } else {
+      // If there's a stale small allowance, reset to 0 first (some USDC implementations require this)
+      if (currentAllowance > 0n) {
+        console.log(`Resetting stale allowance...`);
+        const resetTx = await usdc.approve(cfg.escrowManager, 0n);
+        await resetTx.wait();
+      }
+      console.log(`Approving ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC...`);
+      const approveTx = await usdc.approve(cfg.escrowManager, amount);
+      console.log(`  Approve tx: ${approveTx.hash}`);
+      await approveTx.wait();
+      console.log(`  Confirmed ✓`);
+    }
+
+    // 6. createEscrow
+    console.log(`Creating escrow (locking ${ethers.formatUnits(amount, cfg.usdcDecimals)} USDC)...`);
+    const escrowContract = new ethers.Contract(cfg.escrowManager, [
+      'function createEscrow(bytes32,address,address,uint256,uint256,bytes32,bytes) external'
+    ], wallet);
+
+    let createTxHash;
+    try {
+      const tx = await escrowContract.createEscrow(
+        sigData.orderId,
+        sigData.executorAddress,
+        cfg.usdcAddress,
+        amount,
+        fee,
+        sigData.nonce,
+        sigData.operatorSig
+      );
+      console.log(`  Escrow tx: ${tx.hash}`);
+      const receipt = await tx.wait();
+      console.log(`  Confirmed ✓ (gas: ${receipt.gasUsed})`);
+      createTxHash = tx.hash;
+    } catch (e) {
+      console.error(`\n❌ createEscrow failed: ${e.reason || e.message}`);
+      console.log(`\nUSDC approval is active. You can safely retry:`);
+      console.log(`  atel escrow ${orderId}`);
+      process.exit(1);
+    }
+
+    // 7. Confirm to Platform
+    console.log(`Confirming with Platform...`);
+    try {
+      const confirmData = await signedFetch('POST', `/trade/v1/order/${orderId}/escrow-confirm`, { txHash: createTxHash });
+      console.log(`  ✓ Order status: ${confirmData.status}`);
+      console.log(`\nNext: run "atel milestone-status ${orderId}" to view milestone plan`);
+    } catch (e) {
+      console.error(`\n⚠️ Escrow is on-chain but Platform confirmation failed: ${e.message}`);
+      console.log(`Retry with: atel escrow ${orderId}`);
+      console.log(`(createEscrow won't re-execute, only confirmation will be retried)`);
+    }
+
+  } catch (error) {
+    console.error(`Failed: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 async function cmdComplete(orderId, taskId) {
@@ -4146,13 +6089,26 @@ async function cmdComplete(orderId, taskId) {
   const payload = {};
   if (taskId) payload.taskId = taskId;
 
-  // Fetch order info for context
+  // Fetch order info for context (raw GET; order-info endpoint is public GET, not DIDAuth POST)
   let requesterDid = 'unknown';
   let orderInfo = null;
   try {
-    orderInfo = await signedFetch('GET', `/trade/v1/order/${orderId}`);
-    requesterDid = orderInfo.requesterDid || 'unknown';
+    const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+    const text = await res.text();
+    if (res.ok) {
+      orderInfo = JSON.parse(text);
+      requesterDid = orderInfo.requesterDid || 'unknown';
+    } else {
+      throw new Error(text || `HTTP ${res.status}`);
+    }
   } catch (e) { console.error(`[complete] Warning: could not fetch order info: ${e.message}`); }
+
+  // Idempotency: if order is already completed or beyond, don't submit duplicate complete
+  if (orderInfo && ['completed', 'confirmed', 'settled'].includes(String(orderInfo.status || '').toLowerCase())) {
+    console.error(`[complete] Order ${orderId} is already ${orderInfo.status}; skipping duplicate complete.`);
+    console.log(JSON.stringify(orderInfo, null, 2));
+    return;
+  }
 
   // ========== Verify Requester Signature (version >= 2) ==========
   if (orderInfo && orderInfo.version >= 2) {
@@ -4356,8 +6312,28 @@ async function cmdComplete(orderId, taskId) {
   if (anchorTx) payload.anchorTx = anchorTx;
   if (anchorChain) payload.chain = anchorChain;
 
-  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/complete`, payload);
-  console.log(JSON.stringify(data, null, 2));
+  try {
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/complete`, payload);
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  } catch (e) {
+    const msg = e?.message || '';
+    if (msg.includes('order must be executing')) {
+      try {
+        const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+        const text = await res.text();
+        if (res.ok) {
+          const latest = JSON.parse(text);
+          if (['completed', 'confirmed', 'settled'].includes(String(latest.status || '').toLowerCase())) {
+            console.error(`[complete] Duplicate complete detected; order is already ${latest.status}.`);
+            console.log(JSON.stringify(latest, null, 2));
+            return;
+          }
+        }
+      } catch {}
+    }
+    throw e;
+  }
 }
 
 async function cmdConfirm(orderId) {
@@ -4383,6 +6359,193 @@ async function cmdOrders(role, status) {
   console.log(JSON.stringify(data, null, 2));
 }
 
+// ─── Milestone Commands ──────────────────────────────────────────
+
+async function cmdMilestoneStatus(orderId) {
+  if (!orderId) { console.error('Usage: atel milestone-status <orderId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`);
+  const data = await resp.json();
+  if (data.totalMilestones === 0) {
+    console.log('No milestones (free order or not yet generated)');
+    return;
+  }
+  console.log(`\nOrder: ${orderId}`);
+  if (data.orderStatus) console.log(`Order Status: ${data.orderStatus}`);
+  if (data.phase) console.log(`Phase: ${data.phase}`);
+  console.log(`Progress: ${data.currentMilestone}/${data.totalMilestones}\n`);
+  for (const m of (data.milestones || [])) {
+    const status = m.status === 'verified' ? '✅' : m.status === 'submitted' ? '📤' : m.status === 'rejected' ? '❌' : m.status === 'arbitrated' ? '⚖️' : '⏳';
+    console.log(`  ${status} M${m.index}: ${m.title}`);
+    if (m.resultSummary) console.log(`     Result: ${m.resultSummary}`);
+    if (m.arbitrationResult) console.log(`     Arbitration: ${m.arbitrationResult}`);
+  }
+  console.log('');
+}
+
+async function cmdMilestoneFeedback(orderId) {
+  if (!orderId) { console.error('Usage: atel milestone-feedback <orderId> [--approve | --feedback "text"]'); process.exit(1); }
+  const approve = rawArgs.includes('--approve');
+  const feedbackIdx = rawArgs.findIndex(a => a === '--feedback');
+  const feedback = feedbackIdx >= 0 ? rawArgs[feedbackIdx + 1] : '';
+
+  if (!approve && !feedback) {
+    console.error('Usage: atel milestone-feedback <orderId> --approve');
+    console.error('       atel milestone-feedback <orderId> --feedback "修改意见"');
+    process.exit(1);
+  }
+
+  const payload = approve ? { approved: true } : { approved: false, feedback };
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestones/feedback`, payload);
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdMilestoneSubmit(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-submit <orderId> <index> --result "结果描述" [--file <path>]');
+    console.error('       atel milestone-submit <orderId> <index> --result ./file.pdf [--hash 0x...] [--file <path>]');
+    process.exit(1);
+  }
+  const resultIdx = rawArgs.findIndex(a => a === '--result');
+  const hashIdx = rawArgs.findIndex(a => a === '--hash');
+
+  if (resultIdx < 0) { console.error('--result is required (text or file path)'); process.exit(1); }
+
+  // Collect result text (everything after --result until next flag or end)
+  let resultParts = [];
+  for (let i = resultIdx + 1; i < rawArgs.length; i++) {
+    if (rawArgs[i].startsWith('--')) break;
+    resultParts.push(rawArgs[i]);
+  }
+  const result = resultParts.join(' ');
+  if (!result) { console.error('--result value cannot be empty'); process.exit(1); }
+
+  // Compute resultHash: deterministic, reproducible (no timestamp)
+  let resultHash;
+  if (hashIdx >= 0 && rawArgs[hashIdx + 1]) {
+    // User-provided hash
+    resultHash = rawArgs[hashIdx + 1];
+  } else if (existsSync(result)) {
+    // File path: hash = keccak256(file content)
+    const { ethers } = await import('ethers');
+    const fileContent = readFileSync(result);
+    resultHash = ethers.keccak256(fileContent);
+    console.log(`File detected: ${result} (${fileContent.length} bytes)`);
+  } else {
+    // Text: hash = keccak256(text) — stable, reproducible
+    const { ethers } = await import('ethers');
+    resultHash = ethers.keccak256(ethers.toUtf8Bytes(result));
+  }
+
+  // --file support: upload attachment before submitting
+  let resultText = result;
+  const filePath = rawArgs.find((a, i) => rawArgs[i - 1] === '--file');
+  if (filePath) {
+    const { execFileSync } = await import('child_process');
+    const path = await import('path');
+    try {
+      const id = requireIdentity();
+      const uploadResult = execFileSync('curl', ['-s', '-X', 'POST',
+        `${PLATFORM_URL}/attachment/v1/upload`,
+        '-F', `file=@${filePath}`,
+        '-F', 'kind=file',
+        '-F', `uploadedBy=${id.did}`
+      ], { encoding: 'utf8' });
+      const uploadData = JSON.parse(uploadResult);
+      if (uploadData.attachmentId) {
+        resultText += `\n[Attachment: ${uploadData.attachmentId} (${path.basename(filePath)})]`;
+        console.error(`File uploaded: ${uploadData.attachmentId}`);
+      }
+    } catch (e) {
+      console.error(`File upload failed: ${e.message}`);
+    }
+  }
+
+  console.log(`Submitting M${indexStr}: "${resultText.slice(0, 60)}${resultText.length > 60 ? '...' : ''}"`);
+  console.log(`Hash: ${resultHash}`);
+
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/submit`, {
+    resultSummary: resultText,
+    resultHash,
+  });
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdMilestoneVerify(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) {
+    console.error('Usage: atel milestone-verify <orderId> <index> --pass');
+    console.error('       atel milestone-verify <orderId> <index> --reject "原因"');
+    process.exit(1);
+  }
+  const pass = rawArgs.includes('--pass');
+  const rejectIdx = rawArgs.findIndex(a => a === '--reject');
+  const hasReject = rejectIdx >= 0;
+
+  // Show milestone content before verifying (so agent actually reviews it)
+  try {
+    const msResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/milestones`, { signal: AbortSignal.timeout(5000) });
+    if (msResp.ok) {
+      const msData = await msResp.json();
+      const milestone = (msData.milestones || []).find(m => m.index === parseInt(indexStr));
+      if (milestone) {
+        console.log(`\n━━━ Reviewing M${indexStr} ━━━`);
+        console.log(`  Goal:    ${milestone.title}`);
+        console.log(`  Status:  ${milestone.status}`);
+        if (milestone.resultSummary) {
+          console.log(`  Content: ${milestone.resultSummary}`);
+        }
+        console.log(`  Attempts: ${milestone.submitCount}/3`);
+        console.log(`━━━━━━━━━━━━━━━━━━━\n`);
+      }
+    }
+  } catch {}
+
+  // Strict mutual exclusion (audit fix #5)
+  if (pass && hasReject) {
+    console.error('Error: --pass and --reject are mutually exclusive');
+    process.exit(1);
+  }
+  if (!pass && !hasReject) {
+    console.error('Error: must specify --pass or --reject "reason"');
+    process.exit(1);
+  }
+
+  if (hasReject) {
+    const rejectReason = rawArgs.slice(rejectIdx + 1).join(' ');
+    if (!rejectReason) {
+      console.error('Error: --reject requires a reason');
+      process.exit(1);
+    }
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: false, rejectReason });
+    console.log(JSON.stringify(data, null, 2));
+  } else {
+    const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: true });
+    console.log(JSON.stringify(data, null, 2));
+  }
+}
+
+async function cmdMilestoneArbitrate(orderId, indexStr) {
+  if (!orderId || indexStr === undefined) { console.error('Usage: atel milestone-arbitrate <orderId> <index>'); process.exit(1); }
+  const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/arbitrate`, {});
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdChainRecords(orderId) {
+  if (!orderId) { console.error('Usage: atel chain-records <orderId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/chain-records`);
+  const data = await resp.json();
+  if (!data.records || data.records.length === 0) {
+    console.log(`No chain records for order ${orderId}.`);
+    return;
+  }
+  console.log(`\nOrder: ${orderId}  Chain records: ${data.count}\n`);
+  for (const r of data.records) {
+    const icon = r.status === 'confirmed' ? '✅' : '⏳';
+    const tx = r.txHash ? r.txHash.slice(0, 18) + '...' : '(pending)';
+    console.log(`  ${icon} ${r.operationType.padEnd(20)} ${r.status.padEnd(10)} ${tx}`);
+  }
+  console.log('');
+}
+
 // ─── Dispute Commands ────────────────────────────────────────────
 
 async function cmdDispute(orderId, reason, description) {
@@ -4392,10 +6555,60 @@ async function cmdDispute(orderId, reason, description) {
 }
 
 async function cmdEvidence(disputeId, evidenceJson) {
-  if (!disputeId || !evidenceJson) { console.error('Usage: atel evidence <disputeId> <json>'); process.exit(1); }
+  if (!disputeId || !evidenceJson) { console.error('Usage: atel evidence <disputeId> <json> [--file <path>]'); process.exit(1); }
   let evidence;
   try { evidence = JSON.parse(evidenceJson); } catch { console.error('Invalid JSON'); process.exit(1); }
+
+  // --file support: upload attachment and attach to evidence
+  const filePath = rawArgs.find((a, i) => rawArgs[i - 1] === '--file');
+  if (filePath) {
+    const { execFileSync } = await import('child_process');
+    const path = await import('path');
+    try {
+      const id = requireIdentity();
+      const uploadResult = execFileSync('curl', ['-s', '-X', 'POST',
+        `${PLATFORM_URL}/attachment/v1/upload`,
+        '-F', `file=@${filePath}`,
+        '-F', 'kind=file',
+        '-F', `uploadedBy=${id.did}`
+      ], { encoding: 'utf8' });
+      const uploadData = JSON.parse(uploadResult);
+      if (uploadData.attachmentId) {
+        evidence.attachmentId = uploadData.attachmentId;
+        evidence.attachmentName = path.basename(filePath);
+        console.error(`File uploaded: ${uploadData.attachmentId}`);
+      }
+    } catch (e) {
+      console.error(`File upload failed: ${e.message}`);
+    }
+  }
+
+  // Submit to Platform API
   const data = await signedFetch('POST', `/dispute/v1/${disputeId}/evidence`, { evidence });
+
+  // Also anchor evidence hash on-chain if DisputeController is configured
+  if (process.env.ATEL_DISPUTE_CONTROLLER_ADDRESS && process.env.ATEL_BASE_PRIVATE_KEY) {
+    try {
+      const { ethers } = await import('ethers');
+      const provider = new ethers.JsonRpcProvider(process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org');
+      const wallet = new ethers.Wallet(process.env.ATEL_BASE_PRIVATE_KEY, provider);
+      const contract = new ethers.Contract(process.env.ATEL_DISPUTE_CONTROLLER_ADDRESS, [
+        'function submitEvidence(bytes32 orderId, bytes32 evidenceHash) external'
+      ], wallet);
+
+      // Compute hashes matching contract expectations
+      const orderId = data.orderId || disputeId;
+      const orderIdHash = ethers.keccak256(ethers.toUtf8Bytes(orderId));
+      const evidenceHash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(evidence)));
+
+      const tx = await contract.submitEvidence(orderIdHash, evidenceHash);
+      await tx.wait();
+      console.log(`[Evidence] On-chain anchored: tx=${tx.hash}`);
+    } catch (e) {
+      console.log(`[Evidence] On-chain anchoring skipped: ${e.message?.slice(0, 60)}`);
+    }
+  }
+
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -4425,6 +6638,21 @@ async function cmdCertStatus(did) {
   const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   console.log(JSON.stringify(data, null, 2));
+
+  // Fetch and display certification requirements
+  try {
+    const reqResp = await fetch(`${PLATFORM_URL}/cert/v1/requirements`, { signal: AbortSignal.timeout(5000) });
+    if (reqResp.ok) {
+      const reqs = await reqResp.json();
+      console.log('\nCertification Requirements:');
+      if (reqs.certified) {
+        console.log(`  Certified: trust_score >= ${reqs.certified.minTrustScore}, cost: $${reqs.certified.cost}`);
+      }
+      if (reqs.enterprise) {
+        console.log(`  Enterprise: trust_score >= ${reqs.enterprise.minTrustScore}, cost: $${reqs.enterprise.cost}`);
+      }
+    }
+  } catch {}
 }
 
 async function cmdCertRenew(level) {
@@ -4486,6 +6714,17 @@ async function cmdOfferList(did) {
   } else {
     console.log('  No active offers found.');
   }
+}
+
+async function cmdOfferInfo(offerId) {
+  if (!offerId) { console.error('Usage: atel offer-info <offerId>'); process.exit(1); }
+  const resp = await fetch(`${PLATFORM_URL}/trade/v1/offer/${encodeURIComponent(offerId)}`, { signal: AbortSignal.timeout(10000) });
+  if (!resp.ok) {
+    console.error(`Error: Failed to fetch offer (HTTP ${resp.status})`);
+    process.exit(1);
+  }
+  const data = await resp.json();
+  console.log(JSON.stringify(data, null, 2));
 }
 
 async function cmdOfferUpdate(offerId) {
@@ -4861,14 +7100,32 @@ async function cmdFriendRequest(args) {
   };
   
   // Sign the request
-  const signedRequest = createMessage(request, id.secretKey);
+  const signedRequest = createMessage({ ...request, secretKey: id.secretKey });
   
-  // Try to send via P2P
+  // Try to send via P2P — look up registry for endpoint
   let sent = false;
   let error = null;
   
   try {
-    const result = await sendP2PMessage(targetDid, signedRequest);
+    // Resolve endpoint from registry
+    let endpoint = null;
+    try {
+      const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        const entry = await resp.json();
+        const candidates = entry.endpoint_candidates || [];
+        const direct = candidates.find(c => c.type === 'direct');
+        const relay = candidates.find(c => c.type === 'relay');
+        endpoint = direct?.url || relay?.url || entry.endpoint;
+      }
+    } catch (e) {
+      throw new Error(`Cannot find agent in registry: ${e.message}`);
+    }
+    if (!endpoint) throw new Error('Agent has no reachable endpoint');
+    
+    const hsManager = new HandshakeManager(id);
+    const client = new AgentClient(id);
+    await client.sendTask(endpoint, signedRequest, hsManager);
     sent = true;
   } catch (err) {
     error = err.message;
@@ -4958,7 +7215,7 @@ async function cmdFriendAccept(args) {
     }
   };
   
-  const signedMsg = createMessage(acceptMsg, id.secretKey);
+  const signedMsg = createMessage({ ...acceptMsg, secretKey: id.secretKey });
   
   try {
     await sendP2PMessage(request.from, signedMsg);
@@ -5024,7 +7281,7 @@ async function cmdFriendReject(args) {
     }
   };
   
-  const signedMsg = createMessage(rejectMsg, id.secretKey);
+  const signedMsg = createMessage({ ...rejectMsg, secretKey: id.secretKey });
   
   try {
     await sendP2PMessage(request.from, signedMsg);
@@ -5160,6 +7417,214 @@ async function cmdFriendStatus(args) {
   }
   
   console.log('');
+}
+
+// ─── P2P Send Helper ────────────────────────────────────────────
+// Resolves DID → endpoint via registry, then sends a signed message.
+// Replaces the previously undefined sendP2PMessage.
+async function sendP2PMessage(targetDid, signedMsg) {
+  const id = loadIdentity();
+  if (!id) throw new Error('No identity found');
+
+  let endpoint = null;
+  try {
+    const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      const entry = await resp.json();
+      const candidates = entry.endpoint_candidates || [];
+      const direct = candidates.find(c => c.type === 'direct');
+      const relay  = candidates.find(c => c.type === 'relay');
+      endpoint = direct?.url || relay?.url || entry.endpoint;
+    }
+  } catch (e) {
+    throw new Error(`Registry lookup failed for ${targetDid}: ${e.message}`);
+  }
+  if (!endpoint) throw new Error(`No reachable endpoint for ${targetDid}`);
+
+  const hsManager = new HandshakeManager(id);
+  const client    = new AgentClient(id);
+  return await client.sendTask(endpoint, signedMsg, hsManager);
+}
+
+// ─── Send Command (Rich Media P2P Messaging) ─────────────────────
+
+function showSendHelp() {
+  console.log(`
+atal send — Send a message (with optional rich media) to another agent
+
+Usage:
+  atel send <did|alias|endpoint> "message text"
+  atel send <did> "look at this" --image ./photo.jpg
+  atel send <did> "here is the file" --file ./report.pdf
+  atel send <did> "listen" --audio ./voice.mp3
+  atel send <did> "watch this" --video ./clip.mp4
+
+Flags:
+  --image <path>   Attach image (jpg/png/gif/webp, max 10MB, up to 9)
+  --file  <path>   Attach file  (pdf/zip/txt/json, max 100MB, up to 5)
+  --audio <path>   Attach audio (mp3/wav/ogg/m4a, max 50MB)
+  --video <path>   Attach video (mp4/webm/mov, max 500MB)
+  --json           Output result as JSON
+
+Notes:
+  By default, agents require a mutual friend relationship before accepting
+  P2P messages. If you get a NOT_FRIEND error, run:
+    atel friend request <did>
+  and ask the other side to accept with:
+    atel friend accept <request-id>
+
+  To disable the friend requirement on your own agent, set in policy.json:
+    { "relationshipPolicy": { "defaultMode": "open" } }
+
+Examples:
+  atel send did:atel:ed25519:ABC "Hello!"
+  atel send @alice "Check this" --image ./screenshot.png
+  atel send did:atel:ed25519:ABC "Report" --file ./q1.pdf
+`);
+}
+
+async function cmdSend(args) {
+  const target  = args._[0];
+  const text    = args._[1] || '';
+  const isJson  = rawArgs.includes('--json');
+
+  if (!target) { showSendHelp(); process.exit(1); }
+
+  const id = loadIdentity();
+  if (!id) { console.error('No identity found. Run: atel init'); process.exit(1); }
+
+  // Parse attachment flags
+  const attachmentFlags = parseAttachmentFlags(rawArgs);
+  const hasAttachments  = attachmentFlags.images.length > 0 ||
+                          attachmentFlags.files.length  > 0 ||
+                          attachmentFlags.audios.length > 0 ||
+                          attachmentFlags.videos.length > 0;
+
+  if (!text && !hasAttachments) {
+    console.error('Error: message text or at least one attachment is required');
+    showSendHelp(); process.exit(1);
+  }
+
+  // Build payload
+  const msgId   = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const payload = {
+    action:    'general',   // broad compatibility with all SDK versions
+    msgType:   'message',   // identifies this as a p2p chat message
+    msgId,
+    text,
+    timestamp: new Date().toISOString(),
+  };
+
+  // Upload attachments
+  if (hasAttachments) {
+    try {
+      if (!isJson) process.stderr.write('Uploading attachments...\n');
+      const processed = await processAttachments(attachmentFlags, id.did, msgId);
+      if (processed.images.length     > 0) payload.images      = processed.images;
+      if (processed.attachments.length > 0) payload.attachments = processed.attachments;
+      if (!isJson) {
+        const total = (processed.images.length + processed.attachments.length);
+        process.stderr.write(`  ✓ ${total} attachment(s) ready\n`);
+      }
+    } catch (err) {
+      console.error(`Attachment upload failed: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  // Resolve target → endpoint + remoteDid
+  let remoteEndpoint = target;
+  let remoteDid;
+
+  // Resolve @alias
+  try { const r = resolveDID(target); if (r !== target) remoteEndpoint = r; } catch (_) {}
+
+  if (!remoteEndpoint.startsWith('http')) {
+    // Registry lookup
+    let entry;
+    try {
+      const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(remoteEndpoint)}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) entry = await resp.json();
+    } catch (_) {}
+    if (!entry) {
+      const regClient = new RegistryClient({ registryUrl: REGISTRY_URL });
+      const results = await regClient.search({ type: remoteEndpoint, limit: 1 });
+      if (results.length > 0) entry = results[0];
+    }
+    if (!entry) { console.error(`Agent not found: ${target}`); process.exit(1); }
+    remoteDid = entry.did;
+    const candidates = entry.endpoint_candidates || [];
+    const direct = candidates.find(c => c.type === 'direct');
+    const relay  = candidates.find(c => c.type === 'relay');
+    remoteEndpoint = direct?.url || relay?.url || entry.endpoint;
+  } else {
+    remoteDid = target.startsWith('did:') ? target : undefined;
+    // Try to get remoteDid from handshake cache for direct endpoints
+    if (!remoteDid) {
+      try {
+        const tmpHs = new HandshakeManager(id);
+        const session = await tmpHs.getOrCreate(remoteEndpoint);
+        if (session?.remoteDid) remoteDid = session.remoteDid;
+      } catch (_) {}
+    }
+  }
+
+  if (!remoteEndpoint) {
+    console.error(`No reachable endpoint for: ${target}`);
+    process.exit(1);
+  }
+
+  // Send
+  try {
+    const hsManager = new HandshakeManager(id);
+    const client    = new AgentClient(id);
+    const msg       = createMessage({ type: 'task', from: id.did, to: remoteDid || remoteEndpoint, payload, secretKey: id.secretKey });
+    const result    = await client.sendTask(remoteEndpoint, msg, hsManager);
+
+    // Surface friendly errors
+    const inner = result?.result;
+    if (inner?.code === 'NOT_FRIEND' || inner?.error?.includes('NOT_FRIEND') || inner?.error?.includes('not a friend')) {
+      if (isJson) {
+        console.log(JSON.stringify({ status: 'error', code: 'NOT_FRIEND', message: inner.error, hint: `Run: atel friend request ${remoteDid || target}` }));
+      } else {
+        console.error(`✗ Message blocked: the recipient requires a friend relationship.`);
+        console.error(`  Run: atel friend request ${remoteDid || target}`);
+        console.error(`  Then ask them to: atel friend accept <request-id>`);
+      }
+      process.exit(1);
+    }
+    if (inner?.status === 'rejected') {
+      if (isJson) {
+        console.log(JSON.stringify({ status: 'error', message: inner.error || 'Message rejected', result }));
+      } else {
+        console.error(`✗ Message rejected: ${inner.error || 'unknown reason'}`);
+      }
+      process.exit(1);
+    }
+
+    if (isJson) {
+      console.log(JSON.stringify({ status: 'sent', msgId, to: remoteDid || remoteEndpoint, attachments: (payload.images?.length || 0) + (payload.attachments?.length || 0), result }, null, 2));
+    } else {
+      console.log(`✓ Message sent to ${remoteDid || remoteEndpoint}`);
+      if (payload.images?.length)      console.log(`  Images:      ${payload.images.length}`);
+      if (payload.attachments?.length) console.log(`  Attachments: ${payload.attachments.length}`);
+    }
+  } catch (err) {
+    if (isJson) {
+      console.log(JSON.stringify({ status: 'error', message: err.message }));
+    } else {
+      // Surface specific known errors in human-readable form
+      if (err.message?.includes('fetch failed') || err.message?.includes('ECONNREFUSED')) {
+        console.error(`✗ Cannot reach agent at ${remoteEndpoint}`);
+        console.error(`  The agent may be offline or behind a firewall.`);
+      } else if (err.message?.includes('401') || err.message?.includes('Unauthorized')) {
+        console.error(`✗ Authentication failed — try: atel handshake ${remoteEndpoint}`);
+      } else {
+        console.error(`✗ Send failed: ${err.message}`);
+      }
+    }
+    process.exit(1);
+  }
 }
 
 // ─── Temporary Session Commands ──────────────────────────────────
@@ -5527,6 +7992,7 @@ const commands = {
   // Trade
   'trade-task': () => cmdTradeTask(args[0], args.slice(1).join(' ')),
   order: () => cmdOrder(args[0], args[1], args[2]),
+  'order-cancel': () => cmdOrderCancel(args[0], args.slice(1).join(' ').trim()),
   'order-info': () => cmdOrderInfo(args[0]),
   accept: () => cmdAccept(args[0]),
   reject: () => _origCmdReject(args[0]),
@@ -5535,6 +8001,13 @@ const commands = {
   confirm: () => cmdConfirm(args[0]),
   rate: () => cmdRate(args[0], args[1], args[2]),
   orders: () => cmdOrders(args[0], args[1]),
+  // Milestone
+  'milestone-status': () => cmdMilestoneStatus(args[0]),
+  'milestone-feedback': () => cmdMilestoneFeedback(args[0]),
+  'milestone-submit': () => cmdMilestoneSubmit(args[0], args[1]),
+  'milestone-verify': () => cmdMilestoneVerify(args[0], args[1]),
+  'milestone-arbitrate': () => cmdMilestoneArbitrate(args[0], args[1]),
+  'chain-records': () => cmdChainRecords(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
@@ -5551,7 +8024,7 @@ const commands = {
   // Offers
   offer: () => cmdOfferCreate(args[0], args[1]),
   offers: () => cmdOfferList(args[0]),
-  'offer-info': () => cmdOfferList(args[0]), // alias — single offer uses GET /offer/:id
+  'offer-info': () => cmdOfferInfo(args[0]),
   'offer-update': () => cmdOfferUpdate(args[0]),
   'offer-close': () => cmdOfferClose(args[0]),
   'offer-buy': () => cmdOfferBuy(args[0], args[1]),
@@ -5625,6 +8098,162 @@ const commands = {
     console.error('  status [--json]');
     process.exit(1);
   },
+  // Auth (Dashboard authorization code login)
+  auth: () => cmdAuth(args[0]),
+  // Send (Rich Media P2P Message)
+  hub: () => cmdHub(args[0], args.slice(1), rawArgs),
+  send: () => {
+    if (rawArgs.includes('--help') || rawArgs.includes('-h') || args.length === 0) {
+      showSendHelp();
+      process.exit(0);
+    }
+    return cmdSend({ _: args, json: rawArgs.includes('--json') });
+  },
+  // Notification Management
+  notify: async () => {
+    const subCmd = args[0];
+    if (!subCmd || subCmd === 'help' || subCmd === '--help') {
+      console.log('Usage: atel notify <status|bind|add|remove|enable|disable|test>');
+      console.log('  status                          Show current notification targets');
+      console.log('  bind <chatId> [--bot-token T]   Bind TG chat as notification target');
+      console.log('  add telegram <chatId> [--label name] [--bot-token T]  Add a target');
+      console.log('  remove <id>                     Remove a target');
+      console.log('  enable <id>                     Enable a target');
+      console.log('  disable <id>                    Disable a target (mute)');
+      console.log('  test                            Send test notification to all targets');
+      process.exit(0);
+    }
+    const targets = loadNotifyTargets();
+
+    if (subCmd === 'status') {
+      const gw = discoverGateway();
+      console.log('Gateway:', gw ? `${gw.url} (token: ${gw.token ? '✅' : '❌'})` : '❌ not found');
+      const botToken = discoverTelegramBot();
+      console.log('TG Bot:', botToken ? `✅ (${botToken.split(':')[0]})` : '❌ not configured');
+      console.log(`\nTargets (${targets.targets.length}):`);
+      if (targets.targets.length === 0) {
+        console.log('  (none) — use "atel notify bind <chatId>" to add');
+      }
+      for (const t of targets.targets) {
+        const status = t.enabled !== false ? '✅' : '🔇';
+        console.log(`  ${status} [${t.id}] ${t.channel}:${t.target} label=${t.label || '-'} last=${t.lastUsedAt || 'never'}`);
+      }
+      return;
+    }
+
+    if (subCmd === 'bind') {
+      let chatId = args[1];
+      // Auto-detect from OpenClaw session if not provided
+      if (!chatId) {
+        chatId = discoverTelegramChat();
+        if (chatId) {
+          console.log(`🔍 Auto-detected TG chat: ${chatId}`);
+        } else {
+          console.error('Could not auto-detect TG chat. Usage: atel notify bind <chatId> [--bot-token TOKEN]');
+          process.exit(1);
+        }
+      }
+      // Get bot token: --bot-token flag > env > openclaw config
+      let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
+      if (!botToken) botToken = process.env.TELEGRAM_BOT_TOKEN || '';
+      if (!botToken) botToken = discoverTelegramBot() || '';
+      const id = `tg_${chatId}`;
+      // Remove existing with same id
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      targets.targets.push({
+        id, channel: 'telegram', target: String(chatId),
+        botToken: botToken || undefined,
+        label: 'owner', enabled: true,
+        createdAt: new Date().toISOString(), lastUsedAt: null,
+      });
+      saveNotifyTargets(targets);
+      console.log(`✅ Bound TG chat ${chatId} as notification target (id: ${id})`);
+      if (!botToken) console.log('⚠️  No bot token found. Set TELEGRAM_BOT_TOKEN or use --bot-token');
+      return;
+    }
+
+    if (subCmd === 'add') {
+      const channel = args[1]; const target = args[2];
+      if (!channel || !target) { console.error('Usage: atel notify add telegram <chatId> [--label name] [--bot-token T]'); process.exit(1); }
+      let label = '';
+      if (rawArgs.includes('--label')) label = rawArgs[rawArgs.indexOf('--label') + 1] || '';
+      let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
+      if (!botToken && channel === 'telegram') botToken = process.env.TELEGRAM_BOT_TOKEN || discoverTelegramBot() || '';
+      const id = `${channel.substring(0,2)}_${target}`;
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      targets.targets.push({
+        id, channel, target: String(target),
+        botToken: (channel === 'telegram' && botToken) ? botToken : undefined,
+        label: label || '', enabled: true,
+        createdAt: new Date().toISOString(), lastUsedAt: null,
+      });
+      saveNotifyTargets(targets);
+      console.log(`✅ Added ${channel}:${target} (id: ${id})`);
+      return;
+    }
+
+    if (subCmd === 'remove') {
+      const id = args[1];
+      if (!id) { console.error('Usage: atel notify remove <id>'); process.exit(1); }
+      const before = targets.targets.length;
+      targets.targets = targets.targets.filter(t => t.id !== id);
+      saveNotifyTargets(targets);
+      console.log(targets.targets.length < before ? `✅ Removed ${id}` : `⚠️ Target ${id} not found`);
+      return;
+    }
+
+    if (subCmd === 'enable' || subCmd === 'disable') {
+      const id = args[1];
+      if (!id) { console.error(`Usage: atel notify ${subCmd} <id>`); process.exit(1); }
+      const t = targets.targets.find(t => t.id === id);
+      if (!t) { console.error(`Target ${id} not found`); process.exit(1); }
+      t.enabled = subCmd === 'enable';
+      saveNotifyTargets(targets);
+      console.log(`✅ ${id} ${subCmd}d`);
+      return;
+    }
+
+    if (subCmd === 'test') {
+      console.log('Sending test notification to all enabled targets...');
+      const enabled = targets.targets.filter(t => t.enabled !== false);
+      if (enabled.length === 0) { console.log('No enabled targets. Use "atel notify bind <chatId>" first.'); return; }
+      for (const target of enabled) {
+        try {
+          if (target.channel === 'telegram' && target.botToken) {
+            const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: target.target, text: '🔔 ATEL 通知测试\n如果你看到这条消息，说明通知已正确配置！' }),
+              signal: AbortSignal.timeout(10000),
+            });
+            const data = await resp.json();
+            console.log(`  ${target.id}: ${data.ok ? '✅ sent' : '❌ ' + (data.description || 'failed')}`);
+          } else if (target.channel === 'gateway') {
+            const gw = discoverGateway();
+            if (gw?.url && gw?.token) {
+              const resp = await fetch(`${gw.url}/tools/invoke`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+                body: JSON.stringify({ tool: 'message', args: { action: 'send', message: '🔔 ATEL notification test', target: target.target } }),
+                signal: AbortSignal.timeout(10000),
+              });
+              console.log(`  ${target.id}: ${resp.ok ? '✅ sent' : '❌ status ' + resp.status}`);
+            } else {
+              console.log(`  ${target.id}: ❌ gateway not found`);
+            }
+          } else {
+            console.log(`  ${target.id}: ❌ unsupported channel ${target.channel}`);
+          }
+        } catch (e) {
+          console.log(`  ${target.id}: ❌ ${e.message}`);
+        }
+      }
+      return;
+    }
+
+    console.error('Unknown subcommand. Use: atel notify help');
+    process.exit(1);
+  },
   // Alias System
   alias: () => {
     const subCmd = args[0];
@@ -5661,12 +8290,16 @@ Protocol Commands:
   register [name] [caps] [endpoint]    Register on public registry (caps: "type1:price1,type2:price2" or "type1,type2" for free)
   search <capability>                  Search registry for agents (shows pricing info)
   handshake <endpoint> [did]           Handshake with remote agent
+  send <target> "text" [--image/--file/--audio/--video <path>]  Send P2P message with optional rich media
   task <target> <json>                 Delegate task (auto trust check)
   result <taskId> <json>               Submit execution result (from executor)
   check <did> [risk]                   Check agent trust (risk: low|medium|high|critical)
   verify-proof <anchor_tx> <root>      Verify on-chain proof
   audit <did_or_url> <taskId>          Deep audit: fetch trace + verify hash chain
   rotate                               Rotate identity key pair (backup + on-chain anchor)
+
+Auth Commands:
+  auth <code>                          Authorize Dashboard login (enter code from login page)
 
 Account Commands:
   balance                              Show platform account balance
@@ -5677,14 +8310,23 @@ Account Commands:
 Trade Commands:
   trade-task <cap> <desc> [--budget N]   One-shot: search → order → wait → confirm (requester)
   order <executorDid> <cap> <price>    Create a trade order
+  order-cancel <orderId> [reason]      Cancel an order
   order-info <orderId>                 Get order details
-  accept <orderId>                     Accept an order (auto-escrow for paid orders)
+  accept <orderId>                     Accept an order (executor)
   reject <orderId>                     Reject an order (executor)
-  escrow <orderId>                     [DEPRECATED] Escrow is now automatic on accept
+  escrow <orderId>                     Lock USDC on-chain for paid order (requester)
   complete <orderId> [taskId]          Mark order complete + attach proof (executor)
   confirm <orderId>                    Confirm delivery + settle (requester)
   rate <orderId> <1-5> [comment]       Rate the other party
   orders [role] [status]               List orders (role: requester|executor|all)
+
+Milestone Commands:
+  milestone-status <orderId>           View milestone progress
+  milestone-feedback <orderId>         Approve plan (--approve) or revise (--feedback "text")
+  milestone-submit <orderId> <idx>     Submit milestone result (--result "text" or --result ./file)
+  milestone-verify <orderId> <idx>     Verify milestone (--pass or --reject "reason")
+  milestone-arbitrate <orderId> <idx>  Request AI arbitration (after 3 rejections)
+  chain-records <orderId>              View on-chain transaction records
 
 Dispute Commands:
   dispute <orderId> <reason> [desc]    Open a dispute (reason: quality|incomplete|timeout|fraud|malicious|other)
@@ -5744,6 +8386,15 @@ Alias Commands:
   alias set <alias> <did>              Set an alias for a DID (use @alias in commands)
   alias list [--json]                  List all aliases
   alias remove <alias>                 Remove an alias
+
+Notification Commands:
+  notify status                        Show notification targets and gateway status
+  notify bind <chatId> [--bot-token T] Bind TG chat as default notification target
+  notify add telegram <chatId>         Add a notification target [--label name] [--bot-token T]
+  notify remove <id>                   Remove a notification target
+  notify enable <id>                   Enable a muted target
+  notify disable <id>                  Mute a target (keep but don't send)
+  notify test                          Send test notification to all enabled targets
 
 Environment:
   ATEL_DIR                Identity directory (default: .atel)

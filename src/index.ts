@@ -31,3 +31,6 @@ export * from './executor/index.js';
 
 // ── Audit Module ─────────────────────────────────────────────
 export * from './audit/index.js';
+
+// ── Attachment Module ────────────────────────────────────────
+export * from './attachment/index.js';
