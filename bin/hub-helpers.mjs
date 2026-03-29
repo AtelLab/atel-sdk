@@ -370,122 +370,18 @@ async function cmdHubChat(model, prompt, flags) {
   }
 }
 
-// ─── New Commands ────────────────────────────────────────────────
-
-function getPageFlags(flags) {
-  const pageIdx = flags.indexOf('--page');
-  const limitIdx = flags.indexOf('--limit');
-  const page  = pageIdx  !== -1 && flags[pageIdx  + 1] ? parseInt(flags[pageIdx  + 1], 10) : 1;
-  const limit = limitIdx !== -1 && flags[limitIdx + 1] ? parseInt(flags[limitIdx + 1], 10) : 20;
-  return { page, limit };
-}
-
-async function cmdHubLedger(flags) {
-  const { page, limit } = getPageFlags(flags);
-  const res = await hubFetch(`/ledger?page=${page}&limit=${limit}`);
-  const data = await res.json();
-  const entries = data.entries || data.records || [];
-  if (entries.length === 0) { console.log('No ledger records.'); return; }
-  console.log(`Ledger (page ${page}, ${entries.length} records):`);
-  console.log('  ' + 'Time'.padEnd(22) + 'Type'.padEnd(16) + 'Delta'.padStart(12) + '  Balance After');
-  console.log('  ' + '-'.repeat(68));
-  for (const e of entries) {
-    const t = new Date(e.created_at).toLocaleString();
-    const delta = (e.delta > 0 ? '+' : '') + e.delta.toLocaleString();
-    console.log(`  ${t.padEnd(22)}${(e.entry_type||'').padEnd(16)}${delta.padStart(12)}  ${(e.balance_after||0).toLocaleString()}`);
-  }
-  if (data.total) console.log(`\nTotal: ${data.total} records`);
-}
-
-async function cmdHubDashboard() {
-  const res = await hubFetch('/dashboard');
-  const data = await res.json();
-  console.log('Dashboard Summary:');
-  console.log(`  Balance:       ${(data.balance||0).toLocaleString()} ATELToken`);
-  console.log(`  USDC Equiv:    $${data.usdc_equiv||'0.00'}`);
-  if (data.total_spent    != null) console.log(`  Total Spent:   ${data.total_spent.toLocaleString()} ATELToken`);
-  if (data.total_earned   != null) console.log(`  Total Earned:  ${data.total_earned.toLocaleString()} ATELToken`);
-  if (data.total_topup    != null) console.log(`  Total Topup:   $${data.total_topup}`);
-  if (data.calls_today    != null) console.log(`  Calls Today:   ${data.calls_today}`);
-  if (data.calls_30d      != null) console.log(`  Calls (30d):   ${data.calls_30d}`);
-}
-
-async function cmdHubSwapHistory(flags) {
-  const { page, limit } = getPageFlags(flags);
-  const res = await hubFetch(`/swap/history?page=${page}&limit=${limit}`);
-  const data = await res.json();
-  const records = data.records || data.swaps || [];
-  if (records.length === 0) { console.log('No swap history.'); return; }
-  console.log(`Swap History (page ${page}):`);
-  console.log('  ' + 'Time'.padEnd(22) + 'Direction'.padEnd(20) + 'USDC'.padStart(10) + '  ATELToken');
-  console.log('  ' + '-'.repeat(68));
-  for (const s of records) {
-    const t = new Date(s.created_at).toLocaleString();
-    const dir = s.direction || 'usdc→token';
-    console.log(`  ${t.padEnd(22)}${dir.padEnd(20)}${String(s.usdc_amount||'').padStart(10)}  ${s.token_amount||''}`);
-  }
-}
-
-async function cmdHubTransfer(toDid, amount) {
-  if (!toDid || !amount || isNaN(parseFloat(amount))) {
-    console.error('Usage: atel hub transfer <to_did> <amount>');
-    process.exit(1);
-  }
-  const res = await hubFetch('/transfer', {
-    method: 'POST',
-    body: JSON.stringify({ to_did: toDid, amount: parseInt(amount, 10) }),
-  });
-  const data = await res.json();
-  console.log(`Transfer sent: ${data.amount||amount} ATELToken → ${toDid}`);
-  if (data.balance_after != null) console.log(`Balance after: ${data.balance_after.toLocaleString()} ATELToken`);
-}
-
-async function cmdHubTransfers(flags) {
-  const { page, limit } = getPageFlags(flags);
-  const res = await hubFetch(`/transfers?page=${page}&limit=${limit}`);
-  const data = await res.json();
-  const records = data.records || data.transfers || [];
-  if (records.length === 0) { console.log('No transfer history.'); return; }
-  console.log(`Transfer History (page ${page}):`);
-  console.log('  ' + 'Time'.padEnd(22) + 'From/To DID'.padEnd(40) + 'Amount'.padStart(10));
-  console.log('  ' + '-'.repeat(74));
-  for (const t of records) {
-    const ts = new Date(t.created_at).toLocaleString();
-    const peer = t.to_did || t.from_did || '';
-    const dir  = t.to_did ? '→' : '←';
-    console.log(`  ${ts.padEnd(22)}${(dir + ' ' + peer).padEnd(40)}${String(t.amount||'').padStart(10)}`);
-  }
-}
-
-async function cmdHubStats() {
-  const res = await hubFetch('/stats');
-  const data = await res.json();
-  console.log('ATEL Economy Stats:');
-  if (data.total_accounts  != null) console.log(`  Total Accounts:    ${data.total_accounts.toLocaleString()}`);
-  if (data.total_supply    != null) console.log(`  Total Supply:      ${data.total_supply.toLocaleString()} ATELToken`);
-  if (data.total_calls     != null) console.log(`  Total API Calls:   ${data.total_calls.toLocaleString()}`);
-  if (data.total_topup_usdc!= null) console.log(`  Total Topup USDC:  $${data.total_topup_usdc}`);
-  if (data.token_per_usdc  != null) console.log(`  Rate:              1 USDC = ${data.token_per_usdc.toLocaleString()} ATELToken`);
-}
-
 // ─── Router ──────────────────────────────────────────────────────
 
 export async function cmdHub(sub, args, rawArgs) {
   const flags = rawArgs || [];
   try {
     switch (sub) {
-      case 'balance':      return await cmdHubBalance();
-      case 'swap':         return await cmdHubSwap(args[0], flags);
-      case 'swap-history': return await cmdHubSwapHistory(flags);
-      case 'usage':        return await cmdHubUsage(flags);
-      case 'ledger':       return await cmdHubLedger(flags);
-      case 'dashboard':    return await cmdHubDashboard();
-      case 'transfer':     return await cmdHubTransfer(args[0], args[1]);
-      case 'transfers':    return await cmdHubTransfers(flags);
-      case 'stats':        return await cmdHubStats();
-      case 'topup':        return await cmdHubTopup();
-      case 'models':       return await cmdHubModels(flags);
-      case 'chat':         return await cmdHubChat(args[0], args[1], flags);
+      case 'balance': return await cmdHubBalance();
+      case 'swap':    return await cmdHubSwap(args[0], flags);
+      case 'usage':   return await cmdHubUsage(flags);
+      case 'topup':   return await cmdHubTopup();
+      case 'models':  return await cmdHubModels(flags);
+      case 'chat':    return await cmdHubChat(args[0], args[1], flags);
       case 'key': {
         const keySub = args[0];
         const keyFlags = flags;
@@ -505,22 +401,16 @@ export async function cmdHub(sub, args, rawArgs) {
 atel hub — ATELToken management
 
 Commands:
-  atel hub balance                                       Show ATELToken balance
-  atel hub dashboard                                     Dashboard summary
-  atel hub usage [--model <id>] [--days 7] [--page N]    Usage history
-  atel hub ledger [--page N] [--limit N]                 Ledger records
-  atel hub topup                                         Show deposit addresses
-  atel hub swap <amount> [--chain bsc|base]              Swap USDC → ATELToken
-  atel hub swap-history [--page N] [--limit N]           Swap history
-  atel hub transfer <to_did> <amount>                    Transfer ATELToken
-  atel hub transfers [--page N] [--limit N]              Transfer history
-  atel hub stats                                         Public economy stats
-  atel hub models [--search <kw>]                        List available models
-  atel hub chat <model> "<prompt>" [--stream]            Quick chat
-  atel hub key create [--name <name>]                    Create API key
-  atel hub key list                                      List API keys
-  atel hub key revoke <id>                               Revoke a key
-  atel hub key use                                       Output env vars
+  atel hub balance                          Show ATELToken balance
+  atel hub usage [--model <id>] [--days 7]  Usage history
+  atel hub topup                            Top-up instructions
+  atel hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
+  atel hub models [--search <kw>]           List available models
+  atel hub chat <model> "<prompt>" [--stream] Quick chat
+  atel hub key create [--name <name>]       Create API key
+  atel hub key list                         List API keys
+  atel hub key revoke <id>                  Revoke a key
+  atel hub key use                          Output env vars for external tools
         `);
     }
   } catch (err) {
