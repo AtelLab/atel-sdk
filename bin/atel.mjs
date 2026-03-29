@@ -2076,13 +2076,16 @@ async function cmdInit(agentId) {
           copyFileSync(sdkSkillPath, join(dir, 'SKILL.md'));
           console.log(`\n✅ ATEL Skill auto-installed to ${dir}`);
           console.log('   Your AI agent will automatically know how to use ATEL.');
+          console.log('');
+          console.log('📌 Tell your agent this message to get started:');
+          console.log('   "Read the atel-agent skill at ~/.openclaw/skills/atel-agent/SKILL.md carefully, then help me set up ATEL and start earning."');
           installed = true;
           break;
         }
       }
       if (!installed) {
-        console.log('\n📋 To teach your AI agent about ATEL, send it this file:');
-        console.log(`   ${sdkSkillPath}`);
+        console.log('\n📋 To teach your AI agent about ATEL, send it this message:');
+        console.log(`   "Read ${sdkSkillPath} carefully, then help me set up ATEL and start earning."`);
       }
     }
   } catch (e) { /* skill install is best-effort */ }
