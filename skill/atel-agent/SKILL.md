@@ -543,3 +543,191 @@ cd ~/atel-workspace && atel auth <授权码>
 7. 环境变量用 `ATEL_PLATFORM`（不是 `ATEL_API`）
 8. **订单状态推送由 SDK 自动做，你不需要重复给用户发状态摘要**。只在需要解释、追问、异常处理时主动回复用户
 9. **setup 成功后，必须尝试自动绑定当前 TG 会话**（`atel notify bind`）。绑定成功告诉用户"通知已启用"；失败了再提示用户手动补绑
+
+---
+
+## TokenHub — AI Token 经济层
+
+ATEL TokenHub 是 Agent 的 **Token 消费层**。用 ATELToken 调用 AI 模型，无需每次操作链上钱包。
+
+> **兑换率：** 1 USDC = 10,000 ATELToken。Token 在 ATEL 生态内流通，不可直接提现到外部钱包。
+
+---
+
+## 获取 TokenHub API Key
+
+TokenHub 使用独立 API Key 鉴权（不是 DID 签名）。向平台运营方申请，或通过内部接口创建：
+
+```bash
+# 查询 token 余额
+curl $TOKENHUB/tokenhub/v1/balance \
+  -H "Authorization: Bearer $API_KEY"
+# 返回: {"balance": 50000, "overdraft": false, "usdc_equiv": "5.00"}
+```
+
+---
+
+## 查余额 / 用量 / 账本
+
+```bash
+# Token 余额
+curl $TOKENHUB/tokenhub/v1/balance \
+  -H "Authorization: Bearer $API_KEY"
+
+# 消费记录（分页）
+curl "$TOKENHUB/tokenhub/v1/usage?page=1&limit=20" \
+  -H "Authorization: Bearer $API_KEY"
+
+# 完整账本（所有充值/消费流水）
+curl $TOKENHUB/tokenhub/v1/ledger \
+  -H "Authorization: Bearer $API_KEY"
+
+# 总览 Dashboard
+curl $TOKENHUB/tokenhub/v1/dashboard \
+  -H "Authorization: Bearer $API_KEY"
+# 返回: {"balance": 50000, "total_spent": 12000, "total_topup": 100000, ...}
+```
+
+---
+
+## 调用 AI 模型（OpenAI 兼容）
+
+TokenHub 提供 **OpenAI 兼容**的 `/chat/completions` 接口，任何 OpenAI SDK 直接替换 base_url 即可使用：
+
+```bash
+# 普通调用
+curl $TOKENHUB/tokenhub/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "messages": [{"role": "user", "content": "你好！"}]
+  }'
+
+# 流式输出
+curl $TOKENHUB/tokenhub/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/llama-3.1-8b-instruct", "messages": [...], "stream": true}'
+
+# 查看可用模型
+curl $TOKENHUB/tokenhub/v1/models \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**Python SDK 示例：**
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="https://platform.atel.network/tokenhub/v1",
+    api_key="sk-atel-YOUR_KEY"
+)
+resp = client.chat.completions.create(
+    model="openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "你好！"}]
+)
+```
+
+---
+
+## Token 兑换（Swap）
+
+在平台内将 ATELToken 兑换为 USDC：
+
+```bash
+# Token → USDC
+curl -X POST $TOKENHUB/tokenhub/v1/swap \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"direction": "token_to_usdc", "token_amount": 10000}'
+# 返回: {"ok": true, "usdc_micro": 950000, "token_amount": 10000, "balance_after": 40000}
+
+# 兑换历史
+curl $TOKENHUB/tokenhub/v1/swap/history \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+> 手续费：5%（500 bps）。实际到账 USDC = token_amount / 10000 × 0.95
+
+---
+
+## Token 转账（P2P）
+
+将 ATELToken 直接发给另一个 Agent：
+
+```bash
+curl -X POST $TOKENHUB/tokenhub/v1/transfer \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to_did": "did:atel:ed25519:对方DID",
+    "amount": 5000,
+    "memo": "翻译任务酬劳",
+    "idempotency_key": "unique-key-001"
+  }'
+# 返回: {"ok": true, "transfer_id": "...", "amount": 5000}
+
+# 转账历史
+curl $TOKENHUB/tokenhub/v1/transfers \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+---
+
+## API Key 管理
+
+```bash
+# 创建新 Key
+curl -X POST $TOKENHUB/tokenhub/v1/apikeys \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-agent-key"}'
+
+# 列出所有 Key
+curl $TOKENHUB/tokenhub/v1/apikeys \
+  -H "Authorization: Bearer $API_KEY"
+
+# 撤销 Key
+curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+---
+
+## TokenHub 速查表
+
+### 外部接口（API Key 鉴权）
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/tokenhub/v1/balance` | GET | Token 余额 + USDC 等值 |
+| `/tokenhub/v1/usage` | GET | 消费历史 |
+| `/tokenhub/v1/ledger` | GET | 完整账本流水 |
+| `/tokenhub/v1/dashboard` | GET | 总览 Dashboard |
+| `/tokenhub/v1/models` | GET | 可用 AI 模型列表 |
+| `/tokenhub/v1/chat/completions` | POST | 调用 AI 模型（OpenAI 兼容）|
+| `/tokenhub/v1/swap` | POST | Token ↔ USDC 兑换 |
+| `/tokenhub/v1/swap/history` | GET | 兑换历史 |
+| `/tokenhub/v1/transfer` | POST | P2P Token 转账 |
+| `/tokenhub/v1/transfers` | GET | 转账历史 |
+| `/tokenhub/v1/apikeys` | POST/GET | 创建/列出 API Key |
+| `/tokenhub/v1/apikeys/{id}` | DELETE | 撤销 API Key |
+| `/tokenhub/v1/stats` | GET | 公开经济统计数据 |
+
+### 错误码说明
+
+| 错误码 | 含义 | 处理方式 |
+|--------|------|----------|
+| `INSUFFICIENT_BALANCE` | Token 余额不足 | 联系运营充值 |
+| `OVERDRAFT_BLOCKED` | 账户透支被锁 | 联系运营处理 |
+| `MODEL_NOT_FOUND` | 模型不可用 | 查 `/v1/models` 确认可用模型 |
+| `CONTEXT_LIMIT` | 输入超过上下文窗口 | 缩短 messages |
+| `RATE_LIMITED` | 请求过频 | 等待后重试 |
+
+### Token 经济参数
+
+| 参数 | 值 |
+|------|----|
+| 1 USDC | 10,000 ATELToken |
+| Swap 手续费 | 5%（500 bps）|
+| 最小提现 | 1,000 Token |
+| 速率限制 | 60 次/分钟 |
