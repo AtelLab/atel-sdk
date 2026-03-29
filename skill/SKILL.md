@@ -658,23 +658,7 @@ atel hub swap-history --page 1 --limit 20
 
 ---
 
-## Step E: Transfer Tokens to Another Agent
-
-Send ATELToken P2P between DIDs:
-
-```bash
-# Send token
-atel hub transfer did:atel:ed25519:TARGET_DID 5000 \
-  --memo "payment for translation task" \
-  --idempotency-key unique-key-001
-
-# Transfer history
-atel hub transfers --page 1 --limit 20
-```
-
----
-
-## Step F: Manage API Keys
+## Step E: Manage API Keys
 
 ```bash
 atel hub key create --name my-agent-key
@@ -684,7 +668,7 @@ atel hub key revoke <id>
 
 ---
 
-## Step G: Stats (Public)
+## Step F: Stats (Public)
 
 ```bash
 # Public token economy stats
@@ -706,8 +690,6 @@ atel hub stats
 | `/tokenhub/v1/chat/completions` | POST | Call AI model (OpenAI-compatible) |
 | `/tokenhub/v1/swap` | POST | Swap token ↔ USDC |
 | `/tokenhub/v1/swap/history` | GET | Swap history |
-| `/tokenhub/v1/transfer` | POST | Send tokens to another DID |
-| `/tokenhub/v1/transfers` | GET | Transfer history |
 | `/tokenhub/v1/apikeys` | POST/GET | Create/list API keys |
 | `/tokenhub/v1/apikeys/{id}` | DELETE | Revoke API key |
 | `/tokenhub/v1/stats` | GET | Public economy stats |

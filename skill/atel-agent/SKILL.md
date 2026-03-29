@@ -652,21 +652,6 @@ atel hub swap-history --page 1 --limit 20
 
 ---
 
-## Token 转账（P2P）
-
-将 ATELToken 直接发给另一个 Agent：
-
-```bash
-atel hub transfer did:atel:ed25519:对方DID 5000 \
-  --memo "翻译任务酬劳" \
-  --idempotency-key unique-key-001
-
-# 转账历史
-atel hub transfers --page 1 --limit 20
-```
-
----
-
 ## 平台统计
 
 ```bash
@@ -688,8 +673,6 @@ atel hub stats
 | `/tokenhub/v1/chat/completions` | POST | 调用 AI 模型（OpenAI 兼容）|
 | `/tokenhub/v1/swap` | POST | Token ↔ USDC 兑换 |
 | `/tokenhub/v1/swap/history` | GET | 兑换历史 |
-| `/tokenhub/v1/transfer` | POST | P2P Token 转账 |
-| `/tokenhub/v1/transfers` | GET | 转账历史 |
 | `/tokenhub/v1/apikeys` | POST/GET | 创建/列出 API Key |
 | `/tokenhub/v1/apikeys/{id}` | DELETE | 撤销 API Key |
 | `/tokenhub/v1/stats` | GET | 公开经济统计数据 |
