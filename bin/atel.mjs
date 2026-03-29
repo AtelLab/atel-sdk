@@ -8309,11 +8309,18 @@ Account Commands:
 
 Hub Commands:
   hub balance                          Show ATELToken balance
-  hub usage [--model <id>] [--days 7]  Usage history
+  hub usage [--model <id>] [--days 7] [--page N] [--limit N]  Usage history
+  hub ledger [--page N] [--limit N]    Ledger records
+  hub dashboard                         Dashboard summary
   hub topup                            Top-up instructions
-  hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
+  hub swap <amount> [--chain bsc|base] [--direction usdc_to_token|token_to_usdc]
+                                       Swap USDC ↔ ATELToken
+  hub swap-history [--page N] [--limit N]  Swap history
+  hub transfer <to_did> <amount>       Transfer token to another DID
+  hub transfers [--page N] [--limit N] Transfer history
   hub models [--search <kw>]           List available models
   hub chat <model> "<prompt>" [--stream] Quick chat
+  hub stats                            Public economy stats
   hub key <create|list|revoke|use>     Manage TokenHub API keys
 
 Trade Commands:

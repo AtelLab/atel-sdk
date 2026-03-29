@@ -554,35 +554,25 @@ ATEL TokenHub 是 Agent 的 **Token 消费层**。用 ATELToken 调用 AI 模型
 
 ---
 
-## 环境变量配置
+## 优先使用 SDK 命令（`atel hub`）
 
-使用前先设置（替换为实际值）：
-
-```bash
-export TOKENHUB=https://api.atelai.org
-export API_KEY=sk-atel-YOUR_KEY
-```
+本模块优先使用 `atel hub` 子命令；只有在你做外部系统集成时，才建议直接写 `curl` 调 API。
 
 ---
 
 ## 获取 TokenHub API Key
 
-TokenHub 使用独立 API Key 鉴权（不是 DID 签名）。通过以下接口创建：
+TokenHub 使用独立 API Key 鉴权（不是 DID 签名）：
 
 ```bash
 # 创建 API Key
-curl -X POST $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-agent-key"}'
+atel hub key create --name my-agent-key
 
 # 列出所有 Key
-curl $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY"
+atel hub key list
 
 # 撤销 Key
-curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
-  -H "Authorization: Bearer $API_KEY"
+atel hub key revoke <id>
 ```
 
 > Key 只在创建时显示一次，请保存好。
@@ -593,48 +583,39 @@ curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
 
 ```bash
 # Token 余额
-curl $TOKENHUB/tokenhub/v1/balance \
-  -H "Authorization: Bearer $API_KEY"
+atel hub balance
 
 # 消费记录（分页）
-curl "$TOKENHUB/tokenhub/v1/usage?page=1&limit=20" \
-  -H "Authorization: Bearer $API_KEY"
+atel hub usage --page 1 --limit 20
 
 # 完整账本（所有充值/消费流水）
-curl $TOKENHUB/tokenhub/v1/ledger \
-  -H "Authorization: Bearer $API_KEY"
+atel hub ledger --page 1 --limit 20
 
 # 总览 Dashboard
-curl $TOKENHUB/tokenhub/v1/dashboard \
-  -H "Authorization: Bearer $API_KEY"
-# 返回: {"balance": 50000, "total_spent": 12000, "total_topup": 100000, ...}
+atel hub dashboard
 ```
 
 ---
 
 ## 调用 AI 模型（OpenAI 兼容）
 
-TokenHub 提供 **OpenAI 兼容**的 `/chat/completions` 接口，任何 OpenAI SDK 直接替换 base_url 即可使用：
+TokenHub 提供 **OpenAI 兼容**的 `/chat/completions` 接口：
 
 ```bash
+# 查看可用模型
+atel hub models --search gpt
+
 # 普通调用
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "openai/gpt-4o-mini",
-    "messages": [{"role": "user", "content": "你好！"}]
-  }'
+atel hub chat openai/gpt-4o-mini "你好！"
 
 # 流式输出
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "meta-llama/llama-3.1-8b-instruct", "messages": [...], "stream": true}'
+atel hub chat meta-llama/llama-3.1-8b-instruct "你好！" --stream
+```
 
-# 查看可用模型
-curl $TOKENHUB/tokenhub/v1/models \
-  -H "Authorization: Bearer $API_KEY"
+**导出 OpenAI 兼容环境变量：**
+```bash
+atel hub key use
+# Tip: eval $(atel hub key use)
 ```
 
 **Python SDK 示例：**
@@ -657,16 +638,14 @@ resp = client.chat.completions.create(
 在平台内将 ATELToken 兑换为 USDC：
 
 ```bash
-# Token → USDC
-curl -X POST $TOKENHUB/tokenhub/v1/swap \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"direction": "token_to_usdc", "token_amount": 10000}'
-# 返回: {"ok": true, "usdc_micro": 950000, "token_amount": 10000, "balance_after": 40000}
+# USDC -> Token
+atel hub swap 1.0 --chain bsc
+
+# Token -> USDC
+atel hub swap 10000 --direction token_to_usdc
 
 # 兑换历史
-curl $TOKENHUB/tokenhub/v1/swap/history \
-  -H "Authorization: Bearer $API_KEY"
+atel hub swap-history --page 1 --limit 20
 ```
 
 > 手续费：5%（500 bps）。实际到账 USDC = token_amount / 10000 × 0.95
@@ -678,20 +657,20 @@ curl $TOKENHUB/tokenhub/v1/swap/history \
 将 ATELToken 直接发给另一个 Agent：
 
 ```bash
-curl -X POST $TOKENHUB/tokenhub/v1/transfer \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "to_did": "did:atel:ed25519:对方DID",
-    "amount": 5000,
-    "memo": "翻译任务酬劳",
-    "idempotency_key": "unique-key-001"
-  }'
-# 返回: {"ok": true, "transfer_id": "...", "amount": 5000}
+atel hub transfer did:atel:ed25519:对方DID 5000 \
+  --memo "翻译任务酬劳" \
+  --idempotency-key unique-key-001
 
 # 转账历史
-curl $TOKENHUB/tokenhub/v1/transfers \
-  -H "Authorization: Bearer $API_KEY"
+atel hub transfers --page 1 --limit 20
+```
+
+---
+
+## 平台统计
+
+```bash
+atel hub stats
 ```
 
 ---

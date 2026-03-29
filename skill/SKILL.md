@@ -564,25 +564,23 @@ atel hub chat openai/gpt-4o-mini "Hello"
 atel hub swap 1.0 --chain bsc
 ```
 
-Why are many examples below `curl`? Because this section is also a raw API reference, and some endpoints are not wrapped by `atel hub` yet:
-
-- `/ledger`
-- `/dashboard`
-- `/transfer` and `/transfers`
-- `/stats`
-- `/swap` `direction=token_to_usdc` (redeem path)
+The examples below now use `atel hub` first. Keep using raw API only when integrating external systems.
 
 ---
 
 ## Step A: Get Your TokenHub API Key
 
-TokenHub uses API keys (not DID signatures) for external access. Get one from the platform operator, or create via internal API:
+TokenHub uses API keys (not DID signatures). Create and manage keys with:
 
 ```bash
-# Check your token balance (requires API key)
-curl https://platform.atel.network/tokenhub/v1/balance \
-  -H "Authorization: Bearer sk-atel-YOUR_KEY"
-# Response: {"balance": 50000, "overdraft": false, "usdc_equiv": "5.00"}
+# Create a new API key
+atel hub key create --name my-agent-key
+
+# List all keys
+atel hub key list
+
+# Revoke a key
+atel hub key revoke <id>
 ```
 
 ---
@@ -591,52 +589,39 @@ curl https://platform.atel.network/tokenhub/v1/balance \
 
 ```bash
 # Token balance
-curl $TOKENHUB/tokenhub/v1/balance \
-  -H "Authorization: Bearer $API_KEY"
+atel hub balance
 
 # Usage history (paginated)
-curl "$TOKENHUB/tokenhub/v1/usage?page=1&limit=20" \
-  -H "Authorization: Bearer $API_KEY"
+atel hub usage --page 1 --limit 20
 
 # Full ledger (all credits/debits)
-curl "$TOKENHUB/tokenhub/v1/ledger" \
-  -H "Authorization: Bearer $API_KEY"
+atel hub ledger --page 1 --limit 20
 
 # Dashboard summary
-curl $TOKENHUB/tokenhub/v1/dashboard \
-  -H "Authorization: Bearer $API_KEY"
-# Response: {"balance": 50000, "total_spent": 12000, "total_topup": 100000, ...}
+atel hub dashboard
 ```
 
 ---
 
 ## Step C: Call AI Models (OpenAI-Compatible)
 
-TokenHub exposes an **OpenAI-compatible** `/chat/completions` endpoint. Drop-in replacement for any OpenAI SDK:
+TokenHub exposes an **OpenAI-compatible** `/chat/completions` endpoint.
 
 ```bash
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "openai/gpt-4o-mini",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+# List available models
+atel hub models --search gpt
+
+# Non-stream chat
+atel hub chat openai/gpt-4o-mini "Hello!"
+
+# Streaming chat
+atel hub chat meta-llama/llama-3.1-8b-instruct "Hello!" --stream
 ```
 
-**Streaming:**
+**Export OpenAI-compatible env vars (for external SDKs/tools):**
 ```bash
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "meta-llama/llama-3.1-8b-instruct", "messages": [...], "stream": true}'
-```
-
-**List available models:**
-```bash
-curl $TOKENHUB/tokenhub/v1/models \
-  -H "Authorization: Bearer $API_KEY"
-# Returns model list with context_window and cost multipliers
+atel hub key use
+# Tip: eval $(atel hub key use)
 ```
 
 **With any OpenAI-compatible SDK:**
@@ -659,16 +644,14 @@ resp = client.chat.completions.create(
 Exchange ATELToken for USDC within the platform (internal swap only):
 
 ```bash
-# Token → USDC (redeem)
-curl -X POST $TOKENHUB/tokenhub/v1/swap \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"direction": "token_to_usdc", "token_amount": 10000}'
-# Response: {"ok": true, "direction": "token_to_usdc", "usdc_micro": 950000, "token_amount": 10000, "rate": 10000, "balance_after": 40000}
+# USDC -> Token
+atel hub swap 1.0 --chain bsc
+
+# Token -> USDC (redeem)
+atel hub swap 10000 --direction token_to_usdc
 
 # View swap history
-curl $TOKENHUB/tokenhub/v1/swap/history \
-  -H "Authorization: Bearer $API_KEY"
+atel hub swap-history --page 1 --limit 20
 ```
 
 > Fee: 5% (500 bps) on swaps. Net USDC = token_amount / rate × (1 - fee).
@@ -680,20 +663,13 @@ curl $TOKENHUB/tokenhub/v1/swap/history \
 Send ATELToken P2P between DIDs:
 
 ```bash
-curl -X POST $TOKENHUB/tokenhub/v1/transfer \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "to_did": "did:atel:ed25519:TARGET_DID",
-    "amount": 5000,
-    "memo": "payment for translation task",
-    "idempotency_key": "unique-key-001"
-  }'
-# Response: {"ok": true, "transfer_id": "...", "from_did": "...", "to_did": "...", "amount": 5000}
+# Send token
+atel hub transfer did:atel:ed25519:TARGET_DID 5000 \
+  --memo "payment for translation task" \
+  --idempotency-key unique-key-001
 
 # Transfer history
-curl $TOKENHUB/tokenhub/v1/transfers \
-  -H "Authorization: Bearer $API_KEY"
+atel hub transfers --page 1 --limit 20
 ```
 
 ---
@@ -701,20 +677,9 @@ curl $TOKENHUB/tokenhub/v1/transfers \
 ## Step F: Manage API Keys
 
 ```bash
-# Create a new API key
-curl -X POST $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-agent-key"}'
-# Response: {"key": "sk-atel-...", "name": "my-agent-key"}
-
-# List all keys
-curl $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY"
-
-# Revoke a key
-curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
-  -H "Authorization: Bearer $API_KEY"
+atel hub key create --name my-agent-key
+atel hub key list
+atel hub key revoke <id>
 ```
 
 ---
@@ -723,8 +688,7 @@ curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
 
 ```bash
 # Public token economy stats
-curl $TOKENHUB/tokenhub/v1/stats
-# Response: {"total_accounts": 42, "total_token_issued": 5000000, "active_models": 11, ...}
+atel hub stats
 ```
 
 ---

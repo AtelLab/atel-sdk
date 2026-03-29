@@ -3,7 +3,6 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { createReadStream } from 'fs';
 
 const HUB_CONFIG_PATH = join(process.env.HOME || '/root', '.atel', 'hub.json');
 const DEFAULT_BASE = 'https://api.atelai.org/tokenhub/v1';
@@ -32,6 +31,54 @@ function saveConfig(key, base) {
     JSON.stringify({ key, base: base || DEFAULT_BASE }),
     { mode: 0o600 }
   );
+}
+
+function hasFlag(flags, name) {
+  return flags.includes(name);
+}
+
+function getFlagValue(flags, name) {
+  const idx = flags.indexOf(name);
+  if (idx === -1) return '';
+  const val = flags[idx + 1];
+  if (!val || val.startsWith('--')) return '';
+  return val;
+}
+
+function getIntFlag(flags, name, fallback) {
+  const raw = getFlagValue(flags, name);
+  if (!raw) return fallback;
+  const v = parseInt(raw, 10);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+function formatTokenAmount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v ?? '');
+  return n.toLocaleString();
+}
+
+function formatMoney(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v ?? '');
+  return n.toFixed(6);
+}
+
+function buildQuery(params) {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') q.set(k, String(v));
+  });
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+function printObjectAsLines(data) {
+  for (const [k, v] of Object.entries(data || {})) {
+    if (Array.isArray(v)) continue;
+    if (v && typeof v === 'object') continue;
+    console.log(`${k}: ${v}`);
+  }
 }
 
 // ─── HTTP ────────────────────────────────────────────────────────
@@ -67,16 +114,50 @@ async function hubFetch(path, options = {}) {
 
 async function cmdHubSwap(usdcAmount, flags) {
   if (!usdcAmount || isNaN(parseFloat(usdcAmount))) {
-    console.error('Usage: atel hub swap <usdc_amount> [--chain bsc|base]');
+    console.error('Usage: atel hub swap <amount> [--chain bsc|base] [--direction usdc_to_token|token_to_usdc]');
     console.error('Example: atel hub swap 1.0 --chain bsc');
+    console.error('Example: atel hub swap 10000 --direction token_to_usdc');
     process.exit(1);
   }
   const amount = parseFloat(usdcAmount);
-  const chain = flags.chain || 'bsc';
+  const chain = getFlagValue(flags, '--chain') || 'bsc';
+  const direction = getFlagValue(flags, '--direction') || 'usdc_to_token';
+
+  if (direction !== 'usdc_to_token' && direction !== 'token_to_usdc') {
+    console.error('Invalid --direction. Expected usdc_to_token or token_to_usdc');
+    process.exit(1);
+  }
+
+  if (direction === 'token_to_usdc') {
+    const tokenAmount = Math.round(amount);
+    if (!Number.isFinite(tokenAmount) || tokenAmount <= 0) {
+      console.error('Invalid token amount. Must be > 0.');
+      process.exit(1);
+    }
+    const res = await hubFetch('/swap', {
+      method: 'POST',
+      body: JSON.stringify({
+        direction: 'token_to_usdc',
+        token_amount: tokenAmount,
+      }),
+    });
+    const data = await res.json();
+    console.log('✓ Swap successful');
+    console.log(`  Direction:       token_to_usdc`);
+    console.log(`  ATELToken spent: ${formatTokenAmount(data.token_amount ?? tokenAmount)}`);
+    if (data.usdc_micro !== undefined) {
+      console.log(`  USDC received:   $${(Number(data.usdc_micro) / 1_000_000).toFixed(6)}`);
+    }
+    if (data.rate !== undefined) {
+      console.log(`  Rate:            1 USDC = ${formatTokenAmount(data.rate)} ATEL`);
+    }
+    if (data.balance_after !== undefined) {
+      console.log(`  Token balance after: ${formatTokenAmount(data.balance_after)}`);
+    }
+    return;
+  }
 
   // swap via platform (not tokenhub)
-  const { loadIdentity } = await import('./atel.mjs');
-  const id = loadIdentity();
   const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
 
   // Use signedFetch from atel.mjs
@@ -114,14 +195,20 @@ async function cmdHubBalance() {
 
 async function cmdHubUsage(flags) {
   const params = new URLSearchParams();
-  const modelIdx = flags.indexOf('--model');
-  if (modelIdx !== -1 && flags[modelIdx + 1]) params.set('model', flags[modelIdx + 1]);
-  const daysIdx = flags.indexOf('--days');
-  if (daysIdx !== -1 && flags[daysIdx + 1]) {
-    const days = parseInt(flags[daysIdx + 1], 10);
+  const model = getFlagValue(flags, '--model');
+  if (model) params.set('model', model);
+  const daysRaw = getFlagValue(flags, '--days');
+  if (daysRaw) {
+    const days = parseInt(daysRaw, 10);
+    if (!Number.isFinite(days) || days <= 0) {
+      console.error('Invalid --days value. Must be a positive integer.');
+      process.exit(1);
+    }
     const start = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
     params.set('start', start);
   }
+  params.set('page', String(getIntFlag(flags, '--page', 1)));
+  params.set('limit', String(getIntFlag(flags, '--limit', 20)));
   const res = await hubFetch('/usage?' + params.toString());
   const data = await res.json();
   console.log(`Usage (${data.total} total, showing page ${data.page}):`);
@@ -151,6 +238,80 @@ async function cmdHubTopup() {
   console.log('Exchange rate: 1 USDC = 10,000 ATELToken');
   console.log('');
   console.log('Contact your platform admin or visit https://atelai.org/topup for instructions.');
+}
+
+async function cmdHubLedger(flags) {
+  const page = getIntFlag(flags, '--page', 1);
+  const limit = getIntFlag(flags, '--limit', 20);
+  const res = await hubFetch('/ledger' + buildQuery({ page, limit }));
+  const data = await res.json();
+  if (hasFlag(flags, '--json')) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  const items = data.items || data.ledger || data.records || [];
+  if (!Array.isArray(items) || items.length === 0) {
+    console.log('Ledger is empty.');
+    printObjectAsLines(data);
+    return;
+  }
+  console.log(`Ledger (${items.length} items):`);
+  for (const item of items) {
+    const t = item.created_at || item.time || item.timestamp || '';
+    const type = item.type || item.direction || item.kind || '';
+    const amount = item.amount ?? item.token_amount ?? item.delta ?? '';
+    const memo = item.memo || item.note || '';
+    console.log(`  ${t}  ${type}  amount=${amount}${memo ? `  memo=${memo}` : ''}`);
+  }
+}
+
+async function cmdHubDashboard(flags) {
+  const res = await hubFetch('/dashboard');
+  const data = await res.json();
+  if (hasFlag(flags, '--json')) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  console.log('TokenHub Dashboard');
+  if (data.balance !== undefined) console.log(`  Balance:      ${formatTokenAmount(data.balance)} ATEL`);
+  if (data.total_spent !== undefined) console.log(`  Total spent:  ${formatTokenAmount(data.total_spent)} ATEL`);
+  if (data.total_topup !== undefined) console.log(`  Total topup:  ${formatTokenAmount(data.total_topup)} ATEL`);
+  if (data.usdc_equiv !== undefined) console.log(`  USDC equiv:   $${data.usdc_equiv}`);
+  if (Object.keys(data).length > 0) {
+    const known = new Set(['balance', 'total_spent', 'total_topup', 'usdc_equiv']);
+    const extra = Object.fromEntries(Object.entries(data).filter(([k]) => !known.has(k)));
+    if (Object.keys(extra).length > 0) {
+      console.log('');
+      printObjectAsLines(extra);
+    }
+  }
+}
+
+async function cmdHubSwapHistory(flags) {
+  const page = getIntFlag(flags, '--page', 1);
+  const limit = getIntFlag(flags, '--limit', 20);
+  const res = await hubFetch('/swap/history' + buildQuery({ page, limit }));
+  const data = await res.json();
+  if (hasFlag(flags, '--json')) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  const items = data.items || data.history || data.records || [];
+  if (!Array.isArray(items) || items.length === 0) {
+    console.log('No swap history found.');
+    return;
+  }
+  console.log(`Swap History (${items.length}):`);
+  for (const item of items) {
+    const t = item.created_at || item.time || '';
+    const direction = item.direction || '';
+    const tokenAmount = item.token_amount ?? '';
+    const usdcMicro = item.usdc_micro;
+    const usdc = usdcMicro !== undefined ? Number(usdcMicro) / 1_000_000 : undefined;
+    console.log(
+      `  ${t}  ${direction}  token=${formatTokenAmount(tokenAmount)}${usdc !== undefined ? `  usdc=$${formatMoney(usdc)}` : ''}`
+    );
+  }
 }
 
 async function cmdHubKeyCreate(flags) {
@@ -209,8 +370,7 @@ async function cmdHubKeyUse() {
 }
 
 async function cmdHubModels(flags) {
-  const searchIdx = flags.indexOf('--search');
-  const keyword = searchIdx !== -1 && flags[searchIdx + 1] ? flags[searchIdx + 1].toLowerCase() : '';
+  const keyword = (getFlagValue(flags, '--search') || '').toLowerCase();
   const res = await hubFetch('/models');
   const data = await res.json();
   let models = data.models || [];
@@ -297,6 +457,86 @@ async function cmdHubChat(model, prompt, flags) {
   }
 }
 
+async function cmdHubTransfer(toDid, amountRaw, flags) {
+  if (!toDid || !amountRaw) {
+    console.error('Usage: atel hub transfer <to_did> <amount> [--memo "text"] [--idempotency-key <key>]');
+    process.exit(1);
+  }
+  const amount = Number(amountRaw);
+  if (!Number.isInteger(amount) || amount <= 0) {
+    console.error('Amount must be a positive integer token amount.');
+    process.exit(1);
+  }
+  const memo = getFlagValue(flags, '--memo');
+  const idempotencyKey = getFlagValue(flags, '--idempotency-key');
+  const body = {
+    to_did: toDid,
+    amount,
+  };
+  if (memo) body.memo = memo;
+  if (idempotencyKey) body.idempotency_key = idempotencyKey;
+
+  const res = await hubFetch('/transfer', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  console.log('✓ Transfer successful');
+  console.log(`  Transfer ID: ${data.transfer_id || data.id || '(unknown)'}`);
+  console.log(`  To DID:      ${data.to_did || toDid}`);
+  console.log(`  Amount:      ${formatTokenAmount(data.amount ?? amount)} ATEL`);
+}
+
+async function cmdHubTransfers(flags) {
+  const page = getIntFlag(flags, '--page', 1);
+  const limit = getIntFlag(flags, '--limit', 20);
+  const res = await hubFetch('/transfers' + buildQuery({ page, limit }));
+  const data = await res.json();
+  if (hasFlag(flags, '--json')) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  const items = data.items || data.transfers || data.records || [];
+  if (!Array.isArray(items) || items.length === 0) {
+    console.log('No transfer records found.');
+    return;
+  }
+  console.log(`Transfers (${items.length}):`);
+  for (const item of items) {
+    const t = item.created_at || item.time || '';
+    const fromDid = item.from_did || item.from || '';
+    const toDid = item.to_did || item.to || '';
+    const amount = item.amount ?? '';
+    console.log(`  ${t}  ${formatTokenAmount(amount)} ATEL  ${fromDid} -> ${toDid}`);
+  }
+}
+
+async function cmdHubStats(flags) {
+  let cfg;
+  try {
+    cfg = getConfig();
+  } catch {
+    cfg = { base: process.env.ATEL_HUB_BASE || DEFAULT_BASE };
+  }
+  const res = await fetch(cfg.base + '/stats', {
+    headers: cfg.key ? { Authorization: 'Bearer ' + cfg.key } : {},
+  });
+  if (!res.ok) {
+    let errBody = {};
+    try { errBody = await res.json(); } catch {}
+    const code = errBody?.error?.code || 'ERROR';
+    const msg = errBody?.error?.message || res.statusText;
+    throw new Error(`[${code}] ${msg}`);
+  }
+  const data = await res.json();
+  if (hasFlag(flags, '--json')) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  console.log('TokenHub Public Stats');
+  printObjectAsLines(data);
+}
+
 // ─── Router ──────────────────────────────────────────────────────
 
 export async function cmdHub(sub, args, rawArgs) {
@@ -305,10 +545,16 @@ export async function cmdHub(sub, args, rawArgs) {
     switch (sub) {
       case 'balance': return await cmdHubBalance();
       case 'swap':    return await cmdHubSwap(args[0], flags);
+      case 'swap-history': return await cmdHubSwapHistory(flags);
       case 'usage':   return await cmdHubUsage(flags);
+      case 'ledger':  return await cmdHubLedger(flags);
+      case 'dashboard': return await cmdHubDashboard(flags);
       case 'topup':   return await cmdHubTopup();
       case 'models':  return await cmdHubModels(flags);
       case 'chat':    return await cmdHubChat(args[0], args[1], flags);
+      case 'transfer': return await cmdHubTransfer(args[0], args[1], flags);
+      case 'transfers': return await cmdHubTransfers(flags);
+      case 'stats':   return await cmdHubStats(flags);
       case 'key': {
         const keySub = args[0];
         const keyFlags = flags;
@@ -329,11 +575,23 @@ atel hub — ATELToken management
 
 Commands:
   atel hub balance                          Show ATELToken balance
-  atel hub usage [--model <id>] [--days 7]  Usage history
+  atel hub usage [--model <id>] [--days 7] [--page 1] [--limit 20]
+                                             Usage history
+  atel hub ledger [--page 1] [--limit 20] [--json]
+                                             Ledger records
+  atel hub dashboard [--json]                Dashboard summary
   atel hub topup                            Top-up instructions
-  atel hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
+  atel hub swap <amount> [--chain bsc|base] [--direction usdc_to_token|token_to_usdc]
+                                             Swap USDC ↔ ATELToken
+  atel hub swap-history [--page 1] [--limit 20] [--json]
+                                             Swap history
+  atel hub transfer <to_did> <amount> [--memo "text"] [--idempotency-key <key>]
+                                             Transfer token to another DID
+  atel hub transfers [--page 1] [--limit 20] [--json]
+                                             Transfer history
   atel hub models [--search <kw>]           List available models
   atel hub chat <model> "<prompt>" [--stream] Quick chat
+  atel hub stats [--json]                   Public economy stats
   atel hub key create [--name <name>]       Create API key
   atel hub key list                         List API keys
   atel hub key revoke <id>                  Revoke a key
