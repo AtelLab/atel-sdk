@@ -8312,7 +8312,6 @@ Hub Commands:
   hub usage [--model <id>] [--days 7] [--page N] [--limit N]  Usage history
   hub ledger [--page N] [--limit N]    Ledger records
   hub dashboard                         Dashboard summary
-  hub topup                            Top-up instructions
   hub swap <amount> [--chain bsc|base] [--direction usdc_to_token|token_to_usdc]
                                        Swap USDC ↔ ATELToken
   hub swap-history [--page N] [--limit N]  Swap history

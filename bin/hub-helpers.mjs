@@ -103,7 +103,7 @@ async function hubFetch(path, options = {}) {
     err.httpStatus = res.status;
     err.code = code;
     if (errBody?.error?.action === 'topup') {
-      err.hint = 'Run: atel hub topup';
+      err.hint = 'Top up your balance via platform deposit/swap or contact your platform admin.';
     }
     throw err;
   }
@@ -226,18 +226,6 @@ async function cmdHubUsage(flags) {
   const totalCost = data.items.reduce((s, i) => s + i.cost, 0);
   console.log('  ' + '-'.repeat(80));
   console.log(`  Total cost this page: ${totalCost} ATELToken`);
-}
-
-async function cmdHubTopup() {
-  // Show topup instructions (chain-based, no automation yet)
-  const res = await hubFetch('/balance');
-  const data = await res.json();
-  console.log('Current balance: ' + data.balance.toLocaleString() + ' ATELToken ($' + data.usdc_equiv + ')');
-  console.log('');
-  console.log('To top up, send USDC to your ATEL deposit address.');
-  console.log('Exchange rate: 1 USDC = 10,000 ATELToken');
-  console.log('');
-  console.log('Contact your platform admin or visit https://atelai.org/topup for instructions.');
 }
 
 async function cmdHubLedger(flags) {
@@ -419,7 +407,9 @@ async function cmdHubChat(model, prompt, flags) {
     const msg = errBody?.error?.message || res.statusText;
     const code = errBody?.error?.code || 'ERROR';
     console.error(`[${code}] ${msg}`);
-    if (errBody?.error?.action === 'topup') console.error('Run: atel hub topup');
+    if (errBody?.error?.action === 'topup') {
+      console.error('Top up your balance via platform deposit/swap or contact your platform admin.');
+    }
     process.exit(1);
   }
 
@@ -549,7 +539,6 @@ export async function cmdHub(sub, args, rawArgs) {
       case 'usage':   return await cmdHubUsage(flags);
       case 'ledger':  return await cmdHubLedger(flags);
       case 'dashboard': return await cmdHubDashboard(flags);
-      case 'topup':   return await cmdHubTopup();
       case 'models':  return await cmdHubModels(flags);
       case 'chat':    return await cmdHubChat(args[0], args[1], flags);
       case 'transfer': return await cmdHubTransfer(args[0], args[1], flags);
@@ -580,7 +569,6 @@ Commands:
   atel hub ledger [--page 1] [--limit 20] [--json]
                                              Ledger records
   atel hub dashboard [--json]                Dashboard summary
-  atel hub topup                            Top-up instructions
   atel hub swap <amount> [--chain bsc|base] [--direction usdc_to_token|token_to_usdc]
                                              Swap USDC ↔ ATELToken
   atel hub swap-history [--page 1] [--limit 20] [--json]
