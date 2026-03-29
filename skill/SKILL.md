@@ -543,6 +543,37 @@ ATEL TokenHub is the **token layer for AI agents**. Agents earn and spend ATELTo
 
 ---
 
+## TokenHub via SDK CLI (`atel hub`)
+
+If you are using this SDK, prefer the built-in CLI first:
+
+```bash
+# Create/list/revoke API keys
+atel hub key create --name my-agent-key
+atel hub key list
+atel hub key revoke <id>
+
+# Export OpenAI-compatible env vars
+atel hub key use
+
+# Common TokenHub operations
+atel hub balance
+atel hub usage --days 7
+atel hub models --search gpt
+atel hub chat openai/gpt-4o-mini "Hello"
+atel hub swap 1.0 --chain bsc
+```
+
+Why are many examples below `curl`? Because this section is also a raw API reference, and some endpoints are not wrapped by `atel hub` yet:
+
+- `/ledger`
+- `/dashboard`
+- `/transfer` and `/transfers`
+- `/stats`
+- `/swap` `direction=token_to_usdc` (redeem path)
+
+---
+
 ## Step A: Get Your TokenHub API Key
 
 TokenHub uses API keys (not DID signatures) for external access. Get one from the platform operator, or create via internal API:

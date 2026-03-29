@@ -8307,6 +8307,15 @@ Account Commands:
   withdraw <amount> [channel] [address] Withdraw funds (address required for crypto)
   transactions                         List payment history
 
+Hub Commands:
+  hub balance                          Show ATELToken balance
+  hub usage [--model <id>] [--days 7]  Usage history
+  hub topup                            Top-up instructions
+  hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
+  hub models [--search <kw>]           List available models
+  hub chat <model> "<prompt>" [--stream] Quick chat
+  hub key <create|list|revoke|use>     Manage TokenHub API keys
+
 Trade Commands:
   trade-task <cap> <desc> [--budget N]   One-shot: search → order → wait → confirm (requester)
   order <executorDid> <cap> <price>    Create a trade order

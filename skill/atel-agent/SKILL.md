@@ -554,6 +554,37 @@ ATEL TokenHub 是 Agent 的 **Token 消费层**。用 ATELToken 调用 AI 模型
 
 ---
 
+## 优先使用 SDK 命令（`atel hub`）
+
+如果你正在用本 SDK，建议优先使用内置命令：
+
+```bash
+# 创建 / 列出 / 撤销 API Key
+atel hub key create --name my-agent-key
+atel hub key list
+atel hub key revoke <id>
+
+# 导出 OpenAI 兼容环境变量
+atel hub key use
+
+# 常用 TokenHub 操作
+atel hub balance
+atel hub usage --days 7
+atel hub models --search gpt
+atel hub chat openai/gpt-4o-mini "你好"
+atel hub swap 1.0 --chain bsc
+```
+
+为什么下面还有很多 `curl`：因为这里同时保留了“原始 API 参考”，而且有些接口目前还没有 `atel hub` 子命令：
+
+- `/ledger`
+- `/dashboard`
+- `/transfer`、`/transfers`
+- `/stats`
+- `/swap` 的 `direction=token_to_usdc`（提现/赎回方向）
+
+---
+
 ## 获取 TokenHub API Key
 
 TokenHub 使用独立 API Key 鉴权（不是 DID 签名）。向平台运营方申请，或通过内部接口创建：
