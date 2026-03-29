@@ -5,8 +5,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createReadStream } from 'fs';
 
-const _atelDir = process.env.ATEL_DIR || join(process.env.HOME || '/root', '.atel');
-const HUB_CONFIG_PATH = join(_atelDir, 'hub.json');
+const HUB_CONFIG_PATH = join(process.env.HOME || '/root', '.atel', 'hub.json');
 const DEFAULT_BASE = 'https://api.atelai.org/tokenhub/v1';
 
 // ─── Config ──────────────────────────────────────────────────────
@@ -26,7 +25,7 @@ function getConfig() {
 }
 
 function saveConfig(key, base) {
-  const dir = _atelDir;
+  const dir = join(process.env.HOME || '/root', '.atel');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(
     HUB_CONFIG_PATH,
@@ -157,61 +156,18 @@ async function cmdHubTopup() {
 async function cmdHubKeyCreate(flags) {
   const nameIdx = flags.indexOf('--name');
   const name = nameIdx !== -1 && flags[nameIdx + 1] ? flags[nameIdx + 1] : 'default';
-
-  let fullKey, hubBase;
-
-  // Bootstrap path: no hub.json yet — use DID-signed platform auth to get first key
-  if (!existsSync(HUB_CONFIG_PATH)) {
-    // Load identity from ATEL_DIR
-    const identityPath = join(_atelDir, 'identity.json');
-    if (!existsSync(identityPath)) throw new Error('No identity found. Run: atel init');
-    const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-    const did = identity.did;
-    // secretKey stored as hex in identity.json
-    const secretKey = Buffer.from(identity.secretKey, 'hex');
-
-    const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
-    hubBase = process.env.ATEL_HUB_BASE || DEFAULT_BASE;
-
-    // DID-signed request (same as platform DIDAuth expects)
-    const { default: nacl } = await import('tweetnacl');
-    const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
-    const ts = new Date().toISOString();
-    const payload = { name };
-    const signable = serializePayload({ payload, did, timestamp: ts });
-    const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), secretKey)).toString('base64');
-    const body = JSON.stringify({ did, payload, timestamp: ts, signature: sig });
-
-    const res = await fetch(`${PLATFORM_URL}/account/v1/hub-key`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    });
-    if (!res.ok) {
-      let msg = res.statusText;
-      try { const e = await res.json(); msg = e.error || msg; } catch {}
-      throw new Error(`Bootstrap failed: ${msg}`);
-    }
-    const data = await res.json();
-    fullKey = data.key;
-  } else {
-    // Already have a key — create additional key via tokenhub directly
-    const res = await hubFetch('/apikeys', {
-      method: 'POST',
-      body: JSON.stringify({ name }),
-    });
-    const data = await res.json();
-    fullKey = data.key;
-    const cfg = getConfig();
-    hubBase = cfg.base;
-  }
-
+  const res = await hubFetch('/apikeys', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
   console.log('API Key created:');
-  console.log('  ' + fullKey);
+  console.log('  ' + data.key);
   console.log('');
   console.log('This key will NOT be shown again. Save it securely.');
-  console.log(`Saving to ${HUB_CONFIG_PATH} ...`);
-  saveConfig(fullKey, hubBase || DEFAULT_BASE);
+  console.log('Saving to ~/.atel/hub.json ...');
+  const cfg = getConfig();
+  saveConfig(data.key, cfg.base);
   console.log('Saved. You can now use atel hub commands.');
 }
 
