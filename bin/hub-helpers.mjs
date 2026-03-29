@@ -4,7 +4,8 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
-const HUB_CONFIG_PATH = join(process.env.HOME || '/root', '.atel', 'hub.json');
+const ATEL_DIR = process.env.ATEL_DIR || join(process.env.HOME || '/root', '.atel');
+const HUB_CONFIG_PATH = join(ATEL_DIR, 'hub.json');
 const DEFAULT_BASE = 'https://api.atelai.org/tokenhub/v1';
 
 // ─── Config ──────────────────────────────────────────────────────
@@ -24,7 +25,7 @@ function getConfig() {
 }
 
 function saveConfig(key, base) {
-  const dir = join(process.env.HOME || '/root', '.atel');
+  const dir = ATEL_DIR;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(
     HUB_CONFIG_PATH,
