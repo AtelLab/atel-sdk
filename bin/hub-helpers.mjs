@@ -143,15 +143,44 @@ async function cmdHubUsage(flags) {
 }
 
 async function cmdHubTopup() {
-  // Show topup instructions (chain-based, no automation yet)
+  // Show balance
   const res = await hubFetch('/balance');
   const data = await res.json();
   console.log('Current balance: ' + data.balance.toLocaleString() + ' ATELToken ($' + data.usdc_equiv + ')');
+  console.log('Exchange rate:   1 USDC = 10,000 ATELToken');
   console.log('');
-  console.log('To top up, send USDC to your ATEL deposit address.');
-  console.log('Exchange rate: 1 USDC = 10,000 ATELToken');
-  console.log('');
-  console.log('Contact your platform admin or visit https://atelai.org/topup for instructions.');
+
+  // Fetch smart wallet addresses from registry
+  const identityPath = join(_atelDir, 'identity.json');
+  if (!existsSync(identityPath)) {
+    console.log('No identity found. Run: atel init');
+    return;
+  }
+  const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
+  const did = identity.did;
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+
+  try {
+    const agentRes = await fetch(`${PLATFORM_URL}/registry/v1/agent/${encodeURIComponent(did)}`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!agentRes.ok) throw new Error('registry fetch failed');
+    const agent = await agentRes.json();
+    const wallets = typeof agent.wallets === 'string' ? JSON.parse(agent.wallets) : agent.wallets;
+    if (!wallets || Object.keys(wallets).length === 0) {
+      console.log('No deposit address found. Make sure you have registered: atel register');
+      return;
+    }
+    console.log('Send USDC to your smart wallet deposit address:');
+    console.log('');
+    if (wallets.bsc)  console.log('  BSC:  ' + wallets.bsc);
+    if (wallets.base) console.log('  Base: ' + wallets.base);
+    console.log('');
+    console.log('After sending, run: atel hub swap <usdc_amount> --chain bsc|base');
+    console.log('(deposits are detected automatically, usually within 1-2 minutes)');
+  } catch (e) {
+    console.log('Could not fetch deposit address: ' + e.message);
+  }
 }
 
 async function cmdHubKeyCreate(flags) {
