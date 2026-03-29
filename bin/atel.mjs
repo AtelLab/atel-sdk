@@ -51,7 +51,8 @@
  *   atel boost-status [did]             Check boost status
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, copyFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { cmdHub } from './hub-helpers.mjs';
 import { resolve, join, dirname } from 'node:path';
 import crypto from 'node:crypto';
@@ -1203,7 +1204,7 @@ async function signTaskRequest(taskRequest, secretKey) {
     version: taskRequest.version
   });
   
-  console.error('[DEBUG] SDK signable JSON:', signable);
+  if (process.env.ATEL_DEBUG) console.error('[DEBUG] SDK signable JSON:', signable);
   
   const signature = nacl.sign.detached(Buffer.from(signable), secretKey);
   return Buffer.from(signature).toString('base64');
@@ -2056,8 +2057,35 @@ async function cmdInit(agentId) {
     did: identity.did, 
     policy: POLICY_FILE,
     anchor: anchorConfigured ? 'configured' : 'disabled',
-    next: 'Run: atel start [port] — auto-configures network and registers' 
+    next: 'Run: atel start [port] — auto-configures network and registers'
   }, null, 2));
+
+  // Auto-install SKILL.md to OpenClaw skills directory
+  try {
+    const sdkSkillPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent', 'SKILL.md');
+    if (existsSync(sdkSkillPath)) {
+      const home = process.env.HOME || '';
+      const candidates = [
+        join(home, '.openclaw', 'skills', 'atel-agent'),
+        join(home, '.openclaw', 'workspace', 'skills', 'atel-agent'),
+      ];
+      let installed = false;
+      for (const dir of candidates) {
+        if (existsSync(dirname(dir))) {
+          mkdirSync(dir, { recursive: true });
+          copyFileSync(sdkSkillPath, join(dir, 'SKILL.md'));
+          console.log(`\n✅ ATEL Skill auto-installed to ${dir}`);
+          console.log('   Your AI agent will automatically know how to use ATEL.');
+          installed = true;
+          break;
+        }
+      }
+      if (!installed) {
+        console.log('\n📋 To teach your AI agent about ATEL, send it this file:');
+        console.log(`   ${sdkSkillPath}`);
+      }
+    }
+  } catch (e) { /* skill install is best-effort */ }
 }
 
 async function cmdAnchor(subcommand) {
@@ -2387,38 +2415,38 @@ async function cmdStart(port) {
 
   async function verifyAnchorFromChain(chain, txHash, traceRoot) {
     try {
-      console.error('[DEBUG] verifyAnchorFromChain input:', { chain, txHash, traceRoot });
+      if (process.env.ATEL_DEBUG) console.error('[DEBUG] verifyAnchorFromChain input:', { chain, txHash, traceRoot });
       
       if (!txHash || !traceRoot) return { checked: false, verified: false, reason: 'missing_anchor_or_root' };
       const c = (chain || 'solana').toLowerCase();
       
       if (c === 'solana') {
         const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-        console.error('[DEBUG] Solana RPC URL:', rpcUrl);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Solana RPC URL:', rpcUrl);
         const provider = new SolanaAnchorProvider({ rpcUrl });
         const r = await provider.verify(traceRoot, txHash);
-        console.error('[DEBUG] Solana verify result:', r);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Solana verify result:', r);
         return { checked: true, verified: !!r?.valid, chain: 'solana', detail: r?.detail };
       }
       if (c === 'base') {
         const rpcUrl = process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org';
-        console.error('[DEBUG] Base RPC URL:', rpcUrl);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Base RPC URL:', rpcUrl);
         const provider = new BaseAnchorProvider({ rpcUrl });
         const r = await provider.verify(traceRoot, txHash);
-        console.error('[DEBUG] Base verify result:', r);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Base verify result:', r);
         return { checked: true, verified: !!r?.valid, chain: 'base', detail: r?.detail };
       }
       if (c === 'bsc') {
         const rpcUrl = process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org';
-        console.error('[DEBUG] BSC RPC URL:', rpcUrl);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] BSC RPC URL:', rpcUrl);
         const provider = new BSCAnchorProvider({ rpcUrl });
         const r = await provider.verify(traceRoot, txHash);
-        console.error('[DEBUG] BSC verify result:', r);
+        if (process.env.ATEL_DEBUG) console.error('[DEBUG] BSC verify result:', r);
         return { checked: true, verified: !!r?.valid, chain: 'bsc', detail: r?.detail };
       }
       return { checked: false, verified: false, reason: `unsupported_chain:${c}` };
     } catch (e) {
-      console.error('[DEBUG] verifyAnchorFromChain error:', e);
+      if (process.env.ATEL_DEBUG) console.error('[DEBUG] verifyAnchorFromChain error:', e);
       return { checked: true, verified: false, reason: e.message };
     }
   }
@@ -5609,8 +5637,8 @@ async function signedFetch(method, path, payload = {}) {
   const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), id.secretKey)).toString('base64');
   const body = JSON.stringify({ did: id.did, payload, timestamp: ts, signature: sig });
   // Always use POST for signed requests (DIDAuth reads body, GET cannot have body)
-  console.error("DEBUG URL:", `${PLATFORM_URL}${path}`); const res = await fetch(`${PLATFORM_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-  const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
+  if (process.env.ATEL_DEBUG) console.error("DEBUG URL:", `${PLATFORM_URL}${path}`); const res = await fetch(`${PLATFORM_URL}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+  const text = await res.text(); if (process.env.ATEL_DEBUG) console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
@@ -5915,7 +5943,7 @@ async function cmdOrder(executorDid, capType, price) {
 async function cmdOrderInfo(orderId) {
   if (!orderId) { console.error('Usage: atel order-info <orderId>'); process.exit(1); }
   const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
-  const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
+  const text = await res.text(); if (process.env.ATEL_DEBUG) console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   console.log(JSON.stringify(data, null, 2));
 }
@@ -6620,7 +6648,7 @@ async function cmdDisputes() {
 async function cmdDisputeInfo(disputeId) {
   if (!disputeId) { console.error('Usage: atel dispute-info <disputeId>'); process.exit(1); }
   const res = await fetch(`${PLATFORM_URL}/dispute/v1/${disputeId}`);
-  const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
+  const text = await res.text(); if (process.env.ATEL_DEBUG) console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   console.log(JSON.stringify(data, null, 2));
 }
@@ -6635,7 +6663,7 @@ async function cmdCertApply(level) {
 async function cmdCertStatus(did) {
   const targetDid = did || requireIdentity().did;
   const res = await fetch(`${PLATFORM_URL}/cert/v1/status/${encodeURIComponent(targetDid)}`);
-  const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
+  const text = await res.text(); if (process.env.ATEL_DEBUG) console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   console.log(JSON.stringify(data, null, 2));
 
@@ -6671,7 +6699,7 @@ async function cmdBoost(tier, weeks) {
 async function cmdBoostStatus(did) {
   const targetDid = did || requireIdentity().did;
   const res = await fetch(`${PLATFORM_URL}/boost/v1/status/${encodeURIComponent(targetDid)}`);
-  const text = await res.text(); console.error("DEBUG Response:", text); const data = JSON.parse(text);
+  const text = await res.text(); if (process.env.ATEL_DEBUG) console.error("DEBUG Response:", text); const data = JSON.parse(text);
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   console.log(JSON.stringify(data, null, 2));
 }
