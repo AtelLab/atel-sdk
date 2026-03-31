@@ -2,11 +2,14 @@
 // No new npm dependencies: uses native fetch, fs, crypto
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
-import { createReadStream } from 'fs';
+import { join, resolve } from 'path';
 
-const HUB_CONFIG_PATH = join(process.env.HOME || '/root', '.atel', 'hub.json');
+const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
+const HUB_CONFIG_PATH = join(ATEL_DIR, 'hub.json');
+const IDENTITY_PATH = join(ATEL_DIR, 'identity.json');
 const DEFAULT_BASE = 'https://api.atelai.org/tokenhub/v1';
+const DEFAULT_PLATFORM = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+const DEFAULT_TOKEN_PER_USDC = Number(process.env.ATEL_TOKEN_PER_USDC || 10000);
 
 // ─── Config ──────────────────────────────────────────────────────
 
@@ -25,8 +28,7 @@ function getConfig() {
 }
 
 function saveConfig(key, base) {
-  const dir = join(process.env.HOME || '/root', '.atel');
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  mkdirSync(ATEL_DIR, { recursive: true, mode: 0o700 });
   writeFileSync(
     HUB_CONFIG_PATH,
     JSON.stringify({ key, base: base || DEFAULT_BASE }),
@@ -55,61 +57,72 @@ async function hubFetch(path, options = {}) {
     const err = new Error(`[${code}] ${msg}`);
     err.httpStatus = res.status;
     err.code = code;
-    if (errBody?.error?.action === 'topup') {
-      err.hint = 'Run: atel hub topup';
-    }
+    if (errBody?.error?.action === 'topup') err.hint = 'Run: atel deposit <amount> <channel>';
     throw err;
   }
   return res;
 }
 
-// ─── Commands ────────────────────────────────────────────────────
-
-async function cmdHubSwap(usdcAmount, flags) {
-  if (!usdcAmount || isNaN(parseFloat(usdcAmount))) {
-    console.error('Usage: atel hub swap <usdc_amount> [--chain bsc|base]');
-    console.error('Example: atel hub swap 1.0 --chain bsc');
-    process.exit(1);
+function loadIdentityMaterial() {
+  if (!existsSync(IDENTITY_PATH)) {
+    throw new Error('No identity found. Run: atel init');
   }
-  const amount = parseFloat(usdcAmount);
-  const chain = flags.chain || 'bsc';
-
-  // swap via platform (not tokenhub)
-  const { loadIdentity } = await import('./atel.mjs');
-  const id = loadIdentity();
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
-
-  // Use signedFetch from atel.mjs
-  const body = JSON.stringify({ usdc_amount: amount, chain });
-  const res = await fetch(PLATFORM_URL + '/account/v1/swap', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    signal: AbortSignal.timeout(10000),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    console.error('Swap failed:', data.error || JSON.stringify(data));
-    process.exit(1);
+  try {
+    const id = JSON.parse(readFileSync(IDENTITY_PATH, 'utf-8'));
+    if (!id?.did || !id?.secretKey) throw new Error('invalid identity');
+    return id;
+  } catch {
+    throw new Error('Corrupted identity file. Run: atel init');
   }
-  const tokenPerUSDC = data.token_per_usdc || 10000;
-  console.log('✓ Swap successful');
-  console.log(`  USDC spent:     $${amount.toFixed(6)}`);
-  console.log(`  ATELToken received: ${data.token_amount.toLocaleString()}`);
-  console.log(`  Rate:           1 USDC = ${tokenPerUSDC.toLocaleString()} ATEL`);
-  console.log(`  Platform balance after: $${parseFloat(data.balance_after).toFixed(6)} USDC`);
-  console.log('');
-  console.log('Run `atel hub balance` to check your ATELToken balance.');
 }
 
+async function platformSignedFetch(path, payload = {}) {
+  const id = loadIdentityMaterial();
+  const { default: nacl } = await import('tweetnacl');
+  const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+  const ts = new Date().toISOString();
+  const signable = serializePayload({ payload, did: id.did, timestamp: ts });
+  const secretKey = Uint8Array.from(Buffer.from(id.secretKey, 'hex'));
+  const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), secretKey)).toString('base64');
+
+  const res = await fetch(`${DEFAULT_PLATFORM}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ did: id.did, payload, timestamp: ts, signature: sig }),
+    signal: AbortSignal.timeout(10000),
+  });
+
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!res.ok) throw new Error(data.error || `Platform HTTP ${res.status}`);
+  return data;
+}
+
+// ─── Commands ────────────────────────────────────────────────────
+
 async function cmdHubBalance() {
-  const res = await hubFetch('/balance');
-  const data = await res.json();
-  console.log(`ATELToken Balance: ${data.balance.toLocaleString()}`);
-  console.log(`USDC Equivalent:   $${data.usdc_equiv}`);
-  if (data.overdraft) {
-    console.warn('⚠ Account is in overdraft. Top up to resume service.');
-  }
+  const data = await platformSignedFetch('/account/v1/balance', {});
+  const usdc = Number(data.balance || 0);
+  const token = Number(data.token_balance || 0);
+  const tokenUSDC = token / (DEFAULT_TOKEN_PER_USDC > 0 ? DEFAULT_TOKEN_PER_USDC : 10000);
+  console.log(`USDC Balance:      $${usdc.toFixed(6)}`);
+  console.log(`ATELToken Balance: ${token.toLocaleString()}`);
+  console.log(`ATELToken ≈ USDC:  $${tokenUSDC.toFixed(6)}`);
+}
+
+async function cmdHubLedger() {
+  const data = await platformSignedFetch('/account/v1/transactions', {});
+  const txs = Array.isArray(data.transactions) ? data.transactions : [];
+  console.log(JSON.stringify({ transactions: txs }, null, 2));
+}
+
+async function cmdHubSwapHistory() {
+  const data = await platformSignedFetch('/account/v1/transactions', {});
+  const txs = (Array.isArray(data.transactions) ? data.transactions : []).filter((tx) =>
+    tx?.type === 'swap' || tx?.type === 'swap_reverse'
+  );
+  console.log(JSON.stringify({ transactions: txs }, null, 2));
 }
 
 async function cmdHubUsage(flags) {
@@ -129,28 +142,19 @@ async function cmdHubUsage(flags) {
     console.log('  No usage records found.');
     return;
   }
-  console.log('  Time                  Model                          In      Out   Cost');
-  console.log('  ' + '-'.repeat(80));
+  console.log('  Time                  Model                          In      Out   Cost  Provider$');
+  console.log('  ' + '-'.repeat(96));
   for (const item of data.items) {
     const t = new Date(item.created_at).toLocaleString();
     const model = item.model_id.padEnd(30);
-    console.log(`  ${t}  ${model}  ${String(item.tokens_in).padStart(6)}  ${String(item.tokens_out).padStart(6)}  ${item.cost}`);
+    const providerCost = Number(item.provider_cost || 0);
+    console.log(`  ${t}  ${model}  ${String(item.tokens_in).padStart(6)}  ${String(item.tokens_out).padStart(6)}  ${String(item.cost).padStart(4)}  ${providerCost.toFixed(6).padStart(9)}`);
   }
   const totalCost = data.items.reduce((s, i) => s + i.cost, 0);
-  console.log('  ' + '-'.repeat(80));
+  const totalProviderCost = data.items.reduce((s, i) => s + Number(i.provider_cost || 0), 0);
+  console.log('  ' + '-'.repeat(96));
   console.log(`  Total cost this page: ${totalCost} ATELToken`);
-}
-
-async function cmdHubTopup() {
-  // Show topup instructions (chain-based, no automation yet)
-  const res = await hubFetch('/balance');
-  const data = await res.json();
-  console.log('Current balance: ' + data.balance.toLocaleString() + ' ATELToken ($' + data.usdc_equiv + ')');
-  console.log('');
-  console.log('To top up, send USDC to your ATEL deposit address.');
-  console.log('Exchange rate: 1 USDC = 10,000 ATELToken');
-  console.log('');
-  console.log('Contact your platform admin or visit https://atelai.org/topup for instructions.');
+  console.log(`  Total provider cost:  $${totalProviderCost.toFixed(6)}`);
 }
 
 async function cmdHubKeyCreate(flags) {
@@ -165,9 +169,8 @@ async function cmdHubKeyCreate(flags) {
   console.log('  ' + data.key);
   console.log('');
   console.log('This key will NOT be shown again. Save it securely.');
-  console.log('Saving to ~/.atel/hub.json ...');
-  const cfg = getConfig();
-  saveConfig(data.key, cfg.base);
+  console.log(`Saving to ${HUB_CONFIG_PATH} ...`);
+  saveConfig(data.key, process.env.ATEL_HUB_BASE || DEFAULT_BASE);
   console.log('Saved. You can now use atel hub commands.');
 }
 
@@ -259,7 +262,7 @@ async function cmdHubChat(model, prompt, flags) {
     const msg = errBody?.error?.message || res.statusText;
     const code = errBody?.error?.code || 'ERROR';
     console.error(`[${code}] ${msg}`);
-    if (errBody?.error?.action === 'topup') console.error('Run: atel hub topup');
+    if (errBody?.error?.action === 'topup') console.error('Run: atel deposit <amount> <channel>');
     process.exit(1);
   }
 
@@ -304,9 +307,9 @@ export async function cmdHub(sub, args, rawArgs) {
   try {
     switch (sub) {
       case 'balance': return await cmdHubBalance();
-      case 'swap':    return await cmdHubSwap(args[0], flags);
+      case 'ledger':  return await cmdHubLedger();
+      case 'swap-history': return await cmdHubSwapHistory();
       case 'usage':   return await cmdHubUsage(flags);
-      case 'topup':   return await cmdHubTopup();
       case 'models':  return await cmdHubModels(flags);
       case 'chat':    return await cmdHubChat(args[0], args[1], flags);
       case 'key': {
@@ -328,10 +331,10 @@ export async function cmdHub(sub, args, rawArgs) {
 atel hub — ATELToken management
 
 Commands:
-  atel hub balance                          Show ATELToken balance
+  atel hub balance                          Show platform balance (USDC + ATELToken)
+  atel hub ledger                           Show ledger from platform transactions
+  atel hub swap-history                     Show swap history from platform transactions
   atel hub usage [--model <id>] [--days 7]  Usage history
-  atel hub topup                            Top-up instructions
-  atel hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
   atel hub models [--search <kw>]           List available models
   atel hub chat <model> "<prompt>" [--stream] Quick chat
   atel hub key create [--name <name>]       Create API key

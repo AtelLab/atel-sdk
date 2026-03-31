@@ -22,6 +22,11 @@
  *   atel withdraw <amount> [channel]    Withdraw funds
  *   atel transactions                   List payment history
  *
+ * Token Commands:
+ *   atel swap usdc <amount> [--chain bsc|base]
+ *   atel swap token <amount> [--chain bsc|base]
+ *   atel transfer <to_did> <amount> [--memo "..."]
+ *
  * Trade Commands:
  *   atel order <did> <cap> <price>      Create a trade order
  *   atel accept <orderId>               Accept an order (executor)
@@ -5801,6 +5806,67 @@ async function cmdTransactions() {
   console.log(JSON.stringify(data, null, 2));
 }
 
+function readRawFlag(flag, fallback = '') {
+  const idx = rawArgs.indexOf(flag);
+  return idx >= 0 && rawArgs[idx + 1] ? rawArgs[idx + 1] : fallback;
+}
+
+async function cmdSwap(direction, amount) {
+  if (!direction || !amount) {
+    console.error('Usage: atel swap <usdc|token> <amount> [--chain bsc|base]');
+    process.exit(1);
+  }
+  const kind = String(direction).toLowerCase();
+  const chain = String(readRawFlag('--chain', 'bsc')).toLowerCase();
+  if (chain !== 'bsc' && chain !== 'base') {
+    console.error('Invalid chain. Use --chain bsc or --chain base');
+    process.exit(1);
+  }
+
+  let payload;
+  if (kind === 'usdc') {
+    const v = Number(amount);
+    if (!Number.isFinite(v) || v <= 0) {
+      console.error('USDC amount must be a positive number.');
+      process.exit(1);
+    }
+    payload = { from: 'usdc', to: 'token', amount: v, chain };
+  } else if (kind === 'token') {
+    const v = Number(amount);
+    if (!Number.isInteger(v) || v <= 0) {
+      console.error('Token amount must be a positive integer.');
+      process.exit(1);
+    }
+    payload = { from: 'token', to: 'usdc', amount: v, chain };
+  } else {
+    console.error('Usage: atel swap <usdc|token> <amount> [--chain bsc|base]');
+    process.exit(1);
+  }
+
+  const data = await signedFetch('POST', '/account/v1/swap', payload);
+  console.log('Swap successful');
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdTransfer(toDid, amount) {
+  if (!toDid || !amount) {
+    console.error('Usage: atel transfer <to_did> <amount> [--memo "..."]');
+    process.exit(1);
+  }
+  const tokenAmount = Number(amount);
+  if (!Number.isInteger(tokenAmount) || tokenAmount <= 0) {
+    console.error('Transfer amount must be a positive integer.');
+    process.exit(1);
+  }
+  const memo = readRawFlag('--memo', '');
+  const payload = { to_did: toDid, amount: tokenAmount };
+  if (memo) payload.memo = memo;
+
+  const data = await signedFetch('POST', '/account/v1/token/transfer', payload);
+  console.log('Transfer successful');
+  console.log(JSON.stringify(data, null, 2));
+}
+
 // ─── Trade Commands ──────────────────────────────────────────────
 
 // ─── Trade Task: High-level one-shot command ────────────────────
@@ -8020,6 +8086,8 @@ const commands = {
   deposit: () => cmdDeposit(args[0], args[1]),
   withdraw: () => cmdWithdraw(args[0], args[1], args[2]),
   transactions: () => cmdTransactions(),
+  swap: () => cmdSwap(args[0], args[1]),
+  transfer: () => cmdTransfer(args[0], args[1]),
   // Trade
   'trade-task': () => cmdTradeTask(args[0], args.slice(1).join(' ')),
   order: () => cmdOrder(args[0], args[1], args[2]),
@@ -8338,11 +8406,16 @@ Account Commands:
   withdraw <amount> [channel] [address] Withdraw funds (address required for crypto)
   transactions                         List payment history
 
+Token Commands:
+  swap usdc <amount> [--chain bsc|base]  Swap USDC → ATELToken
+  swap token <amount> [--chain bsc|base] Swap ATELToken → USDC
+  transfer <to_did> <amount> [--memo "..."] Transfer ATELToken to another DID
+
 Hub Commands:
-  hub balance                          Show ATELToken balance
+  hub balance                          Show platform balance (USDC + ATELToken)
+  hub ledger                           Show platform transaction ledger
+  hub swap-history                     Show platform swap history
   hub usage [--model <id>] [--days 7]  Usage history
-  hub topup                            Top-up instructions
-  hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
   hub models [--search <kw>]           List available models
   hub chat <model> "<prompt>" [--stream] Quick chat
   hub key <create|list|revoke|use>     Manage TokenHub API keys
