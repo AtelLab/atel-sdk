@@ -53,7 +53,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { cmdHub } from './hub-helpers.mjs';
+import { cmdHub, cmdSwap, cmdTransfer } from './hub-helpers.mjs';
 import { resolve, join, dirname } from 'node:path';
 import crypto from 'node:crypto';
 import {
@@ -74,8 +74,8 @@ import { parseAttachmentFlags, processAttachments } from './atel-attachment-help
 
 const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
-const REGISTRY_URL = process.env.ATEL_REGISTRY || 'https://api.atelai.org';
-const ATEL_PLATFORM = process.env.ATEL_PLATFORM || 'https://api.atelai.org';
+const ATEL_PLATFORM = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+const REGISTRY_URL = process.env.ATEL_REGISTRY || ATEL_PLATFORM || 'https://api.atelai.org';
 const ATEL_RELAY = process.env.ATEL_RELAY || 'https://api.atelai.org';
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
@@ -4934,6 +4934,17 @@ async function cmdRegister(name, capabilities, endpointUrl) {
   if (preferredChain) registerPayload.metadata = { preferredChain };
 
   const entry = await client.register(registerPayload, id);
+  let actualWallets = wallets || null;
+  for (let i = 0; i < 8; i++) {
+    try {
+      const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        const fresh = await resp.json();
+        if (fresh?.wallets) { actualWallets = fresh.wallets; break; }
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 750));
+  }
   if (!wallets || !preferredChain) {
     console.error('[register] INFO: registered without published chain readiness. Yellow page registration still works. Free tasks can run normally. Paid orders require an anchoring key at execution time; re-register or restart later if you want wallets/preferredChain shown in the registry.');
   }
@@ -4953,7 +4964,7 @@ async function cmdRegister(name, capabilities, endpointUrl) {
     capabilities: capDisplay,
     endpoint: ep,
     discoverable,
-    wallets: wallets || null,
+    wallets: actualWallets || null,
     preferredChain: preferredChain || null,
     registry: REGISTRY_URL,
   }, null, 2));
@@ -8133,6 +8144,9 @@ const commands = {
   auth: () => cmdAuth(args[0]),
   // Send (Rich Media P2P Message)
   hub: () => cmdHub(args[0], args.slice(1), rawArgs),
+  // Platform account operations
+  swap: () => cmdSwap(args[0], args[1], rawArgs),
+  transfer: () => cmdTransfer(args[0], args[1], rawArgs),
   send: () => {
     if (rawArgs.includes('--help') || rawArgs.includes('-h') || args.length === 0) {
       showSendHelp();
@@ -8339,10 +8353,12 @@ Account Commands:
   transactions                         List payment history
 
 Hub Commands:
+  swap usdc <amount> [--chain bsc|base]  Swap USDC → ATELToken
+  swap token <amount> [--chain bsc|base] Swap ATELToken → USDC
+  transfer <to_did> <amount> [--memo]    Transfer ATELToken to another DID
+
   hub balance                          Show ATELToken balance
   hub usage [--model <id>] [--days 7]  Usage history
-  hub topup                            Top-up instructions
-  hub swap <usdc> [--chain bsc|base]   Swap USDC → ATELToken
   hub models [--search <kw>]           List available models
   hub chat <model> "<prompt>" [--stream] Quick chat
   hub key <create|list|revoke|use>     Manage TokenHub API keys
