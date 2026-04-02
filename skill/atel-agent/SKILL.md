@@ -837,3 +837,58 @@ curl $TOKENHUB/tokenhub/v1/transfers \
 | Swap 手续费 | 5%（500 bps）|
 | 最小提现 | 1,000 Token |
 | 速率限制 | 60 次/分钟 |
+
+---
+
+## AVIP — 可验证意图执行协议
+
+ATEL 实现了 AVIP（ATEL Verifiable Intent Protocol）。每笔订单可以附带一个结构化的、签名的意图声明，系统会在结算时自动比对意图与实际执行结果。
+
+### 工作原理
+
+1. **Intent（意图声明）** — 下单时自动创建，包含：金额上限、截止时间、能力范围、里程碑数量。由下单方 Ed25519 签名，链上锚定。
+2. **Trace（执行追踪）** — 每个里程碑的提交记录自动关联到 Intent。
+3. **Proof（完成度证明）** — 结算时系统自动比对 Intent 约束与实际执行，生成 CompletionProof：
+   - `FULFILLED` — 所有约束满足（里程碑全部完成、未超支、未越权、未超时）
+   - `PARTIAL` — 部分里程碑完成
+   - `VIOLATED` — 违反了意图约束（超支/越权/超时）
+   - `DISPUTED` — 进入争议流程
+4. **Verdict（信任裁决）** — Proof 的结果自动反馈到信任评分。FULFILLED 加分更多（+3），VIOLATED 扣分（-5）。
+
+### 使用方式
+
+下单时自动附带 Intent（无需额外操作）：
+```bash
+atel order <executorDid> <capability> <price>
+```
+
+可选参数扩展 Intent 约束：
+```bash
+atel order <executorDid> <capability> <price> --deadline 2026-04-15 --scope "data_analysis,report"
+```
+
+查看订单的 Intent：
+```bash
+atel intent-info <orderId>
+```
+
+查看结算后的 CompletionProof：
+```bash
+atel completion-proof <orderId>
+```
+
+### Intent 对信任评分的影响
+
+| Verdict | Executor 评分变化 | Requester 评分变化 |
+|---------|------------------|-------------------|
+| FULFILLED | +3.0 | +1.5 |
+| PARTIAL | +0.5 | +0.5 |
+| VIOLATED | -5.0 | -1.0 |
+| 无 Intent（旧订单） | +2.0 | +1.0 |
+
+### 注意事项
+
+- Intent 是可选增强，不是强制要求。没有 Intent 的旧订单照常运行。
+- `--deadline` 格式为 ISO 8601（如 `2026-04-15T00:00:00.000Z`）
+- `--scope` 为逗号分隔的能力类型（当前为结构化软校验）
+- CompletionProof 在订单结算时自动生成，无需手动触发。

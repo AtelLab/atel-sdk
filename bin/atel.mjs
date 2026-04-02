@@ -5904,6 +5904,45 @@ async function cmdOrder(executorDid, capType, price) {
     // Sign task request
     const taskSignature = await signTaskRequest(taskRequest, id.secretKey);
     
+    // ── AVIP: Create signed Intent ──
+    const { default: nacl } = await import('tweetnacl');
+    const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+    const intentConstraints = {
+      maxAmount: parseFloat(price),
+      milestoneCount: 5,
+    };
+    const deadlineIdx = rawArgs.indexOf('--deadline');
+    if (deadlineIdx >= 0 && rawArgs[deadlineIdx + 1]) {
+      intentConstraints.deadline = rawArgs[deadlineIdx + 1];
+    }
+    const scopeIdx = rawArgs.indexOf('--scope');
+    if (scopeIdx >= 0 && rawArgs[scopeIdx + 1]) {
+      intentConstraints.scope = rawArgs[scopeIdx + 1].split(',').map(s => s.trim());
+    }
+
+    const intentTimestamp = new Date().toISOString();
+    const intentSignable = {
+      action: 'execute_task',
+      constraints: intentConstraints,
+      issuerDid: id.did,
+      subjectDid: executorDid,
+      timestamp: intentTimestamp,
+    };
+    const intentSig = Buffer.from(
+      nacl.sign.detached(Buffer.from(serializePayload(intentSignable)), id.secretKey)
+    ).toString('base64');
+
+    const intentData = {
+      intentId: 'intent_' + crypto.randomUUID(),
+      issuerDid: id.did,
+      subjectDid: executorDid,
+      action: 'execute_task',
+      constraints: intentConstraints,
+      delegationChain: [{ from: id.did, to: executorDid, attenuated: true, signature: intentSig }],
+      timestamp: intentTimestamp,
+      signature: intentSig,
+    };
+
     // Send to Platform
     const data = await signedFetch('POST', '/trade/v1/order', {
       executorDid,
@@ -5914,7 +5953,8 @@ async function cmdOrder(executorDid, capType, price) {
       description,
       version: 2,  // New version with signature
       taskRequest: taskRequest,
-      taskSignature: taskSignature
+      taskSignature: taskSignature,
+      intent: intentData,  // AVIP intent
     });
     
     // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
@@ -5940,6 +5980,60 @@ async function cmdOrder(executorDid, capType, price) {
     // Other errors
     console.error('Order creation failed:', errorMsg);
     process.exit(1);
+  }
+}
+
+// ── AVIP Commands ──
+
+async function cmdIntentInfo(orderId) {
+  if (!orderId) { console.error('Usage: atel intent-info <orderId>'); process.exit(1); }
+  try {
+    const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/intent`);
+    const data = await res.json();
+    if (!res.ok) {
+      console.log('No intent found for this order.');
+      return;
+    }
+    console.log('\n=== Intent Declaration ===');
+    console.log(`Intent ID:    ${data.intent_id}`);
+    console.log(`Action:       ${data.action}`);
+    console.log(`Issuer:       ${data.issuer_did}`);
+    console.log(`Subject:      ${data.subject_did}`);
+    if (data.max_amount) console.log(`Max Amount:   $${data.max_amount}`);
+    if (data.deadline) console.log(`Deadline:     ${data.deadline}`);
+    if (data.scope) console.log(`Scope:        ${JSON.parse(data.scope).join(', ')}`);
+    console.log(`Milestones:   ${data.milestone_count}`);
+    console.log(`Status:       ${data.status}`);
+    console.log(`Anchor:       ${data.anchor_status}${data.anchor_tx ? ' tx=' + data.anchor_tx : ''}`);
+    console.log(`Created:      ${data.created_at}`);
+  } catch (e) {
+    console.error('Failed to fetch intent:', e.message);
+  }
+}
+
+async function cmdCompletionProof(orderId) {
+  if (!orderId) { console.error('Usage: atel completion-proof <orderId>'); process.exit(1); }
+  try {
+    const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/completion-proof`);
+    const data = await res.json();
+    if (!res.ok) {
+      console.log('No completion proof found for this order.');
+      return;
+    }
+    console.log('\n=== Completion Proof ===');
+    console.log(`Proof ID:     ${data.proof_id}`);
+    console.log(`Intent ID:    ${data.intent_id}`);
+    console.log(`Verdict:      ${data.verdict}`);
+    console.log(`Milestones:   ${data.milestones_completed}/${data.milestones_expected}`);
+    console.log(`Rate:         ${(data.completion_rate * 100).toFixed(1)}%`);
+    console.log(`Budget:       ${data.within_budget ? '✅ Within' : '❌ Exceeded'}`);
+    console.log(`Scope:        ${data.within_scope ? '✅ Within' : '❌ Exceeded'} (${data.scope_check_type})`);
+    console.log(`Deadline:     ${data.within_deadline ? '✅ Within' : '❌ Exceeded'}`);
+    console.log(`Anchor:       ${data.anchor_status}${data.anchor_tx ? ' tx=' + data.anchor_tx : ''}`);
+    console.log(`Intent Hash:  ${data.intent_hash}`);
+    console.log(`Exec Hash:    ${data.execution_hash}`);
+  } catch (e) {
+    console.error('Failed to fetch completion proof:', e.message);
   }
 }
 
@@ -8039,6 +8133,9 @@ const commands = {
   'milestone-verify': () => cmdMilestoneVerify(args[0], args[1]),
   'milestone-arbitrate': () => cmdMilestoneArbitrate(args[0], args[1]),
   'chain-records': () => cmdChainRecords(args[0]),
+  // AVIP
+  'intent-info': () => cmdIntentInfo(args[0]),
+  'completion-proof': () => cmdCompletionProof(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
