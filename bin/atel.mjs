@@ -158,7 +158,7 @@ function shouldAllowRepoAccess(context = {}) {
   const resultSummary = String(context?.resultSummary || '').toLowerCase();
   const previousApprovedOutputs = String(context?.previousApprovedOutputs || '').toLowerCase();
   const combined = `${description}\n${objective}\n${resultSummary}\n${previousApprovedOutputs}`;
-  return /(repo|repository|codebase|仓库|代码库|项目代码|source code|read files|analyze code|修改代码|修复代码|实现功能)/i.test(combined);
+  return /(repo|repository|codebase|\u4ed3\u5e93|\u4ee3\u7801\u5e93|\u9879\u76ee\u4ee3\u7801|source code|read files|analyze code|\u4fee\u6539\u4ee3\u7801|\u4fee\u590d\u4ee3\u7801|\u5b9e\u73b0\u529f\u80fd)/i.test(combined);
 }
 
 function summarizeApprovedMilestones(milestones = [], beforeIndex = Number.MAX_SAFE_INTEGER) {
@@ -312,26 +312,26 @@ async function pushTradeNotification(eventType, payload, body) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'order_created': (p) => `📥 收到新订单\n订单: ${p.orderId || body?.orderId || '?'}\n金额: $${p.priceAmount ?? '?'} USDC\n来自: ${p.requesterDid || '未知请求方'}\n请审核后决定是否接单`,
-    'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body?.orderId || '?'}\n执行方已开始处理，进入里程碑阶段`,
+    'order_created': (p) => `📥 New order received\nOrder: ${p.orderId || body?.orderId || '?'}\nAmount: $${p.priceAmount ?? '?'} USDC\nFrom: ${p.requesterDid || 'unknown requester'}\nReview and decide whether to accept`,
+    'order_accepted': (p) => `📋 Order accepted\nOrder: ${p.orderId || body?.orderId || '?'}\nThe executor has started work. The order is now in the milestone phase`,
     'milestone_submitted': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}\n等待审核`;
+      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\nSubmission: ${String(p.resultSummary).substring(0, 200)}` : '';
+      return `📝 Milestone M${p.milestoneIndex ?? '?'} submitted\nOrder: ${p.orderId || body?.orderId || '?'}${desc}${content}\nAwaiting review`;
     },
     'milestone_verified': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      const progress = p.totalMilestones ? `\n进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
-      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
+      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\nSubmission: ${String(p.resultSummary).substring(0, 200)}` : '';
+      const progress = p.totalMilestones ? `\nProgress: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
+      return `✅ Milestone M${p.milestoneIndex ?? '?'} approved\nOrder: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
     },
     'milestone_rejected': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body?.orderId || '?'}${desc}\n原因: ${p.rejectReason || '未说明'}`;
+      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
+      return `❌ Milestone M${p.milestoneIndex ?? '?'} rejected\nOrder: ${p.orderId || body?.orderId || '?'}${desc}\nReason: ${p.rejectReason || 'not provided'}`;
     },
     'order_settled': (p) => {
-      const amount = p.priceAmount ? `\n金额: $${p.priceAmount} USDC` : '';
-      return `💰 订单已结算完成\n订单: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC 已支付`;
+      const amount = p.priceAmount ? `\nAmount: $${p.priceAmount} USDC` : '';
+      return `💰 Order settled\nOrder: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC has been paid`;
     },
   };
   const tmpl = templates[eventType];
@@ -382,12 +382,12 @@ async function pushP2PNotification(eventType, payload = {}) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'p2p_task_sent': (p) => `📤 P2P任务已发送\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
-    'p2p_task_received': (p) => `📩 收到新的P2P任务\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
-    'p2p_task_started': (p) => `▶️ P2P任务开始处理\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
-    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
-    'p2p_result_received': (p) => `✅ P2P任务已完成\n任务: ${p.taskId || '?'}\n结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
-    'p2p_task_failed': (p) => `❌ P2P任务失败\n任务: ${p.taskId || '?'}\n原因: ${p.reason || '未知错误'}`,
+    'p2p_task_sent': (p) => `📤 P2P task sent\nTask: ${p.taskId || '?'}\nTarget: ${p.peerDid || '?'}`,
+    'p2p_task_received': (p) => `📩 New P2P task received\nTask: ${p.taskId || '?'}\nFrom: ${p.peerDid || '?'}`,
+    'p2p_task_started': (p) => `▶️ P2P task started\nTask: ${p.taskId || '?'}\nFrom: ${p.peerDid || '?'}`,
+    'p2p_result_submitted': (p) => `📨 P2P result sent back\nTask: ${p.taskId || '?'}\nTarget: ${p.peerDid || '?'}`,
+    'p2p_result_received': (p) => `✅ P2P task completed\nTask: ${p.taskId || '?'}\nResult: ${String(p.result || '').slice(0, 80) || 'returned'}`,
+    'p2p_task_failed': (p) => `❌ P2P task failed\nTask: ${p.taskId || '?'}\nReason: ${p.reason || 'unknown error'}`,
   };
   const tmpl = templates[eventType];
   if (!tmpl) return;
@@ -2950,18 +2950,18 @@ async function cmdStart(port) {
   function buildGatewayCallbackPrompt(eventType, promptText, callbackUrl, dedupeKey, cwd, payload = {}) {
     const callbackExamples = {
       milestone_submitted: [
-        '通过时执行：',
+        'Run on approval:',
         "python3 - <<'PY'",
         'import json, urllib.request',
-        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "pass", "summary": "审核通过的简短原因"}`,
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "pass", "summary": "brief reason for approval"}`,
         `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
         'urllib.request.urlopen(req, timeout=10).read()',
         'PY',
         '',
-        '拒绝时执行：',
+        'Run on rejection:',
         "python3 - <<'PY'",
         'import json, urllib.request',
-        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "reject", "reason": "具体拒绝原因", "summary": "简短审核结论"}`,
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "decision": "reject", "reason": "specific rejection reason", "summary": "brief review conclusion"}`,
         `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
         'urllib.request.urlopen(req, timeout=10).read()',
         'PY',
@@ -2969,7 +2969,7 @@ async function cmdStart(port) {
       default: [
         "python3 - <<'PY'",
         'import json, urllib.request',
-        `result = """在这里写最终交付内容"""`,
+        `result = """Write the final deliverable here"""`,
         `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "result": result, "summary": result[:120]}`,
         `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
         'urllib.request.urlopen(req, timeout=10).read()',
@@ -2980,7 +2980,7 @@ async function cmdStart(port) {
     const callbackFailed = [
       "python3 - <<'PY'",
       'import json, urllib.request',
-      `body = {"dedupeKey": "${dedupeKey}", "status": "failed", "eventType": "${eventType}", "error": "在这里写失败原因"}`,
+      `body = {"dedupeKey": "${dedupeKey}", "status": "failed", "eventType": "${eventType}", "error": "Write the failure reason here"}`,
       `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
       'urllib.request.urlopen(req, timeout=10).read()',
       'PY',
@@ -2990,27 +2990,27 @@ async function cmdStart(port) {
     const contextFile = join(cwd, 'ORDER_CONTEXT.md');
     const allowRepoAccess = shouldAllowRepoAccess(payload);
     const fileAccessRule = allowRepoAccess
-      ? `3. 仅允许使用目录 ${cwd} 下与当前订单直接相关的内容；如果订单明确要求读仓库，也只能读取该订单工作区中明确提供的路径。`
-      : `3. 本单禁止读取任何本地文件、共享草稿、仓库或其他项目。不要使用文件搜索、目录浏览、读文件等方式扩展上下文；只允许依据本条消息中的订单描述、里程碑目标、提交内容来工作。`;
+      ? `3. Only use content directly related to the current order under ${cwd}. If the order explicitly requires repository analysis, only read the paths explicitly provided inside this order workspace.`
+      : `3. This order forbids reading any local files, shared drafts, repositories, or other projects. Do not expand context through file search, directory browsing, or file reads. Work only from the order description, milestone goal, and submission content in this message.`;
     const contextRule = allowRepoAccess
-      ? `4. 优先读取 ${contextFile}，严格以其中的订单描述、里程碑目标、提交内容为准。`
-      : `4. 不要扫描本机其他目录，不要读取 /root/atel-workspace 下的共享文件，不要根据历史项目或 stray files 推断任务。`;
+      ? `4. Read ${contextFile} first and treat its order description, milestone goal, and submission content as the authoritative source.`
+      : `4. Do not scan other directories on the machine, do not read shared files under /root/atel-workspace, and do not infer the task from historical projects or stray files.`;
     const repoRule = allowRepoAccess
-      ? `5. 只有当订单明确要求分析仓库/代码时，才允许读取订单工作区里显式提供的代码路径；禁止顺带读取其他目录。`
-      : `5. 本单不是 repo/code 任务。禁止把任务扩展成代码分析、工程改造或共享草稿筛选。`;
+      ? `5. Only when the order explicitly requires repository or code analysis may you read code paths explicitly provided in the order workspace. Do not read other directories opportunistically.`
+      : `5. This order is not a repo/code task. Do not expand it into code analysis, engineering changes, or shared-draft review.`;
     if (eventType === 'p2p_task') {
       return `${promptText}
 
-重要要求：
-1. 这是一个 P2P 任务。不要调用 atel result；本地 SDK 会在你回调后自动提交结果。
-2. 你的任务是认真完成 AI 工作，并把最终结论通过回调发回本地 SDK。
+Important requirements:
+1. This is a P2P task. Do not call atel result; the local SDK will submit the result automatically after your callback.
+2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
 ${fileAccessRule}
 ${contextRule}
-5. 完成后，必须立刻执行下面这个成功回调命令模板，并把其中内容替换成你的真实结果：
+5. After finishing, you must immediately run the success callback command template below and replace its content with your real result:
 
 ${callbackDone}
 
-6. 如果重试后仍然失败，也必须执行下面这个失败回调命令：
+6. If it still fails after retries, you must also run the failure callback command below:
 
 ${callbackFailed}
 `;
@@ -3018,17 +3018,17 @@ ${callbackFailed}
 
     return `${promptText}
 
-重要要求：
-1. 不要执行 atel milestone-submit / milestone-verify / milestone-feedback 命令；这些命令会由本地 SDK 在你回调后代为执行。
-2. 你的任务是认真完成 AI 工作，并把最终结论通过回调发回本地 SDK。
+Important requirements:
+1. Do not run atel milestone-submit / milestone-verify / milestone-feedback. The local SDK will execute those commands on your behalf after the callback.
+2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
 ${fileAccessRule}
 ${contextRule}
 ${repoRule}
-6. 完成后，必须立刻执行下面这个成功回调命令模板，并把其中内容替换成你的真实结果：
+6. After finishing, you must immediately run the success callback command template below and replace its content with your real result:
 
 ${callbackDone}
 
-7. 如果重试后仍然失败，也必须执行下面这个失败回调命令：
+7. If it still fails after retries, you must also run the failure callback command below:
 
 ${callbackFailed}
 `;
@@ -3038,26 +3038,26 @@ ${callbackFailed}
     if (eventType === 'milestone_submitted') {
       return `${promptText}
 
-重要：你不是在和用户聊天。
-不要输出 markdown、代码块、解释、分析过程。
-你必须只输出一行 JSON。
+Important: you are not chatting with the user.
+Do not output markdown, code blocks, explanations, or your reasoning.
+You must output exactly one line of JSON.
 
-通过时：
-{"decision":"pass","summary":"简短通过原因"}
+For approval:
+{"decision":"pass","summary":"brief approval reason"}
 
-拒绝时：
-{"decision":"reject","reason":"具体拒绝原因","summary":"简短审核结论"}`;
+For rejection:
+{"decision":"reject","reason":"specific rejection reason","summary":"brief review conclusion"}`;
     }
 
     if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
       return `${promptText}
 
-重要：你不是在和用户聊天。
-不要输出 markdown、标题、项目符号、解释、分析过程。
-你必须只输出一行 JSON。
+Important: you are not chatting with the user.
+Do not output markdown, headings, bullet points, explanations, or your reasoning.
+You must output exactly one line of JSON.
 
-格式：
-{"result":"当前里程碑的真实交付内容"}`;
+Format:
+{"result":"the actual deliverable for the current milestone"}`;
     }
 
     return promptText;
@@ -3168,10 +3168,10 @@ ${callbackFailed}
         return buildAgentCallbackAction(eventType, payload, parsed);
       } catch {
         const lowered = cleaned.toLowerCase();
-        if (lowered.startsWith('pass') || cleaned.includes('通过')) {
+        if (lowered.startsWith('pass') || cleaned.includes('\u901a\u8fc7')) {
           return buildAgentCallbackAction(eventType, payload, { decision: 'pass', summary: cleaned });
         }
-        if (lowered.startsWith('reject') || cleaned.includes('拒绝')) {
+        if (lowered.startsWith('reject') || cleaned.includes('\u62d2\u7edd')) {
           return buildAgentCallbackAction(eventType, payload, { decision: 'reject', reason: cleaned, summary: cleaned });
         }
         return { ok: false, error: 'invalid_local_review_stdout' };
@@ -3375,8 +3375,8 @@ ${callbackFailed}
             previousApprovedOutputs,
           };
       const promptText = currentIndex === 0
-        ? `你是ATEL接单方Agent。双方已确认方案，开始执行。\n订单原始要求：${orderDescription || '未提供'}\n当前里程碑 M0：${currentMilestone.title || ''}\n请只围绕这个订单要求完成当前里程碑，并通过回调返回最终交付内容。`
-        : `你是ATEL接单方Agent。M${currentIndex - 1} 已通过审核。\n订单原始要求：${orderDescription || '未提供'}\n下一个里程碑 M${currentIndex}：${currentMilestone.title || ''}\n前面已通过的阶段结果如下：\n${previousApprovedOutputs || '无'}\n\n请严格基于这些已通过结果推进当前里程碑，不要自行假设缺失材料，也不要读取本地共享文件来补上下文。完成后通过回调返回最终交付内容。`;
+        ? `You are the ATEL executor agent. The plan has been confirmed and execution begins.\nOriginal order requirements: ${orderDescription || 'not provided'}\nCurrent milestone M0: ${currentMilestone.title || ''}\nComplete only this milestone for the current order and return the final deliverable via the callback.`
+        : `You are the ATEL executor agent. M${currentIndex - 1} has been approved.\nOriginal order requirements: ${orderDescription || 'not provided'}\nNext milestone M${currentIndex}: ${currentMilestone.title || ''}\nPreviously approved outputs:\n${previousApprovedOutputs || 'none'}\n\nAdvance the current milestone strictly based on these approved results. Do not invent missing materials or read local shared files to fill missing context. After completion, return the final deliverable via the callback.`;
       const recoveryKey = buildMilestoneHookRecoveryKey(eventType, payload);
       log({ event: 'trade_reconcile_executor', orderId, currentMilestone: currentIndex, recoveryKey });
       const queued = queueAgentHook(eventType, recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
@@ -3409,7 +3409,7 @@ ${callbackFailed}
         orderDescription,
         previousApprovedOutputs,
       };
-      const promptText = `你是ATEL发单方Agent，需要审核执行方提交的工作。\n订单原始要求：${orderDescription || '未提供'}\n里程碑目标：${submittedMilestone.title || ''}\n前面已通过的阶段结果如下：\n${previousApprovedOutputs || '无'}\n提交内容：${submittedMilestone.resultSummary || ''}\n请只按该订单要求和前序已通过结果审慎决定通过还是拒绝，并通过回调返回 decision=pass 或 decision=reject。`;
+      const promptText = `You are the ATEL requester agent. You need to review the work submitted by the executor.\nOriginal order requirements: ${orderDescription || 'not provided'}\nMilestone goal: ${submittedMilestone.title || ''}\nPreviously approved outputs:\n${previousApprovedOutputs || 'none'}\nSubmission: ${submittedMilestone.resultSummary || ''}\nDecide carefully whether to pass or reject based only on the order requirements and the previously approved outputs, then return decision=pass or decision=reject via the callback.`;
       const recoveryKey = buildMilestoneHookRecoveryKey('milestone_submitted', payload);
       const queued = queueAgentHook('milestone_submitted', recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
       if (queued) log({ event: 'trade_reconcile_requester', orderId, milestoneIndex: submittedMilestone.index, recoveryKey });
@@ -3615,7 +3615,7 @@ ${callbackFailed}
         return;
       }
       // Add working directory context so agent runs atel commands in the right place
-      const cwdNote = `\n\n重要：OpenClaw 的分析工作目录是 ${hookCwd}。所有 atel 命令必须在目录 ${atelCwd} 下执行（cd ${atelCwd} && atel ...）。`;
+      const cwdNote = `\n\nImportant: OpenClaw's analysis working directory is ${hookCwd}. All atel commands must be run in ${atelCwd} (cd ${atelCwd} && atel ...).`;
       const enrichedPrompt = sanitizeAgentPrompt(prompt + cwdNote, { eventType: event, dedupeKey });
       if (!enrichedPrompt) {
         res.json({ status: 'received', eventId, eventType: event, skipped: true });
@@ -4542,7 +4542,7 @@ ${callbackFailed}
       fetch(EXECUTOR_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId, from: message.from, action, payload, encrypted: !!session?.encrypted, toolProxy: `http://127.0.0.1:${toolProxyPort}` }) }).catch(e => log({ event: 'executor_forward_failed', taskId, error: e.message }));
       return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
     } else {
-      const p2pPrompt = `你是 ATEL 接单方 Agent，收到一个 P2P 任务。\n任务类型：${action}\n任务内容：${JSON.stringify(payload?.payload || payload || {}, null, 2)}\n请认真完成任务，并通过回调返回最终结果。`;
+      const p2pPrompt = `You are the ATEL executor agent and received a P2P task.\nTask type: ${action}\nTask payload: ${JSON.stringify(payload?.payload || payload || {}, null, 2)}\nComplete the task carefully and return the final result via the callback.`;
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
       pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
       pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
@@ -5915,45 +5915,6 @@ async function cmdOrder(executorDid, capType, price) {
     // Sign task request
     const taskSignature = await signTaskRequest(taskRequest, id.secretKey);
     
-    // ── AVIP: Create signed Intent ──
-    const { default: nacl } = await import('tweetnacl');
-    const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
-    const intentConstraints = {
-      maxAmount: parseFloat(price),
-      milestoneCount: 5,
-    };
-    const deadlineIdx = rawArgs.indexOf('--deadline');
-    if (deadlineIdx >= 0 && rawArgs[deadlineIdx + 1]) {
-      intentConstraints.deadline = rawArgs[deadlineIdx + 1];
-    }
-    const scopeIdx = rawArgs.indexOf('--scope');
-    if (scopeIdx >= 0 && rawArgs[scopeIdx + 1]) {
-      intentConstraints.scope = rawArgs[scopeIdx + 1].split(',').map(s => s.trim());
-    }
-
-    const intentTimestamp = new Date().toISOString();
-    const intentSignable = {
-      action: 'execute_task',
-      constraints: intentConstraints,
-      issuerDid: id.did,
-      subjectDid: executorDid,
-      timestamp: intentTimestamp,
-    };
-    const intentSig = Buffer.from(
-      nacl.sign.detached(Buffer.from(serializePayload(intentSignable)), id.secretKey)
-    ).toString('base64');
-
-    const intentData = {
-      intentId: 'intent_' + crypto.randomUUID(),
-      issuerDid: id.did,
-      subjectDid: executorDid,
-      action: 'execute_task',
-      constraints: intentConstraints,
-      delegationChain: [{ from: id.did, to: executorDid, attenuated: true, signature: intentSig }],
-      timestamp: intentTimestamp,
-      signature: intentSig,
-    };
-
     // Send to Platform
     const data = await signedFetch('POST', '/trade/v1/order', {
       executorDid,
@@ -5964,8 +5925,7 @@ async function cmdOrder(executorDid, capType, price) {
       description,
       version: 2,  // New version with signature
       taskRequest: taskRequest,
-      taskSignature: taskSignature,
-      intent: intentData,  // AVIP intent
+      taskSignature: taskSignature
     });
     
     // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
@@ -5991,127 +5951,6 @@ async function cmdOrder(executorDid, capType, price) {
     // Other errors
     console.error('Order creation failed:', errorMsg);
     process.exit(1);
-  }
-}
-
-// ── AVIP Commands ──
-
-async function cmdIntentInfo(orderId) {
-  if (!orderId) { console.error('Usage: atel intent-info <orderId>'); process.exit(1); }
-  try {
-    const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/intent`);
-    const data = await res.json();
-    if (!res.ok) {
-      console.log('No intent found for this order.');
-      return;
-    }
-    console.log('\n=== Intent Declaration ===');
-    console.log(`Intent ID:    ${data.intent_id}`);
-    console.log(`Action:       ${data.action}`);
-    console.log(`Issuer:       ${data.issuer_did}`);
-    console.log(`Subject:      ${data.subject_did}`);
-    if (data.max_amount) console.log(`Max Amount:   $${data.max_amount}`);
-    if (data.deadline) console.log(`Deadline:     ${data.deadline}`);
-    if (data.scope) console.log(`Scope:        ${JSON.parse(data.scope).join(', ')}`);
-    console.log(`Milestones:   ${data.milestone_count}`);
-    console.log(`Status:       ${data.status}`);
-    console.log(`Anchor:       ${data.anchor_status}${data.anchor_tx ? ' tx=' + data.anchor_tx : ''}`);
-    console.log(`Created:      ${data.created_at}`);
-  } catch (e) {
-    console.error('Failed to fetch intent:', e.message);
-  }
-}
-
-async function cmdCompletionProof(orderId) {
-  if (!orderId) { console.error('Usage: atel completion-proof <orderId>'); process.exit(1); }
-  try {
-    const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/completion-proof`);
-    const data = await res.json();
-    if (!res.ok) {
-      console.log('No completion proof found for this order.');
-      return;
-    }
-    console.log('\n=== Completion Proof ===');
-    console.log(`Proof ID:     ${data.proof_id}`);
-    console.log(`Intent ID:    ${data.intent_id}`);
-    console.log(`Verdict:      ${data.verdict}`);
-    console.log(`Milestones:   ${data.milestones_completed}/${data.milestones_expected}`);
-    console.log(`Rate:         ${(data.completion_rate * 100).toFixed(1)}%`);
-    console.log(`Budget:       ${data.within_budget ? '✅ Within' : '❌ Exceeded'}`);
-    console.log(`Scope:        ${data.within_scope ? '✅ Within' : '❌ Exceeded'} (${data.scope_check_type})`);
-    console.log(`Deadline:     ${data.within_deadline ? '✅ Within' : '❌ Exceeded'}`);
-    console.log(`Anchor:       ${data.anchor_status}${data.anchor_tx ? ' tx=' + data.anchor_tx : ''}`);
-    console.log(`Intent Hash:  ${data.intent_hash}`);
-    console.log(`Exec Hash:    ${data.execution_hash}`);
-  } catch (e) {
-    console.error('Failed to fetch completion proof:', e.message);
-  }
-}
-
-async function cmdVerifyTx(txHash) {
-  if (!txHash) { console.error('Usage: atel verify-tx <txHash>'); process.exit(1); }
-  try {
-    if (!txHash.startsWith('0x')) txHash = '0x' + txHash;
-    const res = await fetch(`${PLATFORM_URL}/verify/v1/tx/${txHash}`);
-    const data = await res.json();
-    if (!res.ok) {
-      console.log(data.error || 'No record found for this transaction hash.');
-      return;
-    }
-    const records = data.records || [];
-    const order = data.order;
-
-    for (const r of records) {
-      console.log('\n=== On-Chain Record ===');
-      console.log(`Transaction:  ${r.txHash || '-'}`);
-      console.log(`Chain:        ${r.chain || '-'}`);
-      console.log(`Type:         ${(r.operationType || '-').replace(/_/g, ' ')}`);
-      console.log(`Order:        ${r.orderId || '-'}`);
-      console.log(`Anchor Key:   ${r.anchorKey || '-'}`);
-      console.log(`Status:       ${r.status || '-'}`);
-      if (r.createdAt) console.log(`Created:      ${r.createdAt}`);
-
-      if (r.enrichedData) {
-        console.log('\n--- Enriched Data ---');
-        const ed = r.enrichedData;
-        if (ed.executorDid) console.log(`  Executor:     ${ed.executorDid}`);
-        if (ed.requesterDid) console.log(`  Requester:    ${ed.requesterDid}`);
-        if (ed.capability) console.log(`  Capability:   ${ed.capability}`);
-        if (ed.priceAmount != null) console.log(`  Amount:       $${ed.priceAmount}`);
-        if (ed.title) console.log(`  Title:        ${ed.title}`);
-        if (ed.milestoneIndex != null) console.log(`  Milestone:    #${ed.milestoneIndex}`);
-        if (ed.resultSummary) console.log(`  Result:       ${ed.resultSummary.slice(0, 100)}${ed.resultSummary.length > 100 ? '...' : ''}`);
-        if (ed.submittedAt) console.log(`  Submitted:    ${ed.submittedAt}`);
-        if (ed.verifiedAt) console.log(`  Verified:     ${ed.verifiedAt}`);
-        if (ed.eventType) console.log(`  Event:        ${ed.eventType}`);
-        if (ed.scoreDelta != null) console.log(`  Score Delta:  ${ed.scoreDelta > 0 ? '+' : ''}${ed.scoreDelta}`);
-        if (ed.scoreAfter != null) console.log(`  Score After:  ${ed.scoreAfter}`);
-      }
-
-      if (r.verification) {
-        const v = r.verification;
-        console.log('\n--- Hash Verification ---');
-        console.log(`  Stored Hash:    ${v.dataHashStored || '-'}`);
-        if (v.dataHashRecomputed) console.log(`  Recomputed:     ${v.dataHashRecomputed}`);
-        if (v.match != null) console.log(`  Match:          ${v.match ? '✅ Verified' : '❌ Mismatch'}`);
-        console.log(`  ${v.message}`);
-      }
-    }
-
-    if (order) {
-      console.log('\n=== Associated Order ===');
-      console.log(`Order:        ${order.orderId}`);
-      console.log(`Status:       ${order.status}`);
-      console.log(`Chain:        ${order.chain}`);
-      console.log(`Amount:       $${order.priceAmount}`);
-      console.log(`Capability:   ${order.capabilityType}`);
-      console.log(`Executor:     ${order.executorDid}`);
-      console.log(`Requester:    ${order.requesterDid}`);
-      if (order.verdict) console.log(`Verdict:      ${order.verdict}`);
-      console.log(`Chain Records: ${order.totalChainRecords}`);
-    }
-  } catch (e) {
-    console.error('Failed to verify transaction:', e.message);
   }
 }
 
@@ -6593,7 +6432,7 @@ async function cmdMilestoneFeedback(orderId) {
 
   if (!approve && !feedback) {
     console.error('Usage: atel milestone-feedback <orderId> --approve');
-    console.error('       atel milestone-feedback <orderId> --feedback "修改意见"');
+    console.error('       atel milestone-feedback <orderId> --feedback "feedback text"');
     process.exit(1);
   }
 
@@ -6604,7 +6443,7 @@ async function cmdMilestoneFeedback(orderId) {
 
 async function cmdMilestoneSubmit(orderId, indexStr) {
   if (!orderId || indexStr === undefined) {
-    console.error('Usage: atel milestone-submit <orderId> <index> --result "结果描述" [--file <path>]');
+    console.error('Usage: atel milestone-submit <orderId> <index> --result "result summary" [--file <path>]');
     console.error('       atel milestone-submit <orderId> <index> --result ./file.pdf [--hash 0x...] [--file <path>]');
     process.exit(1);
   }
@@ -6676,7 +6515,7 @@ async function cmdMilestoneSubmit(orderId, indexStr) {
 async function cmdMilestoneVerify(orderId, indexStr) {
   if (!orderId || indexStr === undefined) {
     console.error('Usage: atel milestone-verify <orderId> <index> --pass');
-    console.error('       atel milestone-verify <orderId> <index> --reject "原因"');
+    console.error('       atel milestone-verify <orderId> <index> --reject "reason"');
     process.exit(1);
   }
   const pass = rawArgs.includes('--pass');
@@ -8211,10 +8050,6 @@ const commands = {
   'milestone-verify': () => cmdMilestoneVerify(args[0], args[1]),
   'milestone-arbitrate': () => cmdMilestoneArbitrate(args[0], args[1]),
   'chain-records': () => cmdChainRecords(args[0]),
-  // AVIP
-  'intent-info': () => cmdIntentInfo(args[0]),
-  'completion-proof': () => cmdCompletionProof(args[0]),
-  'verify-tx': () => cmdVerifyTx(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
@@ -8433,7 +8268,7 @@ const commands = {
             const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ chat_id: target.target, text: '🔔 ATEL 通知测试\n如果你看到这条消息，说明通知已正确配置！' }),
+              body: JSON.stringify({ chat_id: target.target, text: '🔔 ATEL notification test\nIf you can see this message, notifications are configured correctly!' }),
               signal: AbortSignal.timeout(10000),
             });
             const data = await resp.json();
