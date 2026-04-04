@@ -6048,6 +6048,73 @@ async function cmdCompletionProof(orderId) {
   }
 }
 
+async function cmdVerifyTx(txHash) {
+  if (!txHash) { console.error('Usage: atel verify-tx <txHash>'); process.exit(1); }
+  try {
+    if (!txHash.startsWith('0x')) txHash = '0x' + txHash;
+    const res = await fetch(`${PLATFORM_URL}/verify/v1/tx/${txHash}`);
+    const data = await res.json();
+    if (!res.ok) {
+      console.log(data.error || 'No record found for this transaction hash.');
+      return;
+    }
+    const records = data.records || [];
+    const order = data.order;
+
+    for (const r of records) {
+      console.log('\n=== On-Chain Record ===');
+      console.log(`Transaction:  ${r.txHash || '-'}`);
+      console.log(`Chain:        ${r.chain || '-'}`);
+      console.log(`Type:         ${(r.operationType || '-').replace(/_/g, ' ')}`);
+      console.log(`Order:        ${r.orderId || '-'}`);
+      console.log(`Anchor Key:   ${r.anchorKey || '-'}`);
+      console.log(`Status:       ${r.status || '-'}`);
+      if (r.createdAt) console.log(`Created:      ${r.createdAt}`);
+
+      if (r.enrichedData) {
+        console.log('\n--- Enriched Data ---');
+        const ed = r.enrichedData;
+        if (ed.executorDid) console.log(`  Executor:     ${ed.executorDid}`);
+        if (ed.requesterDid) console.log(`  Requester:    ${ed.requesterDid}`);
+        if (ed.capability) console.log(`  Capability:   ${ed.capability}`);
+        if (ed.priceAmount != null) console.log(`  Amount:       $${ed.priceAmount}`);
+        if (ed.title) console.log(`  Title:        ${ed.title}`);
+        if (ed.milestoneIndex != null) console.log(`  Milestone:    #${ed.milestoneIndex}`);
+        if (ed.resultSummary) console.log(`  Result:       ${ed.resultSummary.slice(0, 100)}${ed.resultSummary.length > 100 ? '...' : ''}`);
+        if (ed.submittedAt) console.log(`  Submitted:    ${ed.submittedAt}`);
+        if (ed.verifiedAt) console.log(`  Verified:     ${ed.verifiedAt}`);
+        if (ed.eventType) console.log(`  Event:        ${ed.eventType}`);
+        if (ed.scoreDelta != null) console.log(`  Score Delta:  ${ed.scoreDelta > 0 ? '+' : ''}${ed.scoreDelta}`);
+        if (ed.scoreAfter != null) console.log(`  Score After:  ${ed.scoreAfter}`);
+      }
+
+      if (r.verification) {
+        const v = r.verification;
+        console.log('\n--- Hash Verification ---');
+        console.log(`  Stored Hash:    ${v.dataHashStored || '-'}`);
+        if (v.dataHashRecomputed) console.log(`  Recomputed:     ${v.dataHashRecomputed}`);
+        if (v.match != null) console.log(`  Match:          ${v.match ? '✅ Verified' : '❌ Mismatch'}`);
+        console.log(`  ${v.message}`);
+      }
+    }
+
+    if (order) {
+      console.log('\n=== Associated Order ===');
+      console.log(`Order:        ${order.orderId}`);
+      console.log(`Status:       ${order.status}`);
+      console.log(`Chain:        ${order.chain}`);
+      console.log(`Amount:       $${order.priceAmount}`);
+      console.log(`Capability:   ${order.capabilityType}`);
+      console.log(`Executor:     ${order.executorDid}`);
+      console.log(`Requester:    ${order.requesterDid}`);
+      if (order.verdict) console.log(`Verdict:      ${order.verdict}`);
+      console.log(`Chain Records: ${order.totalChainRecords}`);
+    }
+  } catch (e) {
+    console.error('Failed to verify transaction:', e.message);
+  }
+}
+
 async function cmdOrderInfo(orderId) {
   if (!orderId) { console.error('Usage: atel order-info <orderId>'); process.exit(1); }
   const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`);
@@ -8147,6 +8214,7 @@ const commands = {
   // AVIP
   'intent-info': () => cmdIntentInfo(args[0]),
   'completion-proof': () => cmdCompletionProof(args[0]),
+  'verify-tx': () => cmdVerifyTx(args[0]),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
