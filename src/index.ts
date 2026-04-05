@@ -34,3 +34,6 @@ export * from './audit/index.js';
 
 // ── Attachment Module ────────────────────────────────────────
 export * from './attachment/index.js';
+
+// ── AVIP (Verifiable Intent Protocol) ───────────────────────
+export * from './intent/index.js';

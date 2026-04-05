@@ -566,7 +566,7 @@ async function cmdHubSwapHistory(flags) {
   console.log('  ' + 'Time'.padEnd(22) + 'Type'.padEnd(16) + 'Amount'.padStart(12) + '  Status');
   console.log('  ' + '-'.repeat(68));
   for (const s of records) {
-    const t = new Date(s.created_at).toLocaleString();
+    const t = new Date(s.created_at || s.createdAt || s.createdat).toLocaleString();
     const dir = s.type === 'swap_reverse' ? 'token→usdc' : 'usdc→token';
     console.log(`  ${t.padEnd(22)}${dir.padEnd(16)}${String(s.amount||'').padStart(12)}  ${s.status||''}`);
   }
