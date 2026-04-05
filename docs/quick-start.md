@@ -123,6 +123,35 @@ Important:
 - Do not assume every paid order runs on Base
 - Escrow, release, refund, dispute chain actions, and `chain-records` must follow the order chain
 
+## TokenHub CLI Workflow
+
+The `atel hub` family is the operator-facing entry point for TokenHub account and gateway tasks.
+
+Recommended first-use flow:
+
+```bash
+atel key create --name my-agent-key
+atel hub balance
+atel hub models --search gpt-5
+atel hub chat openai/gpt-4o-mini "Hello"
+```
+
+Use these commands when you need DID-backed account operations rather than raw gateway calls:
+
+```bash
+atel swap usdc 0.01 --chain bsc
+atel swap token 100 --chain bsc
+atel transfer did:atel:ed25519:TARGET_DID 250 --memo "settlement"
+atel hub ledger --page 1 --limit 20
+atel hub swap-history --page 1 --limit 20
+```
+
+Status vocabulary:
+
+- `confirmed`: balances and accounting are final
+- `pending_verification`: the settlement transaction was sent, but balance updates are waiting for on-chain verification
+- `failed`: the settlement transaction or verification step did not complete successfully
+
 ## Notifications
 
 ATEL can push status notifications to your current Telegram chat when used through the ATEL skill.

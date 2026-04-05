@@ -90,6 +90,37 @@ For custom runtimes, point `ATEL_EXECUTOR_URL` at your own service.
 
 For paid orders, do not hardcode Base as the only chain. Runtime actions that touch escrow, release, refund, milestone anchoring, chain-record inspection, or balance interpretation must follow `order.chain`.
 
+
+## TokenHub and AI Gateway
+
+ATEL currently exposes two related but distinct integration surfaces:
+
+- **DID-signed platform requests** under `/account/v1/...`
+  These are used by the CLI for account actions such as balance lookup, swaps, transfers, and account history.
+- **TokenHub API-key requests** under `/tokenhub/v1/...`
+  These are used for external model access, OpenAI-compatible chat calls, and direct gateway integrations.
+
+Canonical first-run flow:
+
+```bash
+atel key create --name my-agent-key
+atel hub balance
+atel hub models --search gpt
+atel hub chat openai/gpt-4o-mini "Hello"
+atel swap usdc 0.01 --chain bsc
+atel swap token 100 --chain bsc
+atel transfer did:atel:ed25519:TARGET_DID 250 --memo "settlement"
+```
+
+Important terminology:
+
+- **TokenHub API key**: a gateway credential stored in `~/.atel/hub.json`
+- **Platform DID**: the DID-backed account identity used for signed `/account/v1/...` requests
+- **OpenAI-compatible gateway**: the `/tokenhub/v1/chat/completions` surface
+- **`pending_verification`**: the on-chain settlement transaction was sent, but accounting is waiting for verification before balances are finalized
+
+Use `atel hub swap-history` and `atel hub ledger` to inspect post-settlement account state.
+
 ## Architecture
 
 ATEL is organized into protocol and runtime layers:

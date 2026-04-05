@@ -173,24 +173,29 @@ async function cmdHubSwap(direction, amountStr, flags) {
     console.error('Swap failed:', data.error || JSON.stringify(data));
     process.exit(1);
   }
+  const status = String(data.status || '').toLowerCase();
+  const pendingVerification = status === 'pending_verification' || status === 'pending';
   if (dir === 'usdc') {
-    console.log('✓ Swap successful (USDC → ATELToken)');
+    console.log(`${pendingVerification ? '↺' : '✓'} Swap ${pendingVerification ? 'submitted' : 'successful'} (USDC → ATELToken)`);
     console.log(`  USDC spent:          $${amount.toFixed(6)}`);
-    console.log(`  ATELToken received:  ${(data.token_amount||0).toLocaleString()}`);
+    console.log(`  ATELToken expected:  ${(data.token_amount||0).toLocaleString()}`);
     console.log(`  Settlement tx:       ${data.settlement_tx_hash || 'N/A'}`);
     console.log(`  Status:              ${data.status}`);
   } else {
-    console.log('✓ Swap successful (ATELToken → USDC)');
+    console.log(`${pendingVerification ? '↺' : '✓'} Swap ${pendingVerification ? 'submitted' : 'successful'} (ATELToken → USDC)`);
     console.log(`  ATELToken spent:     ${amount.toLocaleString()}`);
-    console.log(`  USDC received:       $${parseFloat(data.usdc_amount||0).toFixed(6)}`);
+    console.log(`  USDC expected:       $${parseFloat(data.usdc_amount||0).toFixed(6)}`);
     console.log(`  Settlement tx:       ${data.settlement_tx_hash || 'N/A'}`);
     console.log(`  Status:              ${data.status}`);
   }
-  if (data.status === 'pending') {
-    console.log('  Note: Settlement pending, will complete shortly.');
+  if (pendingVerification) {
+    console.log(`  Note:                ${data.note || 'Accounting will update after on-chain verification.'}`);
+    console.log('');
+    console.log('Run `atel hub swap-history --limit 5` to monitor settlement status.');
+    return;
   }
   console.log('');
-  console.log('Run `atel hub balance` to check your ATELToken balance.');
+  console.log('Run `atel hub balance` to review updated balances.');
 }
 
 async function cmdHubBalance() {
@@ -261,62 +266,81 @@ async function cmdHubUsage(flags) {
 }
 
 
+async function createHubKeyViaDidBootstrap(name) {
+  const { readFileSync } = await import('fs');
+  const nacl = await import('tweetnacl');
+  const idPath = join(ATEL_DIR, 'identity.json');
+  if (!existsSync(idPath)) {
+    console.error('No identity. Run: atel init');
+    process.exit(1);
+  }
+  const identity = JSON.parse(readFileSync(idPath, 'utf-8'));
+  const did = identity.did;
+  const secretKeyHex = identity.secretKey;
+  const secretKey = Buffer.from(secretKeyHex, 'hex');
+  const platformBase = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+  const timestamp = new Date().toISOString();
+  const payload = { name };
+  const signInput = JSON.stringify({ did, payload, timestamp });
+  const signature = Buffer.from(nacl.default.sign.detached(Buffer.from(signInput), secretKey)).toString('base64');
+  const body = JSON.stringify({ did, payload, timestamp, signature });
+  const res = await fetch(platformBase + '/tokenhub/internal/apikeys', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(30000),
+  });
+  const data = await res.json();
+  const base = data.base || process.env.ATEL_HUB_BASE || DEFAULT_BASE;
+  if (!res.ok || data.error) {
+    const errCode = data?.error?.code || data?.code || data?.error_code;
+    const errMsg = data?.error?.message || data?.message || (typeof data?.error === 'string' ? data.error : JSON.stringify(data));
+    console.error('Hub key bootstrap failed:', errMsg);
+    if (errCode === 'PLATFORM_DID_NOT_REGISTERED') {
+      console.error('');
+      console.error(MISSING_PLATFORM_DID_GUIDANCE);
+    }
+    process.exit(1);
+  }
+  return { data, base };
+}
+
 async function cmdHubKeyCreate(flags) {
   const nameIdx = flags.indexOf('--name');
   const name = nameIdx !== -1 && flags[nameIdx + 1] ? flags[nameIdx + 1] : 'default';
 
   let data;
   let base = process.env.ATEL_HUB_BASE || DEFAULT_BASE;
+  let usedBootstrap = false;
 
   if (existsSync(HUB_CONFIG_PATH)) {
-    const res = await hubFetch('/apikeys', {
-      method: 'POST',
-      body: JSON.stringify({ name }),
-    });
-    data = await res.json();
-    base = data.base || getConfig().base || base;
+    try {
+      const res = await hubFetch('/apikeys', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      });
+      data = await res.json();
+      base = data.base || getConfig().base || base;
+    } catch (err) {
+      const code = err?.code || '';
+      const message = String(err?.message || '');
+      const shouldFallback = code === 'INVALID_API_KEY' || /invalid or revoked api key/i.test(message) || /unauthorized/i.test(message);
+      if (!shouldFallback) throw err;
+      ({ data, base } = await createHubKeyViaDidBootstrap(name));
+      usedBootstrap = true;
+    }
   } else {
-    const { readFileSync } = await import('fs');
-    const nacl = await import('tweetnacl');
-    const idPath = join(ATEL_DIR, 'identity.json');
-    if (!existsSync(idPath)) {
-      console.error('No identity. Run: atel init');
-      process.exit(1);
-    }
-    const identity = JSON.parse(readFileSync(idPath, 'utf-8'));
-    const did = identity.did;
-    const secretKeyHex = identity.secretKey;
-    const secretKey = Buffer.from(secretKeyHex, 'hex');
-    const platformBase = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
-    const timestamp = new Date().toISOString();
-    const payload = { name };
-    const signInput = JSON.stringify({ did, payload, timestamp });
-    const signature = Buffer.from(nacl.default.sign.detached(Buffer.from(signInput), secretKey)).toString('base64');
-    const body = JSON.stringify({ did, payload, timestamp, signature });
-    const res = await fetch(platformBase + '/tokenhub/internal/apikeys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-      signal: AbortSignal.timeout(30000),
-    });
-    data = await res.json();
-    base = data.base || base;
-    if (!res.ok || data.error) {
-      const errCode = data?.error?.code || data?.code || data?.error_code;
-      const errMsg = data?.error?.message || data?.message || (typeof data?.error === 'string' ? data.error : JSON.stringify(data));
-      console.error('Hub key bootstrap failed:', errMsg);
-      if (errCode === 'PLATFORM_DID_NOT_REGISTERED') {
-        console.error('');
-        console.error(MISSING_PLATFORM_DID_GUIDANCE);
-      }
-      process.exit(1);
-    }
+    ({ data, base } = await createHubKeyViaDidBootstrap(name));
+    usedBootstrap = true;
   }
 
-  console.log('API Key created:');
+  console.log('TokenHub API key created:');
   console.log('  ' + data.key);
   console.log('');
-  console.log('This key will NOT be shown again. Save it securely.');
+  console.log('The full secret is shown only once. Save it in a secure secrets manager.');
+  if (usedBootstrap) {
+    console.log('Bootstrap path: DID-signed platform bootstrap was used.');
+  }
   console.log(`Saving to ${HUB_CONFIG_PATH} ...`);
   const identityPath = join(ATEL_DIR, 'identity.json');
   let extras = {};
@@ -617,7 +641,8 @@ export async function cmdHub(sub, args, rawArgs) {
           case 'revoke': return await cmdHubKeyRevoke(args[1]);
           case 'use':    return await cmdHubKeyUse();
           default:
-            console.log('Usage: atel hub key <create|list|revoke|use>');
+            console.log('Usage: atel key <create|list|revoke|use>');
+            console.log('   or: atel hub key <create|list|revoke|use>');
             process.exit(1);
         }
         break;
@@ -627,18 +652,23 @@ export async function cmdHub(sub, args, rawArgs) {
 atel hub -- AI model access (TokenHub)
 
 Commands:
-  atel hub balance                                       Show USDC + ATELToken balance
-  atel hub dashboard                                     Dashboard summary
-  atel hub usage [--model <id>] [--days 7] [--page N]    Usage history
-  atel hub ledger [--page N] [--limit N]                 Transaction ledger
-  atel hub swap-history [--page N] [--limit N]           Swap history
-  atel hub stats                                         Usage stats (24h)
+  atel key create [--name <name>]                        Create and save a TokenHub API key
+  atel key list                                          List TokenHub API keys
+  atel key revoke <id>                                   Revoke a TokenHub API key
+  atel key use                                           Print OpenAI-compatible env exports
+
+  atel hub balance                                       Show USDC and ATELToken balances
+  atel hub dashboard                                     Show a compact TokenHub account summary
+  atel hub usage [--model <id>] [--days 7] [--page N]    Show model usage history
+  atel hub ledger [--page N] [--limit N]                 Show account transaction records
+  atel hub swap-history [--page N] [--limit N]           Show swap records
+  atel hub stats                                         Show public TokenHub statistics
   atel hub models [--search <kw>]                        List available models
-  atel hub chat <model> "<prompt>" [--stream]            Quick chat
-  atel hub key create [--name <name>]                    Create API key
-  atel hub key list                                      List API keys
-  atel hub key revoke <id>                               Revoke a key
-  atel hub key use                                       Output env vars for external tools
+  atel hub chat <model> "<prompt>" [--stream]            Send a quick chat request
+  atel hub key create [--name <name>]                    Create a TokenHub API key
+  atel hub key list                                      List TokenHub API keys
+  atel hub key revoke <id>                               Revoke a TokenHub API key
+  atel hub key use                                       Print OpenAI-compatible env exports
 
 Platform account commands:
   atel swap usdc <amount> [--chain bsc|base]             Swap USDC -> ATELToken
