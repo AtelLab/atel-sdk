@@ -650,197 +650,69 @@ Agent 钱包:
 
 ---
 
-## TokenHub — AI Token 经济层
+## TokenHub — AI Gateway and Account Operations
 
-ATEL TokenHub 是 Agent 的 **Token 消费层**。用 ATELToken 调用 AI 模型，无需每次操作链上钱包。
+ATEL TokenHub is the account and AI access layer for DID-backed ATEL accounts.
 
-> **兑换率：** 1 USDC = 10,000 ATELToken。Token 在 ATEL 生态内流通，不可直接提现到外部钱包。
+Use the terminology below consistently:
 
----
+- **Platform DID request**: a DID-signed request sent to `/account/v1/...`
+- **TokenHub API key request**: an API-key-authenticated request sent to `/tokenhub/v1/...`
+- **OpenAI-compatible gateway**: the `/tokenhub/v1/chat/completions` surface
+- **`pending_verification`**: a settlement transaction was submitted on-chain, but accounting is waiting for verification before balances are finalized
 
-## 环境变量配置
+### Canonical CLI Entry Points
 
-使用前先设置（替换为实际值）：
+```bash
+atel key create --name my-agent-key
+atel hub balance
+atel hub dashboard
+atel hub models --search gpt
+atel hub chat openai/gpt-4o-mini "Hello"
+atel swap usdc 0.01 --chain bsc
+atel swap token 100 --chain bsc
+atel transfer did:atel:ed25519:TARGET_DID 250 --memo "settlement"
+```
+
+### Raw HTTP Reference
 
 ```bash
 export TOKENHUB=https://api.atelai.org
 export API_KEY=sk-atel-YOUR_KEY
-```
 
----
+curl $TOKENHUB/tokenhub/v1/balance   -H "Authorization: Bearer $API_KEY"
 
-## 获取 TokenHub API Key
+curl $TOKENHUB/tokenhub/v1/models   -H "Authorization: Bearer $API_KEY"
 
-TokenHub 使用独立 API Key 鉴权（不是 DID 签名）。通过以下接口创建：
-
-```bash
-# 创建 API Key
-curl -X POST $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "my-agent-key"}'
-
-# 列出所有 Key
-curl $TOKENHUB/tokenhub/v1/apikeys \
-  -H "Authorization: Bearer $API_KEY"
-
-# 撤销 Key
-curl -X DELETE $TOKENHUB/tokenhub/v1/apikeys/{id} \
-  -H "Authorization: Bearer $API_KEY"
-```
-
-> Key 只在创建时显示一次，请保存好。
-
----
-
-## 查余额 / 用量 / 账本
-
-```bash
-# Token 余额
-curl $TOKENHUB/tokenhub/v1/balance \
-  -H "Authorization: Bearer $API_KEY"
-
-# 消费记录（分页）
-curl "$TOKENHUB/tokenhub/v1/usage?page=1&limit=20" \
-  -H "Authorization: Bearer $API_KEY"
-
-# 完整账本（所有充值/消费流水）
-curl $TOKENHUB/tokenhub/v1/ledger \
-  -H "Authorization: Bearer $API_KEY"
-
-# 总览 Dashboard
-curl $TOKENHUB/tokenhub/v1/dashboard \
-  -H "Authorization: Bearer $API_KEY"
-# 返回: {"balance": 50000, "total_spent": 12000, "total_topup": 100000, ...}
-```
-
----
-
-## 调用 AI 模型（OpenAI 兼容）
-
-TokenHub 提供 **OpenAI 兼容**的 `/chat/completions` 接口，任何 OpenAI SDK 直接替换 base_url 即可使用：
-
-```bash
-# 普通调用
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
+curl $TOKENHUB/tokenhub/v1/chat/completions   -H "Authorization: Bearer $API_KEY"   -H "Content-Type: application/json"   -d '{
     "model": "openai/gpt-4o-mini",
-    "messages": [{"role": "user", "content": "你好！"}]
+    "messages": [{"role": "user", "content": "Hello!"}]
   }'
-
-# 流式输出
-curl $TOKENHUB/tokenhub/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "meta-llama/llama-3.1-8b-instruct", "messages": [...], "stream": true}'
-
-# 查看可用模型
-curl $TOKENHUB/tokenhub/v1/models \
-  -H "Authorization: Bearer $API_KEY"
 ```
 
-**Python SDK 示例：**
-```python
-from openai import OpenAI
-client = OpenAI(
-    base_url="https://platform.atel.network/tokenhub/v1",
-    api_key="sk-atel-YOUR_KEY"
-)
-resp = client.chat.completions.create(
-    model="openai/gpt-4o-mini",
-    messages=[{"role": "user", "content": "你好！"}]
-)
-```
+### Swap Status Semantics
 
----
+- `confirmed`: settlement succeeded and accounting is final
+- `pending_verification`: settlement was submitted and accounting is waiting for verification
+- `failed`: settlement or verification failed
 
-## Token 兑换（Swap）
+### Gateway Endpoint Reference
 
-当前 CLI 已统一使用平台 canonical swap 语义：
-
-```bash
-# USDC → ATELToken
-atel swap usdc 0.01 --chain bsc
-
-# ATELToken → USDC
-atel swap token 100 --chain bsc
-```
-
-CLI 发出的统一请求体为：
-
-```json
-{"from":"usdc","to":"token","amount":0.01,"chain":"bsc"}
-{"from":"token","to":"usdc","amount":100,"chain":"bsc"}
-```
-
-所有新的 swap 接入都应直接使用这套 `{from,to,amount,chain}` 规范。
-
----
-
-## Token 转账（P2P）
-
-将 ATELToken 直接发给另一个 Agent：
-
-```bash
-curl -X POST $TOKENHUB/tokenhub/v1/transfer \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "to_did": "did:atel:ed25519:对方DID",
-    "amount": 5000,
-    "memo": "翻译任务酬劳",
-    "idempotency_key": "unique-key-001"
-  }'
-# 返回: {"ok": true, "transfer_id": "...", "amount": 5000}
-
-# 转账历史
-curl $TOKENHUB/tokenhub/v1/transfers \
-  -H "Authorization: Bearer $API_KEY"
-```
-
----
-
-## TokenHub 速查表
-
-### 外部接口（API Key 鉴权）
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/tokenhub/v1/balance` | GET | Token 余额 + USDC 等值 |
-| `/tokenhub/v1/usage` | GET | 消费历史 |
-| `/tokenhub/v1/ledger` | GET | 完整账本流水 |
-| `/tokenhub/v1/dashboard` | GET | 总览 Dashboard |
-| `/tokenhub/v1/models` | GET | 可用 AI 模型列表 |
-| `/tokenhub/v1/chat/completions` | POST | 调用 AI 模型（OpenAI 兼容）|
-| `/tokenhub/v1/swap` | POST | Token ↔ USDC 兑换 |
-| `/tokenhub/v1/swap/history` | GET | 兑换历史 |
-| `/tokenhub/v1/transfer` | POST | P2P Token 转账 |
-| `/tokenhub/v1/transfers` | GET | 转账历史 |
-| `/tokenhub/v1/apikeys` | POST/GET | 创建/列出 API Key |
-| `/tokenhub/v1/apikeys/{id}` | DELETE | 撤销 API Key |
-| `/tokenhub/v1/stats` | GET | 公开经济统计数据 |
-
-### 错误码说明
-
-| 错误码 | 含义 | 处理方式 |
-|--------|------|----------|
-| `INSUFFICIENT_BALANCE` | Token 余额不足 | 联系运营充值 |
-| `OVERDRAFT_BLOCKED` | 账户透支被锁 | 联系运营处理 |
-| `MODEL_NOT_FOUND` | 模型不可用 | 查 `/v1/models` 确认可用模型 |
-| `CONTEXT_LIMIT` | 输入超过上下文窗口 | 缩短 messages |
-| `RATE_LIMITED` | 请求过频 | 等待后重试 |
-
-### Token 经济参数
-
-| 参数 | 值 |
-|------|----|
-| 1 USDC | 10,000 ATELToken |
-| Swap 手续费 | 5%（500 bps）|
-| 最小提现 | 1,000 Token |
-| 速率限制 | 60 次/分钟 |
-
----
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/tokenhub/v1/balance` | GET | API-key-authenticated balance lookup |
+| `/tokenhub/v1/usage` | GET | Usage history |
+| `/tokenhub/v1/ledger` | GET | Full gateway ledger |
+| `/tokenhub/v1/dashboard` | GET | Compact account summary |
+| `/tokenhub/v1/models` | GET | Available model catalog |
+| `/tokenhub/v1/chat/completions` | POST | OpenAI-compatible model call |
+| `/tokenhub/v1/swap` | POST | Raw gateway swap API |
+| `/tokenhub/v1/swap/history` | GET | Raw gateway swap history |
+| `/tokenhub/v1/transfer` | POST | Raw gateway transfer API |
+| `/tokenhub/v1/transfers` | GET | Raw gateway transfer history |
+| `/tokenhub/v1/apikeys` | POST/GET | Create or list API keys |
+| `/tokenhub/v1/apikeys/{id}` | DELETE | Revoke an API key |
+| `/tokenhub/v1/stats` | GET | Public TokenHub statistics |
 
 ## AVIP — 可验证意图执行协议
 

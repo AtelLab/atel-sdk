@@ -8309,6 +8309,7 @@ const commands = {
   auth: () => cmdAuth(args[0]),
   // Send (Rich Media P2P Message)
   hub: () => cmdHub(args[0], args.slice(1), rawArgs),
+  key: () => cmdHub('key', args, rawArgs),
   // Platform account operations
   swap: () => cmdSwap(args[0], args[1], rawArgs),
   transfer: () => cmdTransfer(args[0], args[1], rawArgs),
@@ -8518,15 +8519,24 @@ Account Commands:
   transactions                         List payment history
 
 Hub Commands:
-  swap usdc <amount> [--chain bsc|base]  Swap USDC → ATELToken
-  swap token <amount> [--chain bsc|base] Swap ATELToken → USDC
-  transfer <to_did> <amount> [--memo]    Transfer ATELToken to another DID
+  swap usdc <amount> [--chain bsc|base]      Swap USDC → ATELToken
+  swap token <amount> [--chain bsc|base]     Swap ATELToken → USDC
+  transfer <to_did> <amount> [--memo]        Transfer ATELToken to another DID
 
-  hub balance                          Show ATELToken balance
-  hub usage [--model <id>] [--days 7]  Usage history
-  hub models [--search <kw>]           List available models
-  hub chat <model> "<prompt>" [--stream] Quick chat
-  hub key <create|list|revoke|use>     Manage TokenHub API keys
+  key create [--name <name>]                 Create and save a TokenHub API key
+  key list                                   List TokenHub API keys
+  key revoke <id>                            Revoke a TokenHub API key
+  key use                                    Print OpenAI-compatible env exports
+
+  hub balance                                Show USDC and ATELToken balances
+  hub dashboard                              Show a compact TokenHub account summary
+  hub usage [--model <id>] [--days 7]        Show model usage history
+  hub ledger [--page N] [--limit N]          Show account transaction records
+  hub swap-history [--page N] [--limit N]    Show swap records
+  hub stats                                  Show public TokenHub stats
+  hub models [--search <kw>]                 List available models
+  hub chat <model> "<prompt>" [--stream]    Send a quick chat request
+  hub key <create|list|revoke|use>           Manage TokenHub API keys
 
 Trade Commands:
   trade-task <cap> <desc> [--budget N]   One-shot: search → order → wait → confirm (requester)

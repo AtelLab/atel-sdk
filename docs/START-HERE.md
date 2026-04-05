@@ -5,7 +5,7 @@ This is the single-page entrypoint for external teams.
 ## 0) Install
 
 ```bash
-npm install @lawreneliang/atel-sdk
+npm install @lawrenceliang-btc/atel-sdk
 ```
 
 If you are evaluating from source:
@@ -104,4 +104,4 @@ Output report:
 - Quickstart detail: `docs/QUICKSTART-5MIN.md`
 - Service deploy: `docs/SERVICE-DEPLOY.md`
 - Phase 0.5 runbook: `docs/PHASE-0.5.md`
-- Skill: `skills/atel/SKILL.md`
+- Skill: `skill/SKILL.md`
