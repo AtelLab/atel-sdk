@@ -758,22 +758,24 @@ resp = client.chat.completions.create(
 
 ## Token 兑换（Swap）
 
-在平台内将 ATELToken 兑换为 USDC：
+当前 CLI 已统一使用平台 canonical swap 语义：
 
 ```bash
-# Token → USDC
-curl -X POST $TOKENHUB/tokenhub/v1/swap \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"direction": "token_to_usdc", "token_amount": 10000}'
-# 返回: {"ok": true, "usdc_micro": 950000, "token_amount": 10000, "balance_after": 40000}
+# USDC → ATELToken
+atel swap usdc 0.01 --chain bsc
 
-# 兑换历史
-curl $TOKENHUB/tokenhub/v1/swap/history \
-  -H "Authorization: Bearer $API_KEY"
+# ATELToken → USDC
+atel swap token 100 --chain bsc
 ```
 
-> 手续费：5%（500 bps）。实际到账 USDC = token_amount / 10000 × 0.95
+CLI 发出的统一请求体为：
+
+```json
+{"from":"usdc","to":"token","amount":0.01,"chain":"bsc"}
+{"from":"token","to":"usdc","amount":100,"chain":"bsc"}
+```
+
+所有新的 swap 接入都应直接使用这套 `{from,to,amount,chain}` 规范。
 
 ---
 

@@ -570,7 +570,6 @@ Why are many examples below `curl`? Because this section is also a raw API refer
 - `/dashboard`
 - `/transfer` and `/transfers`
 - `/stats`
-- `/swap` `direction=token_to_usdc` (redeem path)
 
 ---
 
@@ -656,22 +655,24 @@ resp = client.chat.completions.create(
 
 ## Step D: Swap Tokens ↔ USDC
 
-Exchange ATELToken for USDC within the platform (internal swap only):
+Current swap usage is unified to the canonical platform contract:
 
 ```bash
-# Token → USDC (redeem)
-curl -X POST $TOKENHUB/tokenhub/v1/swap \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"direction": "token_to_usdc", "token_amount": 10000}'
-# Response: {"ok": true, "direction": "token_to_usdc", "usdc_micro": 950000, "token_amount": 10000, "rate": 10000, "balance_after": 40000}
+# USDC → ATELToken
+atel swap usdc 0.01 --chain bsc
 
-# View swap history
-curl $TOKENHUB/tokenhub/v1/swap/history \
-  -H "Authorization: Bearer $API_KEY"
+# ATELToken → USDC
+atel swap token 100 --chain bsc
 ```
 
-> Fee: 5% (500 bps) on swaps. Net USDC = token_amount / rate × (1 - fee).
+Canonical request payload sent by the CLI:
+
+```json
+{"from":"usdc","to":"token","amount":0.01,"chain":"bsc"}
+{"from":"token","to":"usdc","amount":100,"chain":"bsc"}
+```
+
+Use this canonical `{from,to,amount,chain}` form for all new swap integrations.
 
 ---
 
