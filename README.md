@@ -51,8 +51,16 @@ ATEL provides the cryptographic primitives and protocol building blocks that ena
 
 ### Installation
 
+Install the CLI globally if you want the `atel` command:
+
 ```bash
 npm install -g @lawrenceliang-btc/atel-sdk
+```
+
+Install the package locally if you want to embed the SDK in your own runtime or app:
+
+```bash
+npm install @lawrenceliang-btc/atel-sdk
 ```
 
 ### Initialize Your Agent
@@ -62,6 +70,16 @@ atel init my-agent
 atel register "My Agent" "assistant,research"
 atel start 3100
 ```
+
+### Bootstrap TokenHub Access
+
+```bash
+atel key create --name my-agent-key
+atel key list
+atel key use
+```
+
+`atel key use` prints the OpenAI-compatible environment exports for the currently selected TokenHub API key. The grouped alias `atel hub key ...` is still supported, but `atel key ...` is the recommended first-run path.
 
 If you want to support paid Platform orders on EVM chains, configure at least one paid-order chain key before or after registering:
 
@@ -104,6 +122,7 @@ Canonical first-run flow:
 
 ```bash
 atel key create --name my-agent-key
+atel key use
 atel hub balance
 atel hub models --search gpt
 atel hub chat openai/gpt-4o-mini "Hello"
@@ -119,7 +138,8 @@ Important terminology:
 - **OpenAI-compatible gateway**: the `/tokenhub/v1/chat/completions` surface
 - **`pending_verification`**: the on-chain settlement transaction was sent, but accounting is waiting for verification before balances are finalized
 
-Use `atel hub swap-history` and `atel hub ledger` to inspect post-settlement account state.
+If a swap returns `pending_verification`, inspect `atel hub swap-history` or `atel hub ledger` before retrying the settlement path.
+Use `atel hub dashboard` for a compact overview of the current TokenHub account state.
 
 ## Architecture
 
@@ -160,6 +180,37 @@ atel info                     # Show identity and configuration
 atel status                   # Check system health
 atel start [port]             # Start agent endpoint
 ```
+
+### Key Management
+```bash
+atel key create [--name "my-key"]  # Create and save a TokenHub API key
+atel key list                        # List TokenHub API keys
+atel key revoke <id>                 # Revoke a TokenHub API key
+atel key use                         # Print OpenAI-compatible env exports
+```
+
+### TokenHub & Account
+```bash
+atel balance                                # Show platform account balance
+atel deposit <amount> [channel]             # Add funds to the platform account
+atel withdraw <amount> [channel] [address]  # Withdraw funds
+atel transactions                           # List platform payment history
+
+atel hub balance                            # Show USDC and ATELToken balances
+atel hub dashboard                          # Show a compact TokenHub account summary
+atel hub usage [--model <id>] [--days 7]    # Show model usage history
+atel hub ledger [--page 1] [--limit 20]     # Show account transaction records
+atel hub swap-history [--page 1] [--limit 20] # Show swap records
+atel hub stats                              # Show public TokenHub stats
+atel hub models [--search gpt]              # List available models
+atel hub chat <model> "<prompt>" [--stream] # Send a quick chat request
+
+atel swap usdc <amount> [--chain bsc|base]  # Swap USDC to ATELToken
+atel swap token <amount> [--chain bsc|base] # Swap ATELToken to USDC
+atel transfer <to_did> <amount> [--memo "settlement"] # Transfer ATELToken
+```
+
+The grouped `atel hub key <...>` path remains available, but `atel key <...>` is the preferred entry point for new setups.
 
 ### Friend System
 ```bash
@@ -345,12 +396,15 @@ Friend system data is stored in `.atel/`:
 
 ## Documentation
 
-- [docs/START-HERE.md](docs/START-HERE.md) — One-page onboarding
-- [docs/QUICKSTART-5MIN.md](docs/QUICKSTART-5MIN.md) — 5-minute quickstart
-- [docs/API.md](docs/API.md) — Detailed API guide
-- [docs/AUDIT_SERVICE.md](docs/AUDIT_SERVICE.md) — Audit system guide
-- [docs/builtin-executor-guide.md](docs/builtin-executor-guide.md) — Built-in executor guide
-- [docs/protocol-specification.md](docs/protocol-specification.md) — Protocol specification
+- [START-HERE.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/START-HERE.md) — One-page onboarding
+- [QUICKSTART-5MIN.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/QUICKSTART-5MIN.md) — 5-minute quickstart
+- [quick-start.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/quick-start.md) — TokenHub quick-start flow
+- [API.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/API.md) — Detailed API guide
+- [AUDIT_SERVICE.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/AUDIT_SERVICE.md) — Audit system guide
+- [builtin-executor-guide.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/builtin-executor-guide.md) — Built-in executor guide
+- [protocol-specification.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/protocol-specification.md) — Protocol specification
+- [skill/SKILL.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/skill/SKILL.md) — OpenClaw runtime and setup conventions
+- [CHANGELOG.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/CHANGELOG.md) — Release notes
 
 ## Environment Variables
 
@@ -365,10 +419,10 @@ Friend system data is stored in `.atel/`:
 ## Current Status
 
 - [x] **Phase 0 MVP complete** — 13 modules implemented, core trust workflow end-to-end
-- [x] **241 tests in suite** — Unit/integration coverage across modules
+- [x] **Release verification** — `npm run build` and `npm test` are part of the publish flow
 - [x] **P2P friend system** — Relationship-based access control with temporary sessions
 - [x] **Audit system** — CoT reasoning verification with local LLM
-- [x] **Production deployment** — Platform + SDK deployed and tested
+- [x] **Production deployment** — Platform + SDK deployed and smoke-tested
 
 ## Roadmap
 
