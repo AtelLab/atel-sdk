@@ -5763,7 +5763,8 @@ async function signedFetch(method, path, payload = {}) {
 // ─── Auth Command ────────────────────────────────────────────────
 
 async function cmdAuth(code) {
-  if (!code) {
+  const normalizedCode = (code || '').trim().toUpperCase();
+  if (!normalizedCode) {
     console.error('Usage: atel auth <code>');
     console.error('  Authorize a Dashboard session using the code displayed on the login page.');
     process.exit(1);
@@ -5773,7 +5774,7 @@ async function cmdAuth(code) {
   const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
 
   const ts = new Date().toISOString();
-  const payload = { code: code.toUpperCase(), did: id.did, timestamp: ts };
+  const payload = { code: normalizedCode, did: id.did, timestamp: ts };
   const signable = serializePayload({ payload, did: id.did, timestamp: ts });
   const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), id.secretKey)).toString('base64');
 
@@ -5781,7 +5782,7 @@ async function cmdAuth(code) {
     const resp = await fetch(`${ATEL_PLATFORM}/auth/v1/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: code.toUpperCase(), did: id.did, signature: sig, timestamp: ts }),
+      body: JSON.stringify({ code: normalizedCode, did: id.did, signature: sig, timestamp: ts }),
     });
     const data = await resp.json();
     if (resp.ok) {
