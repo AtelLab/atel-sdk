@@ -3438,7 +3438,20 @@ Format:
           const orderId = order?.orderId;
           if (!orderId) continue;
           seenOrderIds.add(orderId);
-          await reconcileSingleTradeOrder(order);
+          // The list endpoint returns a slim projection that omits
+          // `description` / `taskRequest`. Re-fetch the full order so
+          // reconcileSingleTradeOrder has the authoritative order
+          // description — without it ORDER_CONTEXT.md / agent prompts
+          // would be missing the original task and the LLM would
+          // hallucinate a topic from the milestone title alone.
+          let fullOrder = order;
+          try {
+            const fetched = await fetchOrderState(orderId);
+            if (fetched) fullOrder = fetched;
+          } catch (e) {
+            log({ event: 'trade_reconcile_order_fetch_error', orderId, error: e.message });
+          }
+          await reconcileSingleTradeOrder(fullOrder);
         } catch (e) {
           log({ event: 'trade_reconcile_order_error', orderId: order?.orderId, status, error: e.message });
         }
@@ -3467,7 +3480,7 @@ Format:
     const event = body.eventType || body.event;
     const payload = body.payload || {};
     const eventId = body.eventId;
-    const prompt = body.prompt || payload.prompt;
+    let prompt = body.prompt || payload.prompt;
     const recommendedActions = body.recommendedActions || payload.recommendedActions;
 
     if (!event) {
@@ -3520,7 +3533,7 @@ Format:
 
     const dedupeKey = body.dedupeKey || `${event}:${body.orderId || payload.orderId || ''}`;
     const orderIdForCwd = body.orderId || payload.orderId || '';
-    const workspace = getOrderWorkspace(orderIdForCwd, {
+    let workspace = getOrderWorkspace(orderIdForCwd, {
       chain: payload.chain || body.chain || '',
       role: payload.executorDid === id.did ? 'executor' : (payload.requesterDid === id.did ? 'requester' : ''),
       status: payload.orderStatus || body.orderStatus || '',
@@ -3533,6 +3546,55 @@ Format:
     });
     const hookCwd = workspace.dir;
     const atelCwd = getAtelWorkspaceRoot();
+
+    // ── Verifier context enrichment for milestone_submitted ──
+    // Platform-side prompt for milestone_submitted historically did not
+    // include the original order description, so the verifier LLM had no
+    // ground truth to compare against. We re-fetch the full order here so
+    // ORDER_CONTEXT.md (the LLM's authoritative source file) and the
+    // prompt both contain the original task. We do NOT impose rule
+    // checklists — judgment belongs to the agent.
+    if (event === 'milestone_submitted' && orderIdForCwd) {
+      try {
+        const fullOrder = await fetchOrderState(orderIdForCwd);
+        const fullDesc = (fullOrder?.description
+          || fullOrder?.Description
+          || fullOrder?.taskRequest?.description
+          || fullOrder?.TaskRequest?.description
+          || '');
+        if (fullDesc) {
+          workspace = getOrderWorkspace(orderIdForCwd, {
+            chain: fullOrder?.chain || fullOrder?.Chain || payload.chain || body.chain || '',
+            role: 'requester',
+            status: fullOrder?.status || fullOrder?.Status || 'executing',
+            phase: 'waiting_requester_verification',
+            currentMilestone: payload.milestoneIndex ?? '',
+            milestoneTitle: payload.milestoneDescription || '',
+            orderDescription: fullDesc,
+            milestoneObjective: payload.milestoneDescription || '',
+            resultSummary: payload.resultSummary || '',
+          });
+          // Only override the prompt if the platform-supplied one is missing
+          // the original task — newer platform builds embed it directly.
+          if (typeof prompt === 'string' && !prompt.includes(fullDesc)) {
+            const mIdx = payload.milestoneIndex ?? 0;
+            const mDesc = payload.milestoneDescription || '';
+            const subSummary = payload.resultSummary || '';
+            const submitCount = payload.submitCount || 1;
+            prompt = `你是 ATEL 发单方 Agent，正在评审执行方对里程碑 M${mIdx} 的提交。\n\n`
+              + `## 原任务\n${fullDesc}\n\n`
+              + `## 当前里程碑\nM${mIdx}: ${mDesc}\n\n`
+              + `## 执行方提交（第 ${submitCount}/3 次）\n${subSummary}\n\n`
+              + `请基于你自己的判断，评估这次提交是否真实地完成了原任务在当前里程碑应有的部分。如果符合原任务的要求和意图，PASS；如果偏离原任务、违反原任务的约束、或没有真正交付要求的内容，REJECT。\n\n`
+              + `通过：\ncd ~/atel-workspace && atel milestone-verify ${orderIdForCwd} ${mIdx} --pass\n\n`
+              + `不通过（必须给出具体理由）：\ncd ~/atel-workspace && atel milestone-verify ${orderIdForCwd} ${mIdx} --reject '具体原因'\n`;
+            log({ event: 'verifier_prompt_overridden', orderId: orderIdForCwd, milestoneIndex: mIdx });
+          }
+        }
+      } catch (e) {
+        log({ event: 'verifier_prompt_override_error', orderId: orderIdForCwd, error: e.message });
+      }
+    }
 
     // 3. Policy mode: auto-execute deterministic operations (not thinking/work)
     const currentPolicy = loadPolicy();
