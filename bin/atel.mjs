@@ -51,7 +51,7 @@
  *   atel boost-status [did]             Check boost status
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, copyFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { cmdHub, cmdSwap, cmdTransfer } from './hub-helpers.mjs';
 import { resolve, join, dirname } from 'node:path';
@@ -2403,6 +2403,42 @@ async function startToolGatewayProxy(port, identity, policy) {
 
 async function cmdStart(port) {
   const id = requireIdentity();
+
+  // Cleanup stale openclaw session locks left behind by previous crashes /
+  // network outages. Without this an agent that lost network mid-session leaves
+  // .lock files in /root/.openclaw/agents/main/sessions/, and the next openclaw
+  // run reports "session file locked (timeout 10000ms)" and refuses to handle
+  // any new milestones until a human cleans up. Treat any lock older than 60s
+  // whose owning pid is no longer alive as stale.
+  try {
+    const home = process.env.HOME || '/root';
+    const sessionDir = join(home, '.openclaw', 'agents', 'main', 'sessions');
+    if (existsSync(sessionDir)) {
+      const entries = readdirSync(sessionDir).filter(f => f.endsWith('.lock'));
+      let removed = 0;
+      const now = Date.now();
+      for (const f of entries) {
+        const full = join(sessionDir, f);
+        try {
+          const st = statSync(full);
+          // Stale if older than 60s — openclaw refreshes locks frequently
+          // when actively working, so anything older almost certainly belongs
+          // to a dead session.
+          if (now - st.mtimeMs > 60_000) {
+            unlinkSync(full);
+            removed++;
+          }
+        } catch {}
+      }
+      if (removed > 0) {
+        log({ event: 'openclaw_stale_locks_removed', count: removed, dir: sessionDir });
+        console.log(`🧹 Cleaned up ${removed} stale openclaw session lock(s) from ${sessionDir}`);
+      }
+    }
+  } catch (e) {
+    log({ event: 'openclaw_lock_cleanup_error', error: e.message });
+  }
+
   // Initialize Ollama only if explicitly enabled (optional local AI audit)
   if (process.env.ATEL_OLLAMA_ENABLED === 'true') {
     await initializeOllama().catch(err => {
