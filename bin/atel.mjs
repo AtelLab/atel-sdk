@@ -312,26 +312,26 @@ async function pushTradeNotification(eventType, payload, body) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'order_created': (p) => `📥 New order received\nOrder: ${p.orderId || body?.orderId || '?'}\nAmount: $${p.priceAmount ?? '?'} USDC\nFrom: ${p.requesterDid || 'unknown requester'}\nReview and decide whether to accept`,
-    'order_accepted': (p) => `📋 Order accepted\nOrder: ${p.orderId || body?.orderId || '?'}\nThe executor has started work. The order is now in the milestone phase`,
+    'order_created': (p) => `📥 收到新订单\n订单: ${p.orderId || body?.orderId || '?'}\n金额: $${p.priceAmount ?? '?'} USDC\n来自: ${p.requesterDid || '未知请求方'}\n请审核后决定是否接单`,
+    'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body?.orderId || '?'}\n执行方已开始处理，进入里程碑阶段`,
     'milestone_submitted': (p) => {
-      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\nSubmission: ${String(p.resultSummary).substring(0, 200)}` : '';
-      return `📝 Milestone M${p.milestoneIndex ?? '?'} submitted\nOrder: ${p.orderId || body?.orderId || '?'}${desc}${content}\nAwaiting review`;
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}\n等待审核`;
     },
     'milestone_verified': (p) => {
-      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\nSubmission: ${String(p.resultSummary).substring(0, 200)}` : '';
-      const progress = p.totalMilestones ? `\nProgress: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
-      return `✅ Milestone M${p.milestoneIndex ?? '?'} approved\nOrder: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      const progress = p.totalMilestones ? `\n进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
+      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
     },
     'milestone_rejected': (p) => {
-      const desc = p.milestoneDescription ? `\nGoal: ${p.milestoneDescription}` : '';
-      return `❌ Milestone M${p.milestoneIndex ?? '?'} rejected\nOrder: ${p.orderId || body?.orderId || '?'}${desc}\nReason: ${p.rejectReason || 'not provided'}`;
+      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
+      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body?.orderId || '?'}${desc}\n原因: ${p.rejectReason || '未说明'}`;
     },
     'order_settled': (p) => {
-      const amount = p.priceAmount ? `\nAmount: $${p.priceAmount} USDC` : '';
-      return `💰 Order settled\nOrder: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC has been paid`;
+      const amount = p.priceAmount ? `\n金额: $${p.priceAmount} USDC` : '';
+      return `💰 订单已结算完成\n订单: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC 已支付`;
     },
   };
   const tmpl = templates[eventType];
@@ -386,12 +386,12 @@ async function pushP2PNotification(eventType, payload = {}) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'p2p_task_sent': (p) => `📤 P2P task sent\nTask: ${p.taskId || '?'}\nTarget: ${p.peerDid || '?'}`,
-    'p2p_task_received': (p) => `📩 New P2P task received\nTask: ${p.taskId || '?'}\nFrom: ${p.peerDid || '?'}`,
-    'p2p_task_started': (p) => `▶️ P2P task started\nTask: ${p.taskId || '?'}\nFrom: ${p.peerDid || '?'}`,
-    'p2p_result_submitted': (p) => `📨 P2P result sent back\nTask: ${p.taskId || '?'}\nTarget: ${p.peerDid || '?'}`,
-    'p2p_result_received': (p) => `✅ P2P task completed\nTask: ${p.taskId || '?'}\nResult: ${String(p.result || '').slice(0, 80) || 'returned'}`,
-    'p2p_task_failed': (p) => `❌ P2P task failed\nTask: ${p.taskId || '?'}\nReason: ${p.reason || 'unknown error'}`,
+    'p2p_task_sent': (p) => `📤 P2P任务已发送\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_task_received': (p) => `📩 收到新的P2P任务\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_task_started': (p) => `▶️ P2P任务开始处理\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
+    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
+    'p2p_result_received': (p) => `✅ P2P任务已完成\n任务: ${p.taskId || '?'}\n结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
+    'p2p_task_failed': (p) => `❌ P2P任务失败\n任务: ${p.taskId || '?'}\n原因: ${p.reason || '未知错误'}`,
   };
   const tmpl = templates[eventType];
   if (!tmpl) return;
