@@ -342,10 +342,14 @@ async function pushTradeNotification(eventType, payload, body) {
     try {
       if (target.channel === 'telegram' && target.botToken) {
         // Direct TG Bot API — no gateway needed
+        // Note: parse_mode is intentionally omitted. Templates render plain
+        // text (no HTML markup), and milestone payloads frequently contain
+        // raw `<` characters (e.g. "<5秒", "<30秒") that would otherwise
+        // trip Telegram's HTML parser and cause silent 400 drops.
         await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          body: JSON.stringify({ chat_id: target.target, text: message }),
           signal: AbortSignal.timeout(5000),
         }).catch(() => {});
       } else if (target.channel === 'gateway') {
@@ -396,10 +400,11 @@ async function pushP2PNotification(eventType, payload = {}) {
   for (const target of enabled) {
     try {
       if (target.channel === 'telegram' && target.botToken) {
+        // parse_mode intentionally omitted — see pushTradeNotification for rationale
         await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: target.target, text: message, parse_mode: 'HTML' }),
+          body: JSON.stringify({ chat_id: target.target, text: message }),
           signal: AbortSignal.timeout(5000),
         }).catch(() => {});
       } else if (target.channel === 'gateway') {
@@ -5896,6 +5901,7 @@ async function cmdOrder(executorDid, capType, price) {
     try { executorDid = resolveDID(executorDid); } catch (e) { console.error(e.message); process.exit(1); }
   }
   const description = rawArgs.find((a, i) => rawArgs[i-1] === '--desc') || '';
+  const chainArg = rawArgs.find((a, i) => rawArgs[i-1] === '--chain') || '';
   const id = requireIdentity();
   
   try {
@@ -5955,7 +5961,7 @@ async function cmdOrder(executorDid, capType, price) {
     };
 
     // Send to Platform
-    const data = await signedFetch('POST', '/trade/v1/order', {
+    const orderBody = {
       executorDid,
       capabilityType: capType,
       priceAmount: parseFloat(price),
@@ -5966,7 +5972,9 @@ async function cmdOrder(executorDid, capType, price) {
       taskRequest: taskRequest,
       taskSignature: taskSignature,
       intent: intentData,  // AVIP intent
-    });
+    };
+    if (chainArg) { orderBody.chain = chainArg; }
+    const data = await signedFetch('POST', '/trade/v1/order', orderBody);
     
     // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
     if (data.orderId && parseFloat(price) > 0 && data.escrow?.escrowContract) {
