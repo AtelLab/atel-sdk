@@ -94,6 +94,7 @@ const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
 const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
 const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
 const ORDER_WORK_DIR = resolve(ATEL_DIR, 'order-workspaces');
+const CRASH_LOG_FILE = resolve(ATEL_DIR, 'crash.log');
 const KEYS_DIR = resolve(ATEL_DIR, 'keys');
 const ANCHOR_FILE = resolve(KEYS_DIR, 'anchor.json');
 
@@ -102,6 +103,27 @@ const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent:
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function ensureDir() { if (!existsSync(ATEL_DIR)) mkdirSync(ATEL_DIR, { recursive: true }); }
+
+function writeCrashReport(kind, details = {}) {
+  try {
+    ensureDir();
+    const memory = process.memoryUsage();
+    const report = {
+      event: kind,
+      timestamp: new Date().toISOString(),
+      uptimeSeconds: Number(process.uptime().toFixed(2)),
+      pid: process.pid,
+      memory: {
+        rssMb: Math.round(memory.rss / 1024 / 1024),
+        heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+        heapTotalMb: Math.round(memory.heapTotal / 1024 / 1024),
+      },
+      ...details,
+    };
+    appendFileSync(CRASH_LOG_FILE, JSON.stringify(report) + '\n');
+    appendFileSync(INBOX_FILE, JSON.stringify(report) + '\n');
+  } catch {}
+}
 
 function ensureOrderWorkspace(orderId, context = {}) {
   ensureDir();
@@ -469,6 +491,157 @@ function clearPersistedPendingAgentCallback(dedupeKey) {
   if (!persisted[dedupeKey]) return;
   delete persisted[dedupeKey];
   savePendingAgentCallbacksPersisted(persisted);
+}
+
+function isAssistantSessionRecord(record = {}) {
+  const markers = [
+    record.role,
+    record.type,
+    record.sender,
+    record.author,
+    record.eventType,
+    record.kind,
+    record?.message?.role,
+  ];
+  return markers.some((v) => typeof v === 'string' && v.toLowerCase().includes('assistant'));
+}
+
+function extractSessionRecordText(record = {}) {
+  const pullText = (value) => {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (Array.isArray(value)) {
+      const merged = value
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (typeof item?.text === 'string') return item.text;
+          if (typeof item?.content === 'string') return item.content;
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      return merged || '';
+    }
+    return '';
+  };
+
+  return (
+    pullText(record.text) ||
+    pullText(record.content) ||
+    pullText(record.summary) ||
+    pullText(record.result) ||
+    pullText(record.output) ||
+    pullText(record?.message?.content) ||
+    pullText(record?.message?.text) ||
+    pullText(record?.payload?.content) ||
+    pullText(record?.payload?.text)
+  );
+}
+
+function loadLatestAssistantTextFromSessionFiles(childSessionKey) {
+  if (!childSessionKey) return '';
+  const home = process.env.HOME || '';
+  const candidateFiles = [
+    join(home, '.openclaw', 'agents', 'main', 'sessions', `${childSessionKey}.jsonl`),
+    join(home, '.openclaw', 'agents', 'main', 'sessions', childSessionKey, 'session.jsonl'),
+    join(home, '.openclaw', 'agents', 'main', 'sessions', childSessionKey, 'messages.jsonl'),
+    join(home, '.openclaw', 'sessions', `${childSessionKey}.jsonl`),
+    join(home, '.openclaw', 'sessions', childSessionKey, 'session.jsonl'),
+  ];
+
+  for (const filePath of candidateFiles) {
+    if (!existsSync(filePath)) continue;
+    try {
+      const lines = readFileSync(filePath, 'utf-8').split('\n').filter((line) => line.trim());
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        let parsed;
+        try {
+          parsed = JSON.parse(lines[i]);
+        } catch {
+          continue;
+        }
+        if (!isAssistantSessionRecord(parsed)) continue;
+        const text = extractSessionRecordText(parsed);
+        if (text) return text;
+      }
+    } catch {}
+  }
+
+  return '';
+}
+
+function tokenizeCommandLine(input = '') {
+  const text = String(input || '').trim();
+  if (!text) return [];
+  const tokens = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  for (const ch of text) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === '\'') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped || quote) return [];
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function extractAtelCommandFromTaskPayload(payload = {}) {
+  const candidates = [
+    payload?.command,
+    payload?.text,
+    payload?.message,
+    payload?.prompt,
+    payload?.payload?.command,
+    payload?.payload?.text,
+    payload?.payload?.message,
+    payload?.payload?.prompt,
+  ];
+  for (const value of candidates) {
+    if (Array.isArray(value) && value.length > 1 && String(value[0]).toLowerCase() === 'atel') {
+      return value.map((item) => String(item));
+    }
+    if (typeof value !== 'string') continue;
+    const lines = value
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      if (!line.toLowerCase().startsWith('atel ')) continue;
+      const tokens = tokenizeCommandLine(line);
+      if (tokens.length > 1 && tokens[0].toLowerCase() === 'atel') {
+        return tokens;
+      }
+    }
+  }
+  return [];
 }
 
 async function executeRecommendedActionDirect(eventType, action, cwd, dedupeKey) {
@@ -1093,6 +1266,132 @@ function loadTasks() { if (!existsSync(TASKS_FILE)) return {}; try { return JSON
 function saveTasks(t) { ensureDir(); writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2)); }
 function loadNetwork() { if (!existsSync(NETWORK_FILE)) return null; try { return JSON.parse(readFileSync(NETWORK_FILE, 'utf-8')); } catch { return null; } }
 function saveNetwork(n) { ensureDir(); writeFileSync(NETWORK_FILE, JSON.stringify(n, null, 2)); }
+
+function isLikelyIPv4(host) {
+  if (typeof host !== 'string') return false;
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function shouldRewritePortForUrl(parsedUrl, networkConfig = null) {
+  const host = String(parsedUrl?.hostname || '').toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1') return true;
+  if (isLikelyIPv4(host)) return true;
+  if (host.includes(':')) return true; // IPv6 literal
+  const publicIP = String(networkConfig?.publicIP || '').trim().toLowerCase();
+  if (publicIP && host === publicIP) return true;
+  return false;
+}
+
+function normalizeHttpPortInUrl(rawUrl, desiredPort, networkConfig = null) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return rawUrl;
+  const normalizedPort = Number.parseInt(String(desiredPort), 10);
+  if (!Number.isFinite(normalizedPort) || normalizedPort <= 0) return rawUrl;
+  try {
+    const trimmed = rawUrl.trim();
+    const hadTrailingSlash = trimmed.endsWith('/');
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return rawUrl;
+    if (!shouldRewritePortForUrl(parsed, networkConfig)) return rawUrl;
+    const currentPort = parsed.port ? Number.parseInt(parsed.port, 10) : (parsed.protocol === 'https:' ? 443 : 80);
+    if (currentPort === normalizedPort) return rawUrl;
+    parsed.port = String(normalizedPort);
+    let next = parsed.toString();
+    if (!hadTrailingSlash && parsed.pathname === '/' && parsed.search === '' && parsed.hash === '' && next.endsWith('/')) {
+      next = next.slice(0, -1);
+    }
+    return next;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function syncNetworkConfigPort(networkConfig, desiredPort) {
+  if (!networkConfig || typeof networkConfig !== 'object') {
+    return { networkConfig, changed: false, oldPort: null };
+  }
+  const next = { ...networkConfig };
+  const oldPort = Number.parseInt(String(next.port), 10);
+  let changed = false;
+
+  if (!Number.isFinite(oldPort) || oldPort !== desiredPort) {
+    next.port = desiredPort;
+    changed = true;
+  }
+
+  if (typeof next.endpoint === 'string' && next.endpoint.trim()) {
+    const updatedEndpoint = normalizeHttpPortInUrl(next.endpoint, desiredPort, next);
+    if (updatedEndpoint !== next.endpoint) {
+      next.endpoint = updatedEndpoint;
+      changed = true;
+    }
+  }
+
+  if (Array.isArray(next.candidates)) {
+    const updatedCandidates = next.candidates.map((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return candidate;
+      if (candidate.type === 'relay') return candidate;
+      if (typeof candidate.url !== 'string' || !candidate.url.trim()) return candidate;
+      const updatedUrl = normalizeHttpPortInUrl(candidate.url, desiredPort, next);
+      if (updatedUrl === candidate.url) return candidate;
+      changed = true;
+      return { ...candidate, url: updatedUrl };
+    });
+    next.candidates = updatedCandidates;
+  }
+
+  return { networkConfig: next, changed, oldPort: Number.isFinite(oldPort) ? oldPort : null };
+}
+
+function copyDirectoryRecursive(sourceDir, targetDir) {
+  if (!existsSync(sourceDir)) return;
+  mkdirSync(targetDir, { recursive: true });
+  const entries = readdirSync(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const sourcePath = join(sourceDir, entry.name);
+    const targetPath = join(targetDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(sourcePath, targetPath);
+      continue;
+    }
+    if (entry.isFile()) {
+      copyFileSync(sourcePath, targetPath);
+    }
+  }
+}
+
+function syncAtelSkillToOpenClaw(options = {}) {
+  const verbose = options.verbose === true;
+  const home = process.env.HOME || '';
+  const openClawRoot = join(home, '.openclaw');
+  if (!existsSync(openClawRoot)) {
+    return { installed: false, paths: [], reason: 'openclaw_not_found' };
+  }
+
+  const sdkSkillDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent');
+  if (!existsSync(sdkSkillDir)) {
+    return { installed: false, paths: [], reason: 'sdk_skill_missing' };
+  }
+
+  const candidates = [
+    join(home, '.openclaw', 'skills', 'atel-agent'),
+    join(home, '.openclaw', 'workspace', 'skills', 'atel-agent'),
+  ];
+  const installedPaths = [];
+  for (const dir of candidates) {
+    try {
+      copyDirectoryRecursive(sdkSkillDir, dir);
+      installedPaths.push(dir);
+    } catch (e) {
+      if (verbose) {
+        console.warn(`⚠️ Failed to sync ATEL skill to ${dir}: ${e.message}`);
+      }
+    }
+  }
+
+  return { installed: installedPaths.length > 0, paths: installedPaths, reason: installedPaths.length > 0 ? '' : 'copy_failed' };
+}
+
 function saveTrace(taskId, trace) { if (!existsSync(TRACES_DIR)) mkdirSync(TRACES_DIR, { recursive: true }); writeFileSync(resolve(TRACES_DIR, `${taskId}.jsonl`), trace.export()); }
 function loadTrace(taskId) { const f = resolve(TRACES_DIR, `${taskId}.jsonl`); if (!existsSync(f)) return null; return readFileSync(f, 'utf-8'); }
 function loadPending() { if (!existsSync(PENDING_FILE)) return {}; try { return JSON.parse(readFileSync(PENDING_FILE, 'utf-8')); } catch { return {}; } }
@@ -2065,35 +2364,22 @@ async function cmdInit(agentId) {
     next: 'Run: atel start [port] — auto-configures network and registers'
   }, null, 2));
 
-  // Auto-install SKILL.md to OpenClaw skills directory
+  // Auto-install full atel-agent skill directory to OpenClaw (SKILL.md + setup.sh + assets)
   try {
-    const sdkSkillPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent', 'SKILL.md');
-    if (existsSync(sdkSkillPath)) {
-      const home = process.env.HOME || '';
-      const candidates = [
-        join(home, '.openclaw', 'skills', 'atel-agent'),
-        join(home, '.openclaw', 'workspace', 'skills', 'atel-agent'),
-      ];
-      let installed = false;
-      for (const dir of candidates) {
-        if (existsSync(dirname(dir))) {
-          mkdirSync(dir, { recursive: true });
-          copyFileSync(sdkSkillPath, join(dir, 'SKILL.md'));
-          console.log(`\n✅ ATEL Skill auto-installed to ${dir}`);
-          console.log('   Your AI agent will automatically know how to use ATEL.');
-          console.log('');
-          console.log('📌 Tell your agent this message to get started:');
-          console.log('   "Read the atel-agent skill at ~/.openclaw/skills/atel-agent/SKILL.md carefully, then help me set up ATEL and start earning."');
-          installed = true;
-          break;
-        }
+    const synced = syncAtelSkillToOpenClaw({ verbose: true });
+    if (synced.installed) {
+      for (const dir of synced.paths) {
+        console.log(`\n✅ ATEL skill synced to ${dir}`);
       }
-      if (!installed) {
-        console.log('\n📋 To teach your AI agent about ATEL, send it this message:');
-        console.log(`   "Read ${sdkSkillPath} carefully, then help me set up ATEL and start earning."`);
-      }
+      console.log('   Your AI agent will automatically know how to use ATEL.');
+      console.log('');
+      console.log('📌 Tell your agent this message to get started:');
+      console.log('   "Read the atel-agent skill at ~/.openclaw/skills/atel-agent/SKILL.md carefully, then help me set up ATEL and start earning."');
+    } else if (synced.reason !== 'openclaw_not_found') {
+      console.log('\n⚠️ ATEL skill auto-sync skipped.');
+      console.log(`   Reason: ${synced.reason}`);
     }
-  } catch (e) { /* skill install is best-effort */ }
+  } catch (e) { /* skill sync is best-effort */ }
 }
 
 async function cmdAnchor(subcommand) {
@@ -2404,6 +2690,17 @@ async function startToolGatewayProxy(port, identity, policy) {
 async function cmdStart(port) {
   const id = requireIdentity();
 
+  // Keep OpenClaw skill files in sync on every start so fresh npm upgrades
+  // don't leave stale SKILL.md/setup.sh in the runtime workspace.
+  try {
+    const synced = syncAtelSkillToOpenClaw();
+    if (synced.installed) {
+      log({ event: 'atel_skill_synced', paths: synced.paths });
+    }
+  } catch (e) {
+    log({ event: 'atel_skill_sync_error', error: e.message });
+  }
+
   // Cleanup stale openclaw session locks left behind by previous crashes /
   // network outages. Without this an agent that lost network mid-session leaves
   // .lock files in /root/.openclaw/agents/main/sessions/, and the next openclaw
@@ -2581,6 +2878,20 @@ async function cmdStart(port) {
     saveNetwork(networkConfig);
   } else {
     log({ event: 'network_loaded', candidates: networkConfig.candidates?.length || 0 });
+  }
+
+  const syncedNetwork = syncNetworkConfigPort(networkConfig, p);
+  networkConfig = syncedNetwork.networkConfig;
+  if (syncedNetwork.changed) {
+    saveNetwork(networkConfig);
+    log({
+      event: 'network_port_drift_fixed',
+      oldPort: syncedNetwork.oldPort,
+      newPort: p,
+      endpoint: networkConfig.endpoint || '',
+      candidates: Array.isArray(networkConfig.candidates) ? networkConfig.candidates.length : 0,
+    });
+    console.log(`🔧 Fixed network.json port drift: ${syncedNetwork.oldPort ?? 'unknown'} -> ${p}`);
   }
 
   // ── Start endpoint ──
@@ -3045,6 +3356,7 @@ async function cmdStart(port) {
 Important requirements:
 1. This is a P2P task. Do not call atel result; the local SDK will submit the result automatically after your callback.
 2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
+3. You MUST execute the callback command. Plain text output alone does NOT deliver the result to the parent session.
 ${fileAccessRule}
 ${contextRule}
 5. After finishing, you must immediately run the success callback command template below and replace its content with your real result:
@@ -3062,6 +3374,7 @@ ${callbackFailed}
 Important requirements:
 1. Do not run atel milestone-submit / milestone-verify / milestone-feedback. The local SDK will execute those commands on your behalf after the callback.
 2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
+3. You MUST execute the callback command. Plain text output alone does NOT deliver the result to the parent session.
 ${fileAccessRule}
 ${contextRule}
 ${repoRule}
@@ -3264,9 +3577,91 @@ Format:
     const timeoutMs = 10 * 60 * 1000;
 
     return await new Promise(async (resolve) => {
-      const timer = setTimeout(() => {
+      const timer = setTimeout(async () => {
+        const pending = pendingAgentCallbacks.get(dedupeKey);
+        const childSessionKey = pending?.childSessionKey || '';
+        const recoveredText = loadLatestAssistantTextFromSessionFiles(childSessionKey);
+        if (recoveredText) {
+          const fallbackBody = {
+            dedupeKey,
+            status: 'done',
+            eventType,
+            result: recoveredText,
+            summary: recoveredText.slice(0, 160),
+            childSessionKey,
+            recoveredFromSession: true,
+          };
+          const callbackAction = buildAgentCallbackAction(eventType, payload || {}, fallbackBody);
+          if (callbackAction.skipped) {
+            pendingAgentCallbacks.delete(dedupeKey);
+            markPersistedPendingAgentCallbackCompleted(dedupeKey, {
+              eventType,
+              payload,
+              cwd,
+              source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main',
+              skipped: true,
+              reason: callbackAction.reason || 'session_fallback_skipped',
+              recoveredFromTimeoutSession: true,
+              childSessionKey,
+            });
+            resolve({ ok: true, skipped: true, recovered: true, source: 'session_jsonl' });
+            return;
+          }
+          if (callbackAction.ok) {
+            try {
+              if (callbackAction.action?.type === 'local_result') {
+                const localResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    taskId: callbackAction.action.taskId,
+                    result: callbackAction.action.result,
+                    success: true,
+                  }),
+                  signal: AbortSignal.timeout(15000),
+                });
+                if (localResp.ok) {
+                  pendingAgentCallbacks.delete(dedupeKey);
+                  markPersistedPendingAgentCallbackCompleted(dedupeKey, {
+                    eventType,
+                    payload,
+                    cwd,
+                    source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main',
+                    action: callbackAction.action,
+                    recoveredFromTimeoutSession: true,
+                    childSessionKey,
+                  });
+                  log({ event: 'agent_callback_timeout_recovered', eventType, dedupeKey, childSessionKey, mode: 'local_result' });
+                  resolve({ ok: true, recovered: true, source: 'session_jsonl' });
+                  return;
+                }
+              } else {
+                const execResult = await executeRecommendedActionDirect(eventType, callbackAction.action, cwd || process.cwd(), dedupeKey);
+                if (execResult.ok) {
+                  pendingAgentCallbacks.delete(dedupeKey);
+                  markPersistedPendingAgentCallbackCompleted(dedupeKey, {
+                    eventType,
+                    payload,
+                    cwd,
+                    source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main',
+                    action: callbackAction.action,
+                    recoveredFromTimeoutSession: true,
+                    childSessionKey,
+                  });
+                  log({ event: 'agent_callback_timeout_recovered', eventType, dedupeKey, childSessionKey, mode: 'direct_action' });
+                  resolve({ ok: true, recovered: true, source: 'session_jsonl' });
+                  return;
+                }
+              }
+            } catch (e) {
+              log({ event: 'agent_callback_timeout_recovery_error', eventType, dedupeKey, childSessionKey, error: e.message });
+            }
+          }
+        }
+
         pendingAgentCallbacks.delete(dedupeKey);
-        persistPendingAgentCallback(dedupeKey, { eventType, payload, cwd, source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main', timeout: true });
+        log({ event: 'agent_callback_timeout', eventType, dedupeKey, childSessionKey });
+        persistPendingAgentCallback(dedupeKey, { eventType, payload, cwd, source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main', timeout: true, childSessionKey });
         resolve({ ok: false, error: 'agent_callback_timeout' });
       }, timeoutMs);
 
@@ -3754,22 +4149,24 @@ Format:
     hookBusy = true;
     const { event: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, args: spawnArgs, cwd: hookCwd, payload: hookPayload, recoveryKey } = hookQueue.shift();
     const { execFile } = await import('child_process');
+    const hookStartedAt = Date.now();
+    const hookDurationMs = () => Date.now() - hookStartedAt;
     const finishHook = () => {
       if (recoveryKey) activeRecoveryKeys.delete(recoveryKey);
       hookBusy = false;
       processHookQueue();
     };
-    log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length });
+    log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length, startedAt: new Date(hookStartedAt).toISOString() });
 
     if (shouldUseGatewaySession(hookEvent)) {
       const promptArg = spawnArgs[spawnArgs.length - 1] || '';
       const gatewayResult = await runGatewayAgentTask(hookEvent, hookKey, promptArg, hookCwd, hookPayload);
       if (gatewayResult.ok) {
-        log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'sessions_spawn', dedupeKey: hookKey });
+        log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'sessions_spawn', dedupeKey: hookKey, durationMs: hookDurationMs() });
         finishHook();
         return;
       }
-      log({ event: 'agent_session_spawn_error', eventType: hookEvent, dedupeKey: hookKey, error: gatewayResult.error, fallback: 'cli' });
+      log({ event: 'agent_session_spawn_error', eventType: hookEvent, dedupeKey: hookKey, error: gatewayResult.error, fallback: 'cli', durationMs: hookDurationMs() });
       spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg);
     } else if (spawnArgs.length > 0) {
       const promptArg = spawnArgs[spawnArgs.length - 1] || '';
@@ -3789,13 +4186,13 @@ Format:
         if (isSessionLock && attempt < MAX_ATTEMPTS) {
           // OpenClaw session still held by previous call — wait for lock release then retry
           const delay = 15000 + (attempt * 5000); // 15s, 20s, 25s, 30s
-          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay });
+          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay, durationMs: hookDurationMs() });
           setTimeout(() => runHook(attempt + 1), delay);
         } else if (isNetworkError && attempt < 2) {
-          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message });
+          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message, durationMs: hookDurationMs() });
           setTimeout(() => runHook(attempt + 1), 10000);
         } else if (err) {
-          log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200) });
+          log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200), durationMs: hookDurationMs() });
           finishHook();
         } else if (isKnownUpstreamModelInputError(stdout)) {
           log({
@@ -3832,21 +4229,21 @@ Format:
               : Promise.resolve(false);
             guardCheck.then(alreadySubmitted => {
             if (alreadySubmitted) {
-              log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey });
+              log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey, durationMs: hookDurationMs() });
               finishHook();
               return;
             }
             executeRecommendedActionDirect(hookEvent, localAction.action, hookCwd || process.cwd(), hookKey)
               .then((execResult) => {
                 if (execResult.ok) {
-                  log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'local_stdout_action', dedupeKey: hookKey, stdout: summarizeAgentOutput(stdout, 200) });
+                  log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'local_stdout_action', dedupeKey: hookKey, stdout: summarizeAgentOutput(stdout, 200), durationMs: hookDurationMs() });
                 } else {
-                  log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: execResult.error || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                  log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: execResult.error || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200), durationMs: hookDurationMs() });
                 }
                 finishHook();
               })
               .catch((e) => {
-                log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: e.message || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: e.message || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200), durationMs: hookDurationMs() });
                 finishHook();
               });
             return;
@@ -3854,7 +4251,7 @@ Format:
             return;
           }
 
-          log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: summarizeAgentOutput(stdout, 300) });
+          log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: summarizeAgentOutput(stdout, 300), durationMs: hookDurationMs() });
           finishHook();
         }
       });
@@ -4637,6 +5034,83 @@ Format:
     appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
     log({ event: 'task_accepted', taskId, from: message.from, action, encrypted: !!session?.encrypted, relationship: accessCheck.relationship, timestamp: new Date().toISOString() });
 
+    // Deterministic pre-handler for direct ATEL CLI commands:
+    // when requester sends a literal `atel ...` command, execute it directly
+    // and return real stdout/stderr instead of relying on LLM interpretation.
+    const directAtelCommand = (action === 'general' || action === 'command_exec')
+      ? extractAtelCommandFromTaskPayload(payload)
+      : [];
+    if (directAtelCommand.length > 1) {
+      appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
+
+      const commandText = directAtelCommand.join(' ');
+      log({ event: 'p2p_atel_command_detected', taskId, from: message.from, command: commandText });
+      const execResult = await executeRecommendedActionDirect(
+        'p2p_task',
+        { action: 'direct_atel_command', command: directAtelCommand },
+        process.cwd(),
+        `p2p:${taskId}:direct-atel`,
+      );
+
+      const resultPayload = execResult.ok
+        ? {
+            status: 'success',
+            mode: 'direct_atel_command',
+            command: commandText,
+            stdout: String(execResult.stdout || '').trim(),
+          }
+        : {
+            status: 'failed',
+            mode: 'direct_atel_command',
+            command: commandText,
+            error: execResult.error || 'atel_command_failed',
+          };
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      let callbackOk = false;
+      try {
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const callbackResp = await fetch(`http://127.0.0.1:${p}/atel/v1/result`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              taskId,
+              result: resultPayload,
+              success: execResult.ok === true,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (callbackResp.ok) {
+            callbackOk = true;
+            break;
+          }
+          const callbackBody = await callbackResp.text().catch(() => '');
+          log({
+            event: 'p2p_atel_command_result_callback_http_error',
+            taskId,
+            attempt,
+            status: callbackResp.status,
+            body: callbackBody.slice(0, 200),
+          });
+          if (attempt < 3) await sleep(1000 * attempt);
+        }
+      } catch (e) {
+        log({ event: 'p2p_atel_command_result_callback_failed', taskId, error: e.message });
+      }
+
+      if (!callbackOk) {
+        delete pendingTasks[taskId];
+        saveTasks(pendingTasks);
+        enforcer.taskFinished();
+        appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_failed', reason: 'result_callback_failed' });
+        return { status: 'error', taskId, error: 'Result callback failed after retries' };
+      }
+
+      return { status: 'accepted', taskId, message: 'ATEL command accepted and executed directly.' };
+    }
+
     // Forward to executor, gateway session, or echo fallback
     if (EXECUTOR_URL) {
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
@@ -4793,7 +5267,7 @@ Format:
         setTimeout(async () => {
           try {
             await signedFetch('POST', '/registry/v1/register', {
-              name: capTypes.join('+') || id.agent_id, capabilities: caps, endpoint: bestEndpoint,
+              name: capTypes.join('+') || id.agent_id, capabilities: caps, endpoint: bestDirect.url,
               candidates: networkConfig.candidates, discoverable, wallets, metadata: { preferredChain }
             }, id);
             log({ event: 'auto_register_retry_ok' });
@@ -4946,6 +5420,16 @@ Format:
   const heartbeat = new HeartbeatManager(REGISTRY_URL, id);
   heartbeat.start();
 
+  // Runtime health watchdog: surface memory pressure before OOM crashes.
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const rssMb = Math.round(mem.rss / 1024 / 1024);
+    const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
+    if (rssMb >= 1024 || heapUsedMb >= 768) {
+      log({ event: 'memory_usage_high', rssMb, heapUsedMb, heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024) });
+    }
+  }, 60000);
+
   process.on('SIGINT', async () => { 
     heartbeat.stop();
     if (tunnelManager) await tunnelManager.stop();
@@ -4969,35 +5453,20 @@ Format:
       return;
     }
     
-    // Only write to file, avoid console (prevent EPIPE recursion)
-    try {
-      ensureDir();
-      appendFileSync(INBOX_FILE, JSON.stringify({
-        event: 'uncaught_exception',
-        error: err.message,
-        stack: err.stack,
-        timestamp: new Date().toISOString()
-      }) + '\n');
-    } catch {
-      // If even file writing fails, give up
-    }
+    writeCrashReport('uncaught_exception', {
+      error: err.message,
+      stack: err.stack,
+      code: err.code || '',
+    });
     
     setTimeout(() => process.exit(1), 1000);
   });
 
   process.on('unhandledRejection', (reason, promise) => {
-    // Only write to file, avoid console (prevent EPIPE recursion)
-    try {
-      ensureDir();
-      appendFileSync(INBOX_FILE, JSON.stringify({
-        event: 'unhandled_rejection',
-        reason: String(reason),
-        promise: String(promise),
-        timestamp: new Date().toISOString()
-      }) + '\n');
-    } catch {
-      // If even file writing fails, give up
-    }
+    writeCrashReport('unhandled_rejection', {
+      reason: String(reason),
+      promise: String(promise),
+    });
     
     setTimeout(() => process.exit(1), 1000);
   });
