@@ -9,7 +9,7 @@
  *   atel start [port]                   Start endpoint (auto network + auto register)
  *   atel setup [port]                   Network setup only (detect IP, UPnP, verify)
  *   atel verify                         Verify port reachability
- *   atel inbox [count]                  Show received messages
+ *   atel inbox [count]                  Show received messages / notifications
  *   atel register [name] [caps] [url]   Register on public registry
  *   atel search <capability>            Search registry for agents
  *   atel handshake <endpoint> [did]     Handshake with a remote agent
@@ -1093,6 +1093,72 @@ function loadTasks() { if (!existsSync(TASKS_FILE)) return {}; try { return JSON
 function saveTasks(t) { ensureDir(); writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2)); }
 function loadNetwork() { if (!existsSync(NETWORK_FILE)) return null; try { return JSON.parse(readFileSync(NETWORK_FILE, 'utf-8')); } catch { return null; } }
 function saveNetwork(n) { ensureDir(); writeFileSync(NETWORK_FILE, JSON.stringify(n, null, 2)); }
+function syncNetworkConfigToPort(networkConfig, port) {
+  if (!networkConfig || typeof networkConfig !== 'object') return { config: networkConfig, changed: false };
+  let changed = false;
+  const next = { ...networkConfig };
+  if (next.port !== port) { next.port = port; changed = true; }
+  const rewriteUrlPort = (value) => {
+    if (typeof value !== 'string' || !value.trim()) return value;
+    try {
+      const parsed = new URL(value);
+      const desiredPort = String(port);
+      if (parsed.port === desiredPort) return value;
+      parsed.port = desiredPort;
+      changed = true;
+      return parsed.toString();
+    } catch {
+      return value;
+    }
+  };
+  next.endpoint = rewriteUrlPort(next.endpoint);
+  if (Array.isArray(next.candidates)) {
+    next.candidates = next.candidates.map((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return candidate;
+      const updated = { ...candidate };
+      if (updated.port !== port) { updated.port = port; changed = true; }
+      updated.url = rewriteUrlPort(updated.url);
+      return updated;
+    });
+  }
+  if (changed) next.configuredAt = new Date().toISOString();
+  return { config: next, changed };
+}
+function isAckableMalformedRelayMessage(req, inner) {
+  if (typeof inner === 'string') {
+    const raw = inner.trim();
+    if (raw === '' || raw === '{}') return true;
+  }
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return false;
+  const keys = Object.keys(req);
+  if (keys.length === 0) return true;
+  const path = typeof req.path === 'string' ? req.path.trim() : '';
+  const method = typeof req.method === 'string' ? req.method.trim().toUpperCase() : '';
+  const body = req.body;
+  const hasBodyObject = !!body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length > 0;
+  const hasBodyString = typeof body === 'string' && body.trim() !== '';
+  if ((!path || path === '/') && !hasBodyObject && !hasBodyString) return true;
+  return !path && !method && !hasBodyObject && !hasBodyString;
+}
+const HUMAN_INBOX_EVENT_PREFIXES = ['p2p_task_', 'p2p_result_'];
+const HUMAN_INBOX_EVENTS = new Set([
+  'notification',
+  'result_received',
+  'rejection_proof',
+  'friend_added',
+  'friend_removed',
+  'friend_request_received',
+  'friend_request_accepted_by_peer',
+  'friend_request_rejected_by_peer',
+]);
+function isHumanInboxEntry(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.type === 'task-result') return true;
+  const event = typeof entry.event === 'string' ? entry.event : '';
+  if (!event) return false;
+  if (HUMAN_INBOX_EVENTS.has(event)) return true;
+  return HUMAN_INBOX_EVENT_PREFIXES.some((prefix) => event.startsWith(prefix));
+}
 function saveTrace(taskId, trace) { if (!existsSync(TRACES_DIR)) mkdirSync(TRACES_DIR, { recursive: true }); writeFileSync(resolve(TRACES_DIR, `${taskId}.jsonl`), trace.export()); }
 function loadTrace(taskId) { const f = resolve(TRACES_DIR, `${taskId}.jsonl`); if (!existsSync(f)) return null; return readFileSync(f, 'utf-8'); }
 function loadPending() { if (!existsSync(PENDING_FILE)) return {}; try { return JSON.parse(readFileSync(PENDING_FILE, 'utf-8')); } catch { return {}; } }
@@ -2580,7 +2646,14 @@ async function cmdStart(port) {
     delete networkConfig.steps;
     saveNetwork(networkConfig);
   } else {
-    log({ event: 'network_loaded', candidates: networkConfig.candidates?.length || 0 });
+    const synced = syncNetworkConfigToPort(networkConfig, p);
+    networkConfig = synced.config;
+    if (synced.changed) {
+      saveNetwork(networkConfig);
+      log({ event: 'network_port_aligned', port: p, endpoint: networkConfig.endpoint, candidates: networkConfig.candidates?.length || 0 });
+    } else {
+      log({ event: 'network_loaded', candidates: networkConfig.candidates?.length || 0 });
+    }
   }
 
   // ── Start endpoint ──
@@ -2851,6 +2924,7 @@ async function cmdStart(port) {
       summary: body.summary,
       error: body.error,
       childSessionKey: pending.childSessionKey,
+      duration_ms: pending.startedAt ? Date.now() - pending.startedAt : undefined,
     });
 
     if (body.status === 'failed') {
@@ -2866,6 +2940,7 @@ async function cmdStart(port) {
           childSessionKey: pending.childSessionKey,
           summary: body.summary,
           error: body.error,
+          duration_ms: pending.startedAt ? Date.now() - pending.startedAt : undefined,
         });
 
         if (failedAction.action?.type === 'local_result') {
@@ -3044,7 +3119,7 @@ async function cmdStart(port) {
 
 Important requirements:
 1. This is a P2P task. Do not call atel result; the local SDK will submit the result automatically after your callback.
-2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
+2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback. Writing text alone does NOT deliver the result. Only the callback counts.
 ${fileAccessRule}
 ${contextRule}
 5. After finishing, you must immediately run the success callback command template below and replace its content with your real result:
@@ -3061,7 +3136,7 @@ ${callbackFailed}
 
 Important requirements:
 1. Do not run atel milestone-submit / milestone-verify / milestone-feedback. The local SDK will execute those commands on your behalf after the callback.
-2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback.
+2. Your job is to complete the AI work carefully and send the final conclusion back to the local SDK through the callback. Writing text alone does NOT deliver the result. Only the callback counts.
 ${fileAccessRule}
 ${contextRule}
 ${repoRule}
@@ -3262,11 +3337,14 @@ Format:
     if (!safePrompt) return { ok: false, error: 'empty_agent_prompt' };
     const taskPrompt = buildGatewayCallbackPrompt(eventType, safePrompt, callbackUrl, dedupeKey, cwd, payload);
     const timeoutMs = 10 * 60 * 1000;
+    const startedAt = Date.now();
 
     return await new Promise(async (resolve) => {
       const timer = setTimeout(() => {
+        const active = pendingAgentCallbacks.get(dedupeKey);
         pendingAgentCallbacks.delete(dedupeKey);
         persistPendingAgentCallback(dedupeKey, { eventType, payload, cwd, source: dedupeKey.startsWith('reconcile:') ? 'reconcile' : 'main', timeout: true });
+        log({ event: 'agent_callback_timeout', eventType, dedupeKey, childSessionKey: active?.childSessionKey || null, duration_ms: Date.now() - startedAt });
         resolve({ ok: false, error: 'agent_callback_timeout' });
       }, timeoutMs);
 
@@ -3275,6 +3353,7 @@ Format:
         payload,
         cwd,
         childSessionKey: null,
+        startedAt,
         resolve: (result) => {
           clearTimeout(timer);
           resolve(result);
@@ -3304,9 +3383,11 @@ Format:
           signal: AbortSignal.timeout(15000),
         });
         if (!resp.ok) {
+          const errorText = await resp.text().catch(() => '');
           pendingAgentCallbacks.delete(dedupeKey);
           clearPersistedPendingAgentCallback(dedupeKey);
           clearTimeout(timer);
+          log({ event: 'agent_session_spawn_failed', eventType, dedupeKey, status: resp.status, error: errorText.slice(0, 300), duration_ms: Date.now() - startedAt });
           resolve({ ok: false, error: `sessions_spawn_http_${resp.status}` });
           return;
         }
@@ -3315,11 +3396,12 @@ Format:
         const childSessionKey = data.result?.details?.childSessionKey || data.result?.childSessionKey || '';
         const pending = pendingAgentCallbacks.get(dedupeKey);
         if (pending) pending.childSessionKey = childSessionKey;
-        log({ event: 'agent_session_spawned', eventType, dedupeKey, childSessionKey });
+        log({ event: 'agent_session_spawned', eventType, dedupeKey, childSessionKey, spawn_duration_ms: Date.now() - startedAt });
       } catch (e) {
         pendingAgentCallbacks.delete(dedupeKey);
         clearPersistedPendingAgentCallback(dedupeKey);
         clearTimeout(timer);
+        log({ event: 'agent_session_spawn_failed', eventType, dedupeKey, error: e.message, duration_ms: Date.now() - startedAt });
         resolve({ ok: false, error: e.message });
       }
     });
@@ -3781,27 +3863,34 @@ Format:
     const localHookTimeoutMs = isMilestoneHook ? 180000 : 600000;
     const preparedInvocation = prepareHookInvocation(spawnCmd, spawnArgs, hookKey, Math.ceil(localHookTimeoutMs / 1000));
     const runHook = (attempt, invocation = preparedInvocation) => {
+      const hookStartedAt = Date.now();
       execFile(invocation.cmd, invocation.args, { timeout: localHookTimeoutMs, cwd: hookCwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
         const errMsg = (err?.message || '') + (stderr || '');
+        const durationMs = Date.now() - hookStartedAt;
         const isSessionLock = errMsg.includes('session file locked') || errMsg.includes('session locked');
         const isNetworkError = err && (err.killed || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET');
 
         if (isSessionLock && attempt < MAX_ATTEMPTS) {
           // OpenClaw session still held by previous call — wait for lock release then retry
           const delay = 15000 + (attempt * 5000); // 15s, 20s, 25s, 30s
-          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay });
+          log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay, duration_ms: durationMs });
           setTimeout(() => runHook(attempt + 1), delay);
         } else if (isNetworkError && attempt < 2) {
-          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message });
+          log({ event: 'agent_cmd_retry', eventType: hookEvent, attempt: attempt + 1, error: err.message, duration_ms: durationMs });
           setTimeout(() => runHook(attempt + 1), 10000);
         } else if (err) {
-          log({ event: 'agent_cmd_error', eventType: hookEvent, error: err.message, stderr: (stderr || '').substring(0, 200) });
+          if (err.killed || err.code === 'ETIMEDOUT') {
+            log({ event: 'agent_cmd_timeout', eventType: hookEvent, dedupeKey: hookKey, timeout_ms: localHookTimeoutMs, duration_ms: durationMs, error: err.message, stderr: (stderr || '').substring(0, 200) });
+          } else {
+            log({ event: 'agent_cmd_error', eventType: hookEvent, dedupeKey: hookKey, error: err.message, duration_ms: durationMs, stderr: (stderr || '').substring(0, 200) });
+          }
           finishHook();
         } else if (isKnownUpstreamModelInputError(stdout)) {
           log({
             event: 'agent_cmd_upstream_input_error',
             eventType: hookEvent,
             dedupeKey: hookKey,
+            duration_ms: durationMs,
             note: 'suppressed known upstream model input-length error',
           });
           finishHook();
@@ -3832,21 +3921,21 @@ Format:
               : Promise.resolve(false);
             guardCheck.then(alreadySubmitted => {
             if (alreadySubmitted) {
-              log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey });
+              log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'already_submitted_by_agent', dedupeKey: hookKey, duration_ms: durationMs });
               finishHook();
               return;
             }
             executeRecommendedActionDirect(hookEvent, localAction.action, hookCwd || process.cwd(), hookKey)
               .then((execResult) => {
                 if (execResult.ok) {
-                  log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'local_stdout_action', dedupeKey: hookKey, stdout: summarizeAgentOutput(stdout, 200) });
+                  log({ event: 'agent_cmd_done', eventType: hookEvent, mode: 'local_stdout_action', dedupeKey: hookKey, duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 200) });
                 } else {
-                  log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: execResult.error || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                  log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: execResult.error || 'local_action_failed', duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 200) });
                 }
                 finishHook();
               })
               .catch((e) => {
-                log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: e.message || 'local_action_failed', stdout: summarizeAgentOutput(stdout, 200) });
+                log({ event: 'agent_cmd_local_action_error', eventType: hookEvent, dedupeKey: hookKey, error: e.message || 'local_action_failed', duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 200) });
                 finishHook();
               });
             return;
@@ -3854,7 +3943,7 @@ Format:
             return;
           }
 
-          log({ event: 'agent_cmd_done', eventType: hookEvent, stdout: summarizeAgentOutput(stdout, 300) });
+          log({ event: 'agent_cmd_done', eventType: hookEvent, dedupeKey: hookKey, duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 300) });
           finishHook();
         }
       });
@@ -4851,21 +4940,27 @@ Format:
           try {
             req = typeof inner === 'string' ? JSON.parse(inner) : inner;
           } catch (e) {
-            if (m.id) failedIds.push(m.id);
-            log({ event: 'relay_message_parse_error', id: m.id, error: e.message, rawType: typeof inner });
+            if (m.id) ackedIds.push(m.id);
+            log({ event: 'relay_message_parse_error_acked', id: m.id, error: e.message, rawType: typeof inner });
             continue;
           }
 
           try {
+            if (isAckableMalformedRelayMessage(req, inner)) {
+              if (m.id) ackedIds.push(m.id);
+              log({ event: 'relay_message_invalid_acked', id: m.id, path: typeof req?.path === 'string' && req.path.trim() ? req.path.trim() : '/', note: 'empty_or_invalid_relay_message' });
+              continue;
+            }
             const method = req.method || 'POST';
-            const path = req.path || '/';
+            const path = typeof req.path === 'string' ? req.path.trim() : '';
+            const body = req.body && typeof req.body === 'object' ? req.body : {};
             const fetchOpts = {
               method,
               headers: { 'Content-Type': 'application/json' },
               signal: AbortSignal.timeout(30000),
             };
-            if (method !== 'GET' && method !== 'HEAD') fetchOpts.body = JSON.stringify(req.body || {});
-            const localUrl = `http://127.0.0.1:${p}${path}`;
+            if (method !== 'GET' && method !== 'HEAD') fetchOpts.body = JSON.stringify(body);
+            const localUrl = `http://127.0.0.1:${p}${path || '/'}`;
             const localResp = await fetch(localUrl, fetchOpts);
             const rawText = await localResp.text();
             let parsed;
@@ -5005,10 +5100,16 @@ Format:
 
 async function cmdInbox(count) {
   const n = parseInt(count || '20');
-  if (!existsSync(INBOX_FILE)) { console.log(JSON.stringify({ messages: [], count: 0 })); return; }
+  if (!existsSync(INBOX_FILE)) {
+    console.log(JSON.stringify({ messages: [], count: 0, total: 0, filteredOut: 0 }, null, 2));
+    return;
+  }
   const lines = readFileSync(INBOX_FILE, 'utf-8').trim().split('\n').filter(Boolean);
-  const messages = lines.slice(-n).map(l => JSON.parse(l));
-  console.log(JSON.stringify({ messages, count: messages.length, total: lines.length }, null, 2));
+  const parsed = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  const messages = parsed.filter(isHumanInboxEntry).slice(-n);
+  console.log(JSON.stringify({ messages, count: messages.length, total: parsed.length, filteredOut: parsed.length - messages.length }, null, 2));
 }
 
 async function cmdRegister(name, capabilities, endpointUrl) {
@@ -7732,6 +7833,15 @@ async function cmdFriendStatus(args) {
 // ─── P2P Send Helper ────────────────────────────────────────────
 // Resolves DID → endpoint via registry, then sends a signed message.
 // Replaces the previously undefined sendP2PMessage.
+function extractCapabilityTypes(capabilities) {
+  if (!Array.isArray(capabilities)) return [];
+  return capabilities.map((cap) => {
+    if (typeof cap === 'string') return cap.trim().toLowerCase();
+    if (cap && typeof cap === 'object' && typeof cap.type === 'string') return cap.type.trim().toLowerCase();
+    return '';
+  }).filter(Boolean);
+}
+
 async function sendP2PMessage(targetDid, signedMsg) {
   const id = loadIdentity();
   if (!id) throw new Error('No identity found');
@@ -7760,7 +7870,7 @@ async function sendP2PMessage(targetDid, signedMsg) {
 
 function showSendHelp() {
   console.log(`
-atal send — Send a message (with optional rich media) to another agent
+atel send — Send a message (with optional rich media) to another agent
 
 Usage:
   atel send <did|alias|endpoint> "message text"
@@ -7782,6 +7892,10 @@ Notes:
     atel friend request <did>
   and ask the other side to accept with:
     atel friend accept <request-id>
+
+  Some agents do not expose the "general" capability needed for free-form
+  chat messages. If you get an "outside capability boundary" rejection,
+  enable "general" on the recipient or use atel task / atel order instead.
 
   To disable the friend requirement on your own agent, set in policy.json:
     { "relationshipPolicy": { "defaultMode": "open" } }
@@ -7845,6 +7959,7 @@ async function cmdSend(args) {
   // Resolve target → endpoint + remoteDid
   let remoteEndpoint = target;
   let remoteDid;
+  let registryEntry = null;
 
   // Resolve @alias
   try { const r = resolveDID(target); if (r !== target) remoteEndpoint = r; } catch (_) {}
@@ -7862,6 +7977,7 @@ async function cmdSend(args) {
       if (results.length > 0) entry = results[0];
     }
     if (!entry) { console.error(`Agent not found: ${target}`); process.exit(1); }
+    registryEntry = entry;
     remoteDid = entry.did;
     const candidates = entry.endpoint_candidates || [];
     const direct = candidates.find(c => c.type === 'direct');
@@ -7881,6 +7997,25 @@ async function cmdSend(args) {
 
   if (!remoteEndpoint) {
     console.error(`No reachable endpoint for: ${target}`);
+    process.exit(1);
+  }
+
+  const advertisedCapabilities = extractCapabilityTypes(registryEntry?.capabilities);
+  if (advertisedCapabilities.length > 0 && !advertisedCapabilities.includes('general')) {
+    const message = 'Registry says the recipient does not advertise the "general" capability for free-form chat messages.';
+    if (isJson) {
+      console.log(JSON.stringify({
+        status: 'error',
+        code: 'CAPABILITY_REJECTED',
+        message,
+        advertisedCapabilities,
+        hint: 'Use atel task / atel order, or enable "general" on the recipient.'
+      }, null, 2));
+    } else {
+      console.error('✗ Message not sent: registry says the recipient does not advertise the "general" capability.');
+      console.error('  Advertised capabilities: ' + advertisedCapabilities.join(', '));
+      console.error('  Use atel task / atel order, or enable "general" on the recipient.');
+    }
     process.exit(1);
   }
 
@@ -7904,10 +8039,21 @@ async function cmdSend(args) {
       process.exit(1);
     }
     if (inner?.status === 'rejected') {
+      const rejectionMessage = inner.error || 'Message rejected';
+      const capabilityRejected = /outside capability boundary/i.test(rejectionMessage);
       if (isJson) {
-        console.log(JSON.stringify({ status: 'error', message: inner.error || 'Message rejected', result }));
+        console.log(JSON.stringify({
+          status: 'error',
+          code: capabilityRejected ? 'CAPABILITY_REJECTED' : undefined,
+          message: rejectionMessage,
+          hint: capabilityRejected ? 'Recipient must allow the general capability for chat messages; otherwise use atel task / atel order.' : undefined,
+          result
+        }));
+      } else if (capabilityRejected) {
+        console.error('✗ Message rejected: the recipient does not accept generic chat messages.');
+        console.error('  Enable the "general" capability on the recipient, or use atel task / atel order instead.');
       } else {
-        console.error(`✗ Message rejected: ${inner.error || 'unknown reason'}`);
+        console.error('✗ Message rejected: ' + rejectionMessage);
       }
       process.exit(1);
     }
@@ -8604,7 +8750,7 @@ Protocol Commands:
   setup [port]                         Configure network (detect IP, UPnP, verify)
   verify                               Verify port reachability
   start [port]                         Start endpoint (auto network + auto register)
-  inbox [count]                        Show received messages (default: 20)
+  inbox [count]                        Show received messages / notifications (default: 20)
   register [name] [caps] [endpoint]    Register on public registry (caps: "type1:price1,type2:price2" or "type1,type2" for free)
   search <capability>                  Search registry for agents (shows pricing info)
   handshake <endpoint> [did]           Handshake with remote agent
