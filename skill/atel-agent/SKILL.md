@@ -20,6 +20,13 @@ ATEL 负责：
 - 通知与回调
 - paid order 的链字段与链上记录
 
+## 合规新增规则（Telegram 通知）
+
+1. Telegram 通知默认必须是 **opt-in**，不能静默自动绑定
+2. 只有在用户已经明确同意的前提下，才允许执行 `atel notify bind`
+3. 如果没有明确同意，就只提示绑定命令，不要帮用户自动绑定
+4. 企业或正式商用前，必须补充隐私提示、跨境告知、日志脱敏与删除能力说明
+
 OpenClaw 负责：
 
 - 理解 prompt
@@ -43,8 +50,10 @@ OpenClaw 负责：
 1. 先判断这是**首次使用**还是**后续复用**
 2. 如果发现已有 `.atel/identity.json`，默认进入复用路径，不要擅自重新初始化或改名
 3. 如果是首次使用，必须先询问用户想用什么 Agent 名称
-4. 如果用户不提供名称，才允许使用默认名称，并且默认名称必须带随机后缀（例如 `my-agent-ab12`）
-5. 默认把 endpoint 当作**常驻公网服务**处理；只有在本地测试场景下，才允许使用 local endpoint
+4. 如果用户没有明确给出名称，就不要继续初始化；必须先拿到用户确认的名称
+5. 即使是脚本执行场景，也不能擅自落默认名；没有名称就中止并提示用户补充
+6. Telegram 通知必须默认关闭自动绑定；只有显式同意后才允许绑定
+7. 默认把 endpoint 当作**常驻公网服务**处理；只有在本地测试场景下，才允许使用 local endpoint
 
 建议约定：
 
@@ -68,10 +77,15 @@ if ! command -v atel &> /dev/null; then
 fi
 echo "✅ SDK: $(command -v atel)"
 
-# 初始化身份
-AGENT_NAME="${ATEL_AGENT_NAME:-my-agent-随机后缀}"
+# 初始化身份（名称必填）
+AGENT_NAME="${ATEL_AGENT_NAME:-}"
 if [ ! -f .atel/identity.json ]; then
-  echo "🔑 Creating identity..."
+  if [ -z "$AGENT_NAME" ]; then
+    echo "❌ Agent name is required before first-time init."
+    echo "   Re-run with: ATEL_AGENT_NAME=<your-name> bash setup.sh"
+    exit 1
+  fi
+  echo "🔑 Creating identity as ${AGENT_NAME}..."
   echo 'n' | ATEL_PLATFORM=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
 else
   echo "✅ Identity already exists"
@@ -674,7 +688,7 @@ Agent 钱包:
 6. 命令失败等几秒重试
 7. 环境变量用 `ATEL_PLATFORM`（不是 `ATEL_API`）
 8. **订单状态推送由 SDK 自动做，你不需要重复给用户发状态摘要**。只在需要解释、追问、异常处理时主动回复用户
-9. **setup 成功后，必须尝试自动绑定当前 TG 会话**（`atel notify bind`）。绑定成功告诉用户"通知已启用"；失败了再提示用户手动补绑
+9. **setup 成功后，不要默认自动绑定 Telegram。** 先确认用户已明确同意，再执行 `atel notify bind`；没有同意就只提示手动绑定命令
 
 ---
 

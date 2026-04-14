@@ -5,7 +5,7 @@ set -euo pipefail
 echo "🤝 ATEL Agent Setup Starting..."
 PLATFORM_URL="${ATEL_PLATFORM:-https://api.atelai.org}"
 ENDPOINT_MODE="${ATEL_ENDPOINT_MODE:-public}"
-DEFAULT_AGENT_NAME="my-agent-$(head -c 2 /dev/urandom | od -A n -t x1 | tr -d " \n")"
+NAME_HINT="my-agent-ab12"
 
 # 1. 创建专用目录
 WORKSPACE="${ATEL_WORKSPACE:-$HOME/atel-workspace}"
@@ -29,11 +29,17 @@ else
   AGENT_NAME="${ATEL_AGENT_NAME:-}"
   if [ -z "$AGENT_NAME" ]; then
     if [ -t 0 ]; then
-      read -r -p "Choose your agent name [${DEFAULT_AGENT_NAME}]: " USER_AGENT_NAME || true
-      AGENT_NAME="${USER_AGENT_NAME:-$DEFAULT_AGENT_NAME}"
+      read -r -p "Choose your agent name (required, e.g. ${NAME_HINT}): " USER_AGENT_NAME || true
+      AGENT_NAME="${USER_AGENT_NAME:-}"
     else
-      AGENT_NAME="$DEFAULT_AGENT_NAME"
+      echo "❌ Agent name required. Re-run with ATEL_AGENT_NAME=<your-name> or use an interactive terminal."
+      exit 1
     fi
+  fi
+  AGENT_NAME="$(printf '%s' "$AGENT_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "$AGENT_NAME" ]; then
+    echo "❌ Agent name required. Initialization aborted."
+    exit 1
   fi
   echo "🔑 Creating identity as ${AGENT_NAME}..."
   echo 'n' | ATEL_PLATFORM="$PLATFORM_URL" atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
@@ -103,7 +109,7 @@ echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 echo "========================================="
 cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
-# 自动绑定当前 TG 会话为通知目标
+# Telegram 通知默认改为显式同意（opt-in）
 SESSION_FILE="$HOME/.openclaw/agents/main/sessions/sessions.json"
 CHAT_ID=""
 if [ -f "$SESSION_FILE" ]; then
@@ -124,16 +130,20 @@ PY
 )
 fi
 
-if [ -n "$CHAT_ID" ]; then
-  echo "🔔 Binding notifications to current Telegram chat: $CHAT_ID"
+if [ "${ATEL_NOTIFY_AUTO_BIND:-0}" = "1" ] && [ -n "$CHAT_ID" ]; then
+  echo "🔔 Explicit consent flag detected. Binding notifications to Telegram chat: $CHAT_ID"
   if [ "${ATEL_SKIP_NOTIFY_TEST:-0}" != "1" ]; then
     cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
     cd "$WORKSPACE" && atel notify test 2>/dev/null || true
   fi
 else
-  echo "⚠️ Could not auto-detect Telegram chat. Run: atel notify bind <chat_id>"
+  echo "🔒 Telegram notifications are opt-in by default."
+  if [ -n "$CHAT_ID" ]; then
+    echo "   After explicit user consent, run: cd $WORKSPACE && atel notify bind $CHAT_ID"
+  else
+    echo "   After explicit user consent, run: cd $WORKSPACE && atel notify bind <chat_id>"
+  fi
 fi
-
 echo "DID: $DID"
 echo "Endpoint mode: $ENDPOINT_MODE ($ENDPOINT_HOST:$PORT)"
 echo "Port: $PORT"

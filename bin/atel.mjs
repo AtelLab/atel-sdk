@@ -79,6 +79,7 @@ const REGISTRY_URL = process.env.ATEL_REGISTRY || ATEL_PLATFORM || 'https://api.
 const ATEL_RELAY = process.env.ATEL_RELAY || 'https://api.atelai.org';
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
+const ATEL_NOTIFY_AUTO_BIND = /^(1|true|yes)$/i.test(String(process.env.ATEL_NOTIFY_AUTO_BIND || ''));
 let EXECUTOR_URL = process.env.ATEL_EXECUTOR_URL || '';
 const INBOX_FILE = resolve(ATEL_DIR, 'inbox.jsonl');
 const POLICY_FILE = resolve(ATEL_DIR, 'policy.json');
@@ -2331,13 +2332,15 @@ async function cmdInit(agentId) {
     return;
   }
 
-  const fallbackName = `my-agent-${Math.random().toString(36).slice(2, 6)}`;
   let name = (agentId || '').trim();
   if (!name && process.stdin.isTTY) {
-    const chosen = await promptInput(`Choose your agent name [${fallbackName}]:`);
-    name = chosen || fallbackName;
+    const chosen = await promptInput('Choose your agent name (required):');
+    name = (chosen || '').trim();
   }
-  if (!name) name = fallbackName;
+  if (!name) {
+    console.error('Agent name is required. Pass a name explicitly, or run `atel init` interactively and enter one.');
+    process.exit(1);
+  }
 
   const identity = new AgentIdentity({ agent_id: name });
   saveIdentity(identity);
@@ -5124,8 +5127,10 @@ Advance the current milestone strictly based on these approved results. Do not i
 
   await endpoint.start();
 
-  // Auto-bind TG notifications on first start
-  try { autoBindNotifications(); } catch (e) { /* never block startup */ }
+  // Telegram notifications are opt-in by default. Only auto-bind when explicit consent was already collected.
+  if (ATEL_NOTIFY_AUTO_BIND) {
+    try { autoBindNotifications(); } catch (e) { /* never block startup */ }
+  }
 
   // Background retry for failed result pushes (durable queue)
   const flushResultPushQueue = async () => {
