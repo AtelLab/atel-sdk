@@ -102,14 +102,23 @@ else
   ENDPOINT_HOST=${ATEL_ENDPOINT_HOST:-$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 127.0.0.1)}
 fi
 PORT=${ATEL_PORT:-3000}
+register_agent() {
+  local name="$1" port="$2"
+  ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel register "$name" general "http://${ENDPOINT_HOST}:${port}" 2>&1
+}
+
 REG_OK=0
 for attempt in 1 2 3; do
-  if ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel register "$AGENT_NAME" general "http://${ENDPOINT_HOST}:${PORT}" 2>&1; then
+  if OUTPUT=$(register_agent "$AGENT_NAME" "$PORT" 2>&1); then
     REG_OK=1; echo "✅ Registered at port ${PORT}"; break
   fi
-  AGENT_NAME="agent-$(head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n')"
+  if echo "$OUTPUT" | grep -q "name already taken"; then
+    echo "❌ Agent name already taken: ${AGENT_NAME}"
+    echo "   Choose a different explicit name and rerun setup."
+    exit 1
+  fi
   PORT=$((PORT + 1))
-  echo "⚠️ Conflict, retrying..."
+  echo "⚠️ Port conflict, retrying on ${PORT}..."
 done
 
 # 启动后台服务

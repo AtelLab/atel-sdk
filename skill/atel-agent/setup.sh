@@ -70,8 +70,9 @@ for attempt in 1 2 3; do
   fi
   # Parse error type
   if echo "$OUTPUT" | grep -q "name already taken"; then
-    AGENT_NAME="agent-$(head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n')"
-    echo "⚠️ Name conflict, retrying as ${AGENT_NAME}..."
+    echo "❌ Agent name already taken: ${AGENT_NAME}"
+    echo "   Choose a different explicit name and rerun setup."
+    exit 1
   elif echo "$OUTPUT" | grep -q "endpoint already registered"; then
     PORT=$((PORT + 1))
     echo "⚠️ Port ${PORT-1} conflict, trying port ${PORT}..."
