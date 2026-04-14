@@ -90,6 +90,7 @@ const TRACES_DIR = resolve(ATEL_DIR, 'traces');
 const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
 const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
+const NOTIFY_ROUTES_FILE = resolve(ATEL_DIR, 'notify-routes.json');
 const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
 const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
 const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
@@ -222,6 +223,96 @@ function saveNotifyTargets(data) {
   writeFileSync(NOTIFY_TARGETS_FILE, JSON.stringify(data, null, 2));
 }
 
+function loadNotifyRoutes() {
+  try { return JSON.parse(readFileSync(NOTIFY_ROUTES_FILE, 'utf-8')); }
+  catch { return { version: 1, defaultTelegram: null, orderBindings: {} }; }
+}
+
+function saveNotifyRoutes(data) {
+  ensureDir();
+  writeFileSync(NOTIFY_ROUTES_FILE, JSON.stringify(data, null, 2));
+}
+
+function getPrimaryTelegramTarget() {
+  const targets = loadNotifyTargets();
+  return (targets.targets || []).find((target) => target && target.enabled !== false && target.channel === 'telegram' && target.target) || null;
+}
+
+function rememberTelegramRoute(chatId, botToken, orderId = '') {
+  const normalizedChatId = String(chatId || '').trim();
+  if (!normalizedChatId) return false;
+  const routes = loadNotifyRoutes();
+  const updatedAt = new Date().toISOString();
+  const nextDefault = { chatId: normalizedChatId, updatedAt };
+  if (botToken) nextDefault.botToken = botToken;
+  routes.defaultTelegram = nextDefault;
+  if (!routes.orderBindings || typeof routes.orderBindings !== 'object') routes.orderBindings = {};
+  if (orderId) {
+    routes.orderBindings[orderId] = { chatId: normalizedChatId, updatedAt };
+    if (botToken) routes.orderBindings[orderId].botToken = botToken;
+  }
+  saveNotifyRoutes(routes);
+  return true;
+}
+
+function rememberCurrentTelegramRoute(orderId = '') {
+  if (!String(process.env.OPENCLAW_SHELL || '').trim()) return false;
+  let chatId = discoverTelegramChat();
+  let botToken = discoverTelegramBot();
+  if (!chatId) {
+    const primary = getPrimaryTelegramTarget();
+    if (primary?.target) {
+      chatId = primary.target;
+      botToken = botToken || primary.botToken;
+    }
+  }
+  if (!chatId) return false;
+  return rememberTelegramRoute(chatId, botToken, orderId);
+}
+
+function dropTelegramRoute(orderId = '') {
+  if (!orderId) return false;
+  const routes = loadNotifyRoutes();
+  if (!routes.orderBindings || !routes.orderBindings[orderId]) return false;
+  delete routes.orderBindings[orderId];
+  saveNotifyRoutes(routes);
+  return true;
+}
+
+function resolveNotifyTargets(orderId = '') {
+  const targets = loadNotifyTargets();
+  let enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  const routes = loadNotifyRoutes();
+  const primary = getPrimaryTelegramTarget();
+  const preferred = (orderId && routes.orderBindings && routes.orderBindings[orderId]) || routes.defaultTelegram || (primary ? { chatId: String(primary.target), botToken: primary.botToken, updatedAt: primary.lastUsedAt || primary.createdAt || new Date().toISOString() } : null);
+  if (!preferred?.chatId) return { targets, enabled };
+  let hasTelegram = false;
+  enabled = enabled.map((target) => {
+    if (target.channel !== 'telegram') return target;
+    hasTelegram = true;
+    return {
+      ...target,
+      target: String(preferred.chatId),
+      botToken: preferred.botToken || target.botToken,
+      routeSource: orderId && routes.orderBindings && routes.orderBindings[orderId] ? 'order' : 'default',
+    };
+  });
+  if (!hasTelegram) {
+    enabled = [{
+      id: `tg_${preferred.chatId}`,
+      channel: 'telegram',
+      target: String(preferred.chatId),
+      botToken: preferred.botToken || discoverTelegramBot() || undefined,
+      label: orderId ? `order:${orderId}` : 'owner',
+      enabled: true,
+      createdAt: preferred.updatedAt || new Date().toISOString(),
+      lastUsedAt: null,
+      routeSource: orderId && routes.orderBindings && routes.orderBindings[orderId] ? 'order' : 'default',
+    }, ...enabled];
+  }
+  return { targets, enabled };
+}
+
 // Auto-detect current TG chat from OpenClaw session state
 function discoverTelegramChat() {
   const sessionPaths = [
@@ -252,10 +343,11 @@ function autoBindNotifications() {
   const targets = loadNotifyTargets();
   if (targets.targets.length > 0) return; // already has targets
 
-  const chatId = discoverTelegramChat();
+  const routes = loadNotifyRoutes();
+  const chatId = routes.defaultTelegram?.chatId || discoverTelegramChat();
   if (!chatId) return;
 
-  const botToken = discoverTelegramBot();
+  const botToken = routes.defaultTelegram?.botToken || discoverTelegramBot();
   const id = `tg_${chatId}`;
   targets.targets.push({
     id, channel: 'telegram', target: chatId,
@@ -264,6 +356,7 @@ function autoBindNotifications() {
     createdAt: new Date().toISOString(), lastUsedAt: null,
   });
   saveNotifyTargets(targets);
+  rememberTelegramRoute(chatId, botToken || undefined);
   console.log(`🔔 Auto-bound TG notifications to chat ${chatId}`);
 }
 
@@ -307,8 +400,8 @@ function discoverTelegramBot() {
 
 // Send notification to all enabled targets (fire-and-forget, never blocks)
 async function pushTradeNotification(eventType, payload, body) {
-  const targets = loadNotifyTargets();
-  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  const orderId = payload?.orderId || body?.orderId || '';
+  const { targets, enabled } = resolveNotifyTargets(orderId);
   if (enabled.length === 0) return;
 
   const templates = {
@@ -381,10 +474,10 @@ USDC 已支付`;
     },
   };
   const tmpl = templates[eventType];
-  const orderId = payload?.orderId || body?.orderId || '?';
+  const orderIdText = orderId || '?';
   const message = tmpl ? tmpl(payload) : `🔔 平台事件更新
 事件: ${eventType}
-订单: ${orderId}`;
+订单: ${orderIdText}`;
 
   for (const target of enabled) {
     try {
@@ -437,8 +530,7 @@ function appendP2PTaskStatus(entry) {
 }
 
 async function pushP2PNotification(eventType, payload = {}) {
-  const targets = loadNotifyTargets();
-  const enabled = (targets.targets || []).filter(t => t.enabled !== false);
+  const { targets, enabled } = resolveNotifyTargets('');
   if (enabled.length === 0) return;
 
   const templates = {
@@ -1165,6 +1257,7 @@ function saveTrackedOrders(orders) {
 }
 function trackOrder(orderId, role) {
   if (!orderId || !role) return;
+  rememberCurrentTelegramRoute(orderId);
   const now = new Date().toISOString();
   const orders = loadTrackedOrders().filter((o) => o && o.orderId);
   const existing = orders.find((o) => o.orderId === orderId);
@@ -1179,6 +1272,7 @@ function trackOrder(orderId, role) {
 function untrackOrder(orderId) {
   if (!orderId) return;
   saveTrackedOrders(loadTrackedOrders().filter((o) => o?.orderId !== orderId));
+  dropTelegramRoute(orderId);
 }
 function loadTasks() { if (!existsSync(TASKS_FILE)) return {}; try { return JSON.parse(readFileSync(TASKS_FILE, 'utf-8')); } catch { return {}; } }
 function saveTasks(t) { ensureDir(); writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2)); }
@@ -6408,6 +6502,7 @@ async function cmdOrder(executorDid, capType, price) {
     };
     if (chainArg) { orderBody.chain = chainArg; }
     const data = await signedFetch('POST', '/trade/v1/order', orderBody);
+    if (data?.orderId) trackOrder(data.orderId, 'requester');
     
     // For paid orders: show escrow info (chain escrow creation handled by Platform backend)
     if (data.orderId && parseFloat(price) > 0 && data.escrow?.escrowContract) {
@@ -6983,6 +7078,7 @@ async function cmdComplete(orderId, taskId) {
 async function cmdConfirm(orderId) {
   if (!orderId) { console.error('Usage: atel confirm <orderId>'); process.exit(1); }
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/confirm`);
+  rememberCurrentTelegramRoute(orderId);
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -7040,6 +7136,7 @@ async function cmdMilestoneFeedback(orderId) {
 
   const payload = approve ? { approved: true } : { approved: false, feedback };
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestones/feedback`, payload);
+  rememberCurrentTelegramRoute(orderId);
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -7111,6 +7208,7 @@ async function cmdMilestoneSubmit(orderId, indexStr) {
     resultSummary: resultText,
     resultHash,
   });
+  rememberCurrentTelegramRoute(orderId);
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -7160,9 +7258,11 @@ async function cmdMilestoneVerify(orderId, indexStr) {
       process.exit(1);
     }
     const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: false, rejectReason });
+    rememberCurrentTelegramRoute(orderId);
     console.log(JSON.stringify(data, null, 2));
   } else {
     const data = await signedFetch('POST', `/trade/v1/order/${orderId}/milestone/${indexStr}/verify`, { passed: true });
+    rememberCurrentTelegramRoute(orderId);
     console.log(JSON.stringify(data, null, 2));
   }
 }
@@ -8864,6 +8964,7 @@ const commands = {
         createdAt: new Date().toISOString(), lastUsedAt: null,
       });
       saveNotifyTargets(targets);
+      rememberTelegramRoute(chatId, botToken || undefined);
       console.log(`✅ Bound TG chat ${chatId} as notification target (id: ${id})`);
       if (!botToken) console.log('⚠️  No bot token found. Set TELEGRAM_BOT_TOKEN or use --bot-token');
       return;
