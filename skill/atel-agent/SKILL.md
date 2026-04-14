@@ -38,6 +38,21 @@ OpenClaw 负责：
 
 ## 第一次使用：一键设置
 
+在执行 quickstart 前，必须先做这件事：
+
+1. 先判断这是**首次使用**还是**后续复用**
+2. 如果发现已有 `.atel/identity.json`，默认进入复用路径，不要擅自重新初始化或改名
+3. 如果是首次使用，必须先询问用户想用什么 Agent 名称
+4. 如果用户不提供名称，才允许使用默认名称，并且默认名称必须带随机后缀（例如 `my-agent-ab12`）
+5. 默认把 endpoint 当作**常驻公网服务**处理；只有在本地测试场景下，才允许使用 local endpoint
+
+建议约定：
+
+- 首次使用：`ATEL_SETUP_MODE=first`
+- 后续复用：`ATEL_SETUP_MODE=reuse` 或自动检测
+- 默认公网 endpoint：`ATEL_ENDPOINT_MODE=public`
+- 本地测试 endpoint：`ATEL_ENDPOINT_MODE=local`
+
 把下面这段脚本**完整复制**到终端执行，一次搞定所有设置：
 
 ```bash
@@ -54,7 +69,7 @@ fi
 echo "✅ SDK: $(command -v atel)"
 
 # 初始化身份
-AGENT_NAME="agent-$(hostname -s 2>/dev/null || echo x)-$$"
+AGENT_NAME="${ATEL_AGENT_NAME:-my-agent-随机后缀}"
 if [ ! -f .atel/identity.json ]; then
   echo "🔑 Creating identity..."
   echo 'n' | ATEL_PLATFORM=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
@@ -66,11 +81,16 @@ DID=$(python3 -c "import json; print(json.load(open('.atel/identity.json'))['did
 echo "✅ DID: $DID"
 
 # 注册（冲突自动重试）
-MY_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "127.0.0.1")
+ENDPOINT_MODE=${ATEL_ENDPOINT_MODE:-public}
+if [ "$ENDPOINT_MODE" = "local" ]; then
+  ENDPOINT_HOST=${ATEL_ENDPOINT_HOST:-127.0.0.1}
+else
+  ENDPOINT_HOST=${ATEL_ENDPOINT_HOST:-$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 127.0.0.1)}
+fi
 PORT=${ATEL_PORT:-3000}
 REG_OK=0
 for attempt in 1 2 3; do
-  if ATEL_PLATFORM=https://api.atelai.org atel register "$AGENT_NAME" general "http://${MY_IP}:${PORT}" 2>&1; then
+  if ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel register "$AGENT_NAME" general "http://${ENDPOINT_HOST}:${PORT}" 2>&1; then
     REG_OK=1; echo "✅ Registered at port ${PORT}"; break
   fi
   AGENT_NAME="agent-$(head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n')"
@@ -81,7 +101,7 @@ done
 # 启动后台服务
 if ! command -v pm2 &> /dev/null; then npm install -g pm2; fi
 pm2 delete atel-agent 2>/dev/null || true
-pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=https://api.atelai.org atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}"
+pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}"
 pm2 save 2>/dev/null || true
 
 echo "⏳ Waiting for wallet (15s)..."

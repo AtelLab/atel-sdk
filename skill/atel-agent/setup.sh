@@ -3,9 +3,12 @@
 set -euo pipefail
 
 echo "🤝 ATEL Agent Setup Starting..."
+PLATFORM_URL="${ATEL_PLATFORM:-https://api.atelai.org}"
+ENDPOINT_MODE="${ATEL_ENDPOINT_MODE:-public}"
+DEFAULT_AGENT_NAME="my-agent-$(head -c 2 /dev/urandom | od -A n -t x1 | tr -d " \n")"
 
 # 1. 创建专用目录
-WORKSPACE="$HOME/atel-workspace"
+WORKSPACE="${ATEL_WORKSPACE:-$HOME/atel-workspace}"
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
@@ -16,28 +19,40 @@ if ! command -v atel &> /dev/null; then
 fi
 echo "✅ SDK: $(command -v atel)"
 
-# 3. 生成唯一名字
-AGENT_NAME="agent-$(hostname -s 2>/dev/null || echo x)-$$"
-
-# 4. 初始化身份
-if [ ! -f .atel/identity.json ]; then
-  echo "🔑 Creating identity as ${AGENT_NAME}..."
-  echo 'n' | ATEL_PLATFORM=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
+# 3. 初始化身份（区分首次使用与后续复用）
+if [ -f .atel/identity.json ]; then
+  echo "✅ Existing identity detected"
+  AGENT_NAME=$(python3 -c "import json; print(json.load(open('.atel/identity.json')).get('agent_id','agent-reuse'))" 2>/dev/null || echo "$DEFAULT_AGENT_NAME")
+  DID=$(python3 -c "import json; print(json.load(open('.atel/identity.json'))['did'])" 2>/dev/null || echo "unknown")
+  echo "✅ Reusing agent: ${AGENT_NAME}"
 else
-  echo "✅ Identity already exists"
-  AGENT_NAME=$(python3 -c "import json; print(json.load(open('.atel/identity.json')).get('agent_id','agent-reuse'))" 2>/dev/null || echo "$AGENT_NAME")
+  AGENT_NAME="${ATEL_AGENT_NAME:-}"
+  if [ -z "$AGENT_NAME" ]; then
+    if [ -t 0 ]; then
+      read -r -p "Choose your agent name [${DEFAULT_AGENT_NAME}]: " USER_AGENT_NAME || true
+      AGENT_NAME="${USER_AGENT_NAME:-$DEFAULT_AGENT_NAME}"
+    else
+      AGENT_NAME="$DEFAULT_AGENT_NAME"
+    fi
+  fi
+  echo "🔑 Creating identity as ${AGENT_NAME}..."
+  echo 'n' | ATEL_PLATFORM="$PLATFORM_URL" atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
+  DID=$(python3 -c "import json; print(json.load(open('.atel/identity.json'))['did'])" 2>/dev/null || echo "unknown")
 fi
 
-DID=$(python3 -c "import json; print(json.load(open('.atel/identity.json'))['did'])" 2>/dev/null || echo "unknown")
 echo "✅ DID: $DID"
 
-# 5. 注册（409 endpoint 冲突：换端口重试；409 name 冲突：换名重试）
-MY_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "127.0.0.1")
+# 4. 注册（默认优先公网 endpoint，本地测试才允许 local）
+if [ "$ENDPOINT_MODE" = "local" ]; then
+  ENDPOINT_HOST="${ATEL_ENDPOINT_HOST:-127.0.0.1}"
+else
+  ENDPOINT_HOST="${ATEL_ENDPOINT_HOST:-$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 127.0.0.1)}"
+fi
 PORT=${ATEL_PORT:-3000}
 
 register_agent() {
   local name="$1" port="$2"
-  ATEL_PLATFORM=https://api.atelai.org atel register "$name" general "http://${MY_IP}:${port}" 2>&1
+  ATEL_PLATFORM="$PLATFORM_URL" atel register "$name" general "http://${ENDPOINT_HOST}:${port}" 2>&1
 }
 
 REG_OK=0
@@ -64,17 +79,21 @@ if [ $REG_OK -eq 0 ]; then
   echo "❌ Registration failed after 3 attempts. atel start will auto-register."
 fi
 
-# 6. 安装 pm2
+# 5. 安装 pm2
 if ! command -v pm2 &> /dev/null; then
   npm install -g pm2 || { echo "❌ pm2 install failed"; exit 1; }
 fi
 
-# 7. 启动 atel start（先启动，不阻塞等钱包）
-pm2 delete atel-agent 2>/dev/null || true
-pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=https://api.atelai.org atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}" || { echo "❌ pm2 start failed"; exit 1; }
-pm2 save 2>/dev/null || true
+# 6. 启动常驻 endpoint（默认常驻；测试可跳过）
+if [ "${ATEL_SKIP_PM2:-0}" = "1" ]; then
+  echo "⚠️ pm2 start skipped by ATEL_SKIP_PM2=1"
+else
+  pm2 delete atel-agent 2>/dev/null || true
+  pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=${PLATFORM_URL} atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}" || { echo "❌ pm2 start failed"; exit 1; }
+  pm2 save 2>/dev/null || true
+fi
 
-# 8. 等钱包（短等，不阻塞太久）
+# 7. 等钱包（短等，不阻塞太久）
 echo "⏳ Waiting for wallet (15s)..."
 sleep 15
 
@@ -107,13 +126,16 @@ fi
 
 if [ -n "$CHAT_ID" ]; then
   echo "🔔 Binding notifications to current Telegram chat: $CHAT_ID"
-  cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
-  cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+  if [ "${ATEL_SKIP_NOTIFY_TEST:-0}" != "1" ]; then
+    cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
+    cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+  fi
 else
   echo "⚠️ Could not auto-detect Telegram chat. Run: atel notify bind <chat_id>"
 fi
 
 echo "DID: $DID"
+echo "Endpoint mode: $ENDPOINT_MODE ($ENDPOINT_HOST:$PORT)"
 echo "Port: $PORT"
 echo "pm2: $(pm2 jlist 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['pm2_env']['status'] if d else 'unknown')" 2>/dev/null || echo 'check: pm2 status')"
 echo "========================================="

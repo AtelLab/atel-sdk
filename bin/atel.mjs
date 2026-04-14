@@ -312,65 +312,121 @@ async function pushTradeNotification(eventType, payload, body) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'order_created': (p) => `📥 收到新订单\n订单: ${p.orderId || body?.orderId || '?'}\n金额: $${p.priceAmount ?? '?'} USDC\n来自: ${p.requesterDid || '未知请求方'}\n请审核后决定是否接单`,
-    'order_accepted': (p) => `📋 订单已被接单\n订单: ${p.orderId || body?.orderId || '?'}\n执行方已开始处理，进入里程碑阶段`,
+    'order_created': (p) => `📥 收到新订单
+订单: ${p.orderId || body?.orderId || '?'}
+金额: $${p.priceAmount ?? '?'} USDC
+来自: ${p.requesterDid || '未知请求方'}
+请审核后决定是否接单`,
+    'order_accepted': (p) => `📋 订单已被接单
+订单: ${p.orderId || body?.orderId || '?'}
+执行方已开始处理，进入里程碑阶段`,
+    'escrow_confirmed': (p) => `🔒 托管已确认
+订单: ${p.orderId || body?.orderId || '?'}
+链上托管已完成，等待里程碑方案确认`,
+    'milestone_plan_confirmed': (p) => {
+      const desc = p.milestoneDescription || p.nextMilestoneDescription || '';
+      const progress = p.totalMilestones ? `
+进度: 1/${p.totalMilestones}` : '';
+      return `🚀 里程碑方案已确认
+订单: ${p.orderId || body?.orderId || '?'}${desc ? `
+当前里程碑: ${desc}` : ''}${progress}`;
+    },
     'milestone_submitted': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}\n等待审核`;
+      const desc = p.milestoneDescription ? `
+目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `
+提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交
+订单: ${p.orderId || body?.orderId || '?'}${desc}${content}
+等待审核`;
     },
     'milestone_verified': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `\n提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      const progress = p.totalMilestones ? `\n进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
-      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过\n订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
+      const desc = p.milestoneDescription ? `
+目标: ${p.milestoneDescription}` : '';
+      const content = p.resultSummary ? `
+提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
+      const progress = p.totalMilestones ? `
+进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
+      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过
+订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
     },
     'milestone_rejected': (p) => {
-      const desc = p.milestoneDescription ? `\n目标: ${p.milestoneDescription}` : '';
-      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝\n订单: ${p.orderId || body?.orderId || '?'}${desc}\n原因: ${p.rejectReason || '未说明'}`;
+      const desc = p.milestoneDescription ? `
+目标: ${p.milestoneDescription}` : '';
+      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝
+订单: ${p.orderId || body?.orderId || '?'}${desc}
+原因: ${p.rejectReason || '未说明'}`;
     },
+    'order_completed': (p) => `📦 订单已提交完成
+订单: ${p.orderId || body?.orderId || '?'}
+等待对方确认或系统自动确认`,
+    'order_cancelled': (p) => `🛑 订单已取消
+订单: ${p.orderId || body?.orderId || '?'}
+原因: ${p.reason || '未说明'}`,
+    'order_expired': (p) => `⌛ 订单已过期
+订单: ${p.orderId || body?.orderId || '?'}
+系统已自动结束该订单`,
+    'dispute_created': (p) => `⚖️ 争议已创建
+订单: ${p.orderId || body?.orderId || '?'}
+请尽快补充证据`,
+    'dispute_resolved': (p) => `🧾 争议已处理完成
+订单: ${p.orderId || body?.orderId || '?'}
+结果: ${p.result || p.resolution || '已裁定'}`,
     'order_settled': (p) => {
-      const amount = p.priceAmount ? `\n金额: $${p.priceAmount} USDC` : '';
-      return `💰 订单已结算完成\n订单: ${p.orderId || body?.orderId || '?'}${amount}\nUSDC 已支付`;
+      const amount = p.priceAmount ? `
+金额: $${p.priceAmount} USDC` : '';
+      return `💰 订单已结算完成
+订单: ${p.orderId || body?.orderId || '?'}${amount}
+USDC 已支付`;
     },
   };
   const tmpl = templates[eventType];
-  if (!tmpl) return;
-  const message = tmpl(payload);
+  const orderId = payload?.orderId || body?.orderId || '?';
+  const message = tmpl ? tmpl(payload) : `🔔 平台事件更新
+事件: ${eventType}
+订单: ${orderId}`;
 
   for (const target of enabled) {
     try {
-      if (target.channel === 'telegram' && target.botToken) {
-        // Direct TG Bot API — no gateway needed
-        // Note: parse_mode is intentionally omitted. Templates render plain
-        // text (no HTML markup), and milestone payloads frequently contain
-        // raw `<` characters (e.g. "<5秒", "<30秒") that would otherwise
-        // trip Telegram's HTML parser and cause silent 400 drops.
-        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+      if (target.channel === 'telegram') {
+        if (!target.botToken) {
+          log({ event: 'trade_notify_target_skipped', eventType, channel: 'telegram', target: target.id || target.target, reason: 'missing_bot_token' });
+          continue;
+        }
+        const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: target.target, text: message }),
           signal: AbortSignal.timeout(5000),
-        }).catch(() => {});
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || data?.ok === false) {
+          log({ event: 'trade_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
+          continue;
+        }
       } else if (target.channel === 'gateway') {
-        // OpenClaw gateway
         const gw = discoverGateway();
         if (gw?.url && gw?.token) {
-          await fetch(`${gw.url}/tools/invoke`, {
+          const resp = await fetch(`${gw.url}/tools/invoke`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
             body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
             signal: AbortSignal.timeout(5000),
-          }).catch(() => {});
+          });
+          if (!resp.ok) {
+            log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: resp.status, error: `http_${resp.status}` });
+            continue;
+          }
+        } else {
+          log({ event: 'trade_notify_target_skipped', eventType, channel: 'gateway', target: target.id || target.target, reason: 'missing_gateway' });
+          continue;
         }
       }
-      // Update lastUsedAt
       target.lastUsedAt = new Date().toISOString();
     } catch (e) {
-      // Never block main flow
+      log({ event: 'trade_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
     }
   }
-  // Best-effort save lastUsedAt
   try { saveNotifyTargets(targets); } catch {}
 }
 
@@ -386,12 +442,30 @@ async function pushP2PNotification(eventType, payload = {}) {
   if (enabled.length === 0) return;
 
   const templates = {
-    'p2p_task_sent': (p) => `📤 P2P任务已发送\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
-    'p2p_task_received': (p) => `📩 收到新的P2P任务\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
-    'p2p_task_started': (p) => `▶️ P2P任务开始处理\n任务: ${p.taskId || '?'}\n来自: ${p.peerDid || '?'}`,
-    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方\n任务: ${p.taskId || '?'}\n目标: ${p.peerDid || '?'}`,
-    'p2p_result_received': (p) => `✅ P2P任务已完成\n任务: ${p.taskId || '?'}\n结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
-    'p2p_task_failed': (p) => `❌ P2P任务失败\n任务: ${p.taskId || '?'}\n原因: ${p.reason || '未知错误'}`,
+    'p2p_task_sent': (p) => `📤 P2P任务已发送
+任务: ${p.taskId || '?'}
+目标: ${p.peerDid || '?'}`,
+    'p2p_task_received': (p) => `📩 收到新的P2P任务
+任务: ${p.taskId || '?'}
+来自: ${p.peerDid || '?'}`,
+    'p2p_task_started': (p) => `▶️ P2P任务开始处理
+任务: ${p.taskId || '?'}
+来自: ${p.peerDid || '?'}`,
+    'p2p_result_submitted': (p) => `📨 P2P结果已发回对方
+任务: ${p.taskId || '?'}
+目标: ${p.peerDid || '?'}`,
+    'p2p_result_received': (p) => `✅ P2P任务已完成
+任务: ${p.taskId || '?'}
+结果: ${String(p.result || '').slice(0, 80) || '已返回'}`,
+    'p2p_task_failed': (p) => `❌ P2P任务失败
+任务: ${p.taskId || '?'}
+原因: ${p.reason || '未知错误'}`,
+    'p2p_message_received': (p) => `💬 收到新消息
+来自: ${p.peerDid || '?'}
+内容: ${String(p.text || '').slice(0, 120) || '[message]'}`,
+    'p2p_contact_added': (p) => `👤 联系人提醒
+来自: ${p.peerDid || '?'}${p.alias ? `
+备注: ${p.alias}` : ''}`,
   };
   const tmpl = templates[eventType];
   if (!tmpl) return;
@@ -399,27 +473,44 @@ async function pushP2PNotification(eventType, payload = {}) {
 
   for (const target of enabled) {
     try {
-      if (target.channel === 'telegram' && target.botToken) {
-        // parse_mode intentionally omitted — see pushTradeNotification for rationale
-        await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+      if (target.channel === 'telegram') {
+        if (!target.botToken) {
+          log({ event: 'p2p_notify_target_skipped', eventType, channel: 'telegram', target: target.id || target.target, reason: 'missing_bot_token' });
+          continue;
+        }
+        const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: target.target, text: message }),
           signal: AbortSignal.timeout(5000),
-        }).catch(() => {});
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || data?.ok === false) {
+          log({ event: 'p2p_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
+          continue;
+        }
       } else if (target.channel === 'gateway') {
         const gw = discoverGateway();
         if (gw?.url && gw?.token) {
-          await fetch(`${gw.url}/tools/invoke`, {
+          const resp = await fetch(`${gw.url}/tools/invoke`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
             body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
             signal: AbortSignal.timeout(5000),
-          }).catch(() => {});
+          });
+          if (!resp.ok) {
+            log({ event: 'p2p_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: resp.status, error: `http_${resp.status}` });
+            continue;
+          }
+        } else {
+          log({ event: 'p2p_notify_target_skipped', eventType, channel: 'gateway', target: target.id || target.target, reason: 'missing_gateway' });
+          continue;
         }
       }
       target.lastUsedAt = new Date().toISOString();
-    } catch {}
+    } catch (e) {
+      log({ event: 'p2p_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
+    }
   }
   try { saveNotifyTargets(targets); } catch {}
 }
@@ -1116,6 +1207,17 @@ function syncNetworkConfigToPort(networkConfig, port) {
     next.candidates = next.candidates.map((candidate) => {
       if (!candidate || typeof candidate !== 'object') return candidate;
       const updated = { ...candidate };
+      if (updated.type === 'relay') {
+        if (typeof next.relayUrl === 'string' && next.relayUrl.trim() && updated.url !== next.relayUrl) {
+          updated.url = next.relayUrl;
+          changed = true;
+        }
+        if (updated.port && updated.port !== 18204) {
+          updated.port = 18204;
+          changed = true;
+        }
+        return updated;
+      }
       if (updated.port !== port) { updated.port = port; changed = true; }
       updated.url = rewriteUrlPort(updated.url);
       return updated;
@@ -1123,6 +1225,34 @@ function syncNetworkConfigToPort(networkConfig, port) {
   }
   if (changed) next.configuredAt = new Date().toISOString();
   return { config: next, changed };
+}
+function isLegacyPassiveRelayMessage(req) {
+  if (!req || typeof req !== 'object' || Array.isArray(req)) return false;
+  const path = typeof req.path === 'string' ? req.path.trim() : '';
+  const method = typeof req.method === 'string' ? req.method.trim().toUpperCase() : '';
+  if (path || method) return false;
+  const kind = typeof req.kind === 'string' ? req.kind.trim() : '';
+  const text = typeof req.text === 'string' ? req.text.trim() : '';
+  const msgType = typeof req.msgType === 'string' ? req.msgType.trim() : '';
+  return Boolean(text || msgType === 'message' || kind === 'portal_message' || kind === 'contact_added');
+}
+function buildPassiveRelayRequest(req, senderDid = '') {
+  const normalizedSender = String(req?.senderDid || req?.from || senderDid || '').trim();
+  const normalizedKind = typeof req?.kind === 'string' && req.kind.trim()
+    ? req.kind.trim()
+    : ((typeof req?.msgType === 'string' && req.msgType.trim() === 'message') || typeof req?.text === 'string'
+      ? 'portal_message'
+      : 'relay_message');
+  return {
+    method: 'POST',
+    path: '/atel/v1/relay-message',
+    body: {
+      ...req,
+      senderDid: normalizedSender,
+      kind: normalizedKind,
+      timestamp: req?.timestamp || new Date().toISOString(),
+    },
+  };
 }
 function isAckableMalformedRelayMessage(req, inner) {
   if (typeof inner === 'string') {
@@ -1150,6 +1280,7 @@ const HUMAN_INBOX_EVENTS = new Set([
   'friend_request_received',
   'friend_request_accepted_by_peer',
   'friend_request_rejected_by_peer',
+  'relay_message_received',
 ]);
 function isHumanInboxEntry(entry) {
   if (!entry || typeof entry !== 'object') return false;
@@ -2095,7 +2226,25 @@ async function configureAnchor() {
 // ─── Commands ────────────────────────────────────────────────────
 
 async function cmdInit(agentId) {
-  const name = agentId || `agent-${Date.now()}`;
+  const existingIdentity = loadIdentity();
+  if (existingIdentity && process.env.ATEL_REINIT != '1') {
+    console.log(JSON.stringify({
+      status: 'exists',
+      agent_id: existingIdentity.agent_id,
+      did: existingIdentity.did,
+      next: 'Reuse existing identity. Run: atel start [port]'
+    }, null, 2));
+    return;
+  }
+
+  const fallbackName = `my-agent-${Math.random().toString(36).slice(2, 6)}`;
+  let name = (agentId || '').trim();
+  if (!name && process.stdin.isTTY) {
+    const chosen = await promptInput(`Choose your agent name [${fallbackName}]:`);
+    name = chosen || fallbackName;
+  }
+  if (!name) name = fallbackName;
+
   const identity = new AgentIdentity({ agent_id: name });
   saveIdentity(identity);
   savePolicy(DEFAULT_POLICY);
@@ -2103,10 +2252,19 @@ async function cmdInit(agentId) {
   // Create default agent-context.md for built-in executor
   const ctxFile = resolve(ATEL_DIR, 'agent-context.md');
   if (!existsSync(ctxFile)) {
-    writeFileSync(ctxFile, `# Agent Context\n\nYou are an ATEL agent (${name}) processing tasks from other agents via the ATEL protocol.\n\n## Guidelines\n- Complete the task accurately and concisely\n- Return only the requested result, no extra commentary\n- If the task is unclear, do your best interpretation\n- Do not access private files or sensitive data\n- Do not make external network requests unless the task requires it\n`);
+    writeFileSync(ctxFile, `# Agent Context
+
+You are an ATEL agent (${name}) processing tasks from other agents via the ATEL protocol.
+
+## Guidelines
+- Complete the task accurately and concisely
+- Return only the requested result, no extra commentary
+- If the task is unclear, do your best interpretation
+- Do not access private files or sensitive data
+- Do not make external network requests unless the task requires it
+`);
   }
   
-  // Ask about paid order services
   console.log('');
   const providePaidOrders = await promptYesNo(
     'Do you want to provide paid order services? (requires on-chain anchoring)'
@@ -2131,7 +2289,6 @@ async function cmdInit(agentId) {
     next: 'Run: atel start [port] — auto-configures network and registers'
   }, null, 2));
 
-  // Auto-install SKILL.md to OpenClaw skills directory
   try {
     const sdkSkillPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent', 'SKILL.md');
     if (existsSync(sdkSkillPath)) {
@@ -2329,7 +2486,7 @@ async function cmdStatus() {
 async function cmdSetup(port) {
   const p = parseInt(port || '3100');
   console.log(JSON.stringify({ event: 'network_setup', port: p }));
-  const net = await autoNetworkSetup(p);
+  const net = await autoNetworkSetup(p, ATEL_RELAY);
   for (const step of net.steps) console.log(JSON.stringify({ event: 'step', message: step }));
   if (net.endpoint) {
     saveNetwork({ publicIP: net.publicIP, port: p, endpoint: net.endpoint, upnp: net.upnpSuccess, reachable: net.reachable, configuredAt: new Date().toISOString() });
@@ -2641,7 +2798,7 @@ async function cmdStart(port) {
   let networkConfig = loadNetwork();
   if (!networkConfig) {
     log({ event: 'network_setup', status: 'auto-detecting' });
-    networkConfig = await autoNetworkSetup(p);
+    networkConfig = await autoNetworkSetup(p, ATEL_RELAY);
     for (const step of networkConfig.steps) log({ event: 'network_step', message: step });
     delete networkConfig.steps;
     saveNetwork(networkConfig);
@@ -3408,14 +3565,23 @@ Format:
   }
 
   function queueAgentHook(eventType, dedupeKey, promptText, cwd, payload = {}, options = {}) {
-    if (!detectedAgentCmd) return false;
+    if (!detectedAgentCmd) {
+      log({ event: 'agent_hook_not_queued', eventType, dedupeKey, reason: 'missing_agent_cmd' });
+      return false;
+    }
     const safePrompt = sanitizeAgentPrompt(promptText, { eventType, dedupeKey });
-    if (!safePrompt) return false;
+    if (!safePrompt) {
+      log({ event: 'agent_hook_not_queued', eventType, dedupeKey, reason: 'empty_prompt' });
+      return false;
+    }
     const parsedCmd = detectedAgentCmd.trim().split(/\s+/);
     parsedCmd.push(safePrompt);
     const recoveryKey = options.recoveryKey || '';
     if (recoveryKey) {
-      if (activeRecoveryKeys.has(recoveryKey)) return false;
+      if (activeRecoveryKeys.has(recoveryKey)) {
+        log({ event: 'agent_hook_not_queued', eventType, dedupeKey, reason: 'recovery_key_active', recoveryKey });
+        return false;
+      }
       activeRecoveryKeys.add(recoveryKey);
     }
     hookQueue.push({ event: eventType, dedupeKey, cmd: parsedCmd[0], args: parsedCmd.slice(1), cwd, payload, recoveryKey });
@@ -3462,7 +3628,7 @@ Format:
     const ms = await fetchMilestoneState(orderId);
     if (ms.orderStatus !== 'executing') return;
 
-    if (executorDid === id.did && ms.phase === 'waiting_executor_submission') {
+    if (executorDid === id.did && ['waiting_executor_submission', 'waiting_executor_resubmission'].includes(ms.phase)) {
       const currentIndex = Number.isFinite(ms.currentMilestone) ? ms.currentMilestone : 0;
       const currentMilestone = (ms.milestones || []).find(m => m.index === currentIndex) || {};
       const previousApprovedOutputs = summarizeApprovedMilestones(ms.milestones || [], currentIndex);
@@ -3477,33 +3643,64 @@ Format:
         milestoneObjective: currentMilestone.title || '',
         previousApprovedOutputs,
       });
-      const eventType = currentIndex === 0 ? 'milestone_plan_confirmed' : 'milestone_verified';
-      const payload = currentIndex === 0
+      const isResubmission = ms.phase === 'waiting_executor_resubmission' || currentMilestone.status === 'rejected';
+      const eventType = isResubmission
+        ? 'milestone_rejected'
+        : (currentIndex === 0 ? 'milestone_plan_confirmed' : 'milestone_verified');
+      const payload = isResubmission
         ? {
             orderId,
-            milestoneIndex: 0,
+            milestoneIndex: currentIndex,
             totalMilestones: ms.totalMilestones || 5,
             milestoneDescription: currentMilestone.title || '',
             orderDescription,
             previousApprovedOutputs,
+            rejectReason: currentMilestone.rejectReason || '',
+            submitCount: currentMilestone.submitCount || 0,
           }
-        : {
-            orderId,
-            milestoneIndex: currentIndex - 1,
-            currentMilestone: currentIndex,
-            totalMilestones: ms.totalMilestones || 5,
-            allComplete: false,
-            nextMilestoneDescription: currentMilestone.title || '',
-            orderDescription,
-            previousApprovedOutputs,
-          };
-      const promptText = currentIndex === 0
-        ? `You are the ATEL executor agent. The plan has been confirmed and execution begins.\nOriginal order requirements: ${orderDescription || 'not provided'}\nCurrent milestone M0: ${currentMilestone.title || ''}\nComplete only this milestone for the current order and return the final deliverable via the callback.`
-        : `You are the ATEL executor agent. M${currentIndex - 1} has been approved.\nOriginal order requirements: ${orderDescription || 'not provided'}\nNext milestone M${currentIndex}: ${currentMilestone.title || ''}\nPreviously approved outputs:\n${previousApprovedOutputs || 'none'}\n\nAdvance the current milestone strictly based on these approved results. Do not invent missing materials or read local shared files to fill missing context. After completion, return the final deliverable via the callback.`;
+        : (currentIndex === 0
+          ? {
+              orderId,
+              milestoneIndex: 0,
+              totalMilestones: ms.totalMilestones || 5,
+              milestoneDescription: currentMilestone.title || '',
+              orderDescription,
+              previousApprovedOutputs,
+            }
+          : {
+              orderId,
+              milestoneIndex: currentIndex - 1,
+              currentMilestone: currentIndex,
+              totalMilestones: ms.totalMilestones || 5,
+              allComplete: false,
+              nextMilestoneDescription: currentMilestone.title || '',
+              orderDescription,
+              previousApprovedOutputs,
+            });
+      const promptText = isResubmission
+        ? `You are the ATEL executor agent. Your previous submission for milestone M${currentIndex} was rejected.
+Original order requirements: ${orderDescription || 'not provided'}
+Current milestone M${currentIndex}: ${currentMilestone.title || ''}
+Previously approved outputs:
+${previousApprovedOutputs || 'none'}
+
+Revise only the rejected milestone based on the rejection feedback and submit an improved deliverable.`
+        : (currentIndex === 0
+          ? `You are the ATEL executor agent. The plan has been confirmed and execution begins.
+Original order requirements: ${orderDescription || 'not provided'}
+Current milestone M0: ${currentMilestone.title || ''}
+Complete only this milestone for the current order and return the final deliverable via the callback.`
+          : `You are the ATEL executor agent. M${currentIndex - 1} has been approved.
+Original order requirements: ${orderDescription || 'not provided'}
+Next milestone M${currentIndex}: ${currentMilestone.title || ''}
+Previously approved outputs:
+${previousApprovedOutputs || 'none'}
+
+Advance the current milestone strictly based on these approved results. Do not invent missing materials or read local shared files to fill missing context. After completion, return the final deliverable via the callback.`);
       const recoveryKey = buildMilestoneHookRecoveryKey(eventType, payload);
-      log({ event: 'trade_reconcile_executor', orderId, currentMilestone: currentIndex, recoveryKey });
+      log({ event: 'trade_reconcile_executor', orderId, currentMilestone: currentIndex, phase: ms.phase, recoveryKey });
       const queued = queueAgentHook(eventType, recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
-      if (queued) log({ event: 'trade_reconcile_executor_queued', orderId, currentMilestone: currentIndex, recoveryKey });
+      if (queued) log({ event: 'trade_reconcile_executor_queued', orderId, currentMilestone: currentIndex, phase: ms.phase, recoveryKey });
       return;
     }
 
@@ -3588,6 +3785,33 @@ Format:
       }
     }
   }
+
+  endpoint.app?.post?.('/atel/v1/relay-message', async (req, res) => {
+    const body = req.body || {};
+    const senderDid = String(body.senderDid || body.from || '').trim();
+    const kind = String(body.kind || ((typeof body.msgType === 'string' && body.msgType === 'message') || typeof body.text === 'string' ? 'portal_message' : 'relay_message')).trim();
+    const text = typeof body.text === 'string' && body.text.trim()
+      ? body.text.trim()
+      : (typeof body.summary === 'string' && body.summary.trim()
+        ? body.summary.trim()
+        : (kind === 'contact_added' && senderDid ? `${senderDid} added you as a contact` : '[message]'));
+
+    log({
+      event: 'relay_message_received',
+      kind,
+      from: senderDid,
+      text,
+      timestamp: body.timestamp || new Date().toISOString(),
+    });
+
+    if (kind === 'contact_added') {
+      pushP2PNotification('p2p_contact_added', { peerDid: senderDid, alias: body.alias || '', text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+    } else {
+      pushP2PNotification('p2p_message_received', { peerDid: senderDid, text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+    }
+
+    res.json({ status: 'ok', kind });
+  });
 
   // Webhook notification: POST /atel/v1/notify
   // SDK only: logs, writes inbox, prints prompt. Does NOT execute any actions.
@@ -3943,7 +4167,13 @@ Format:
             return;
           }
 
-          log({ event: 'agent_cmd_done', eventType: hookEvent, dedupeKey: hookKey, duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 300) });
+          if (localAction.skipped) {
+            log({ event: 'agent_cmd_skipped', eventType: hookEvent, dedupeKey: hookKey, reason: localAction.reason || 'skipped', duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 200) });
+            finishHook();
+            return;
+          }
+
+          log({ event: 'agent_cmd_local_parse_error', eventType: hookEvent, dedupeKey: hookKey, error: localAction.error || 'invalid_local_agent_stdout', duration_ms: durationMs, stdout: summarizeAgentOutput(stdout, 300) });
           finishHook();
         }
       });
@@ -4946,6 +5176,9 @@ Format:
           }
 
           try {
+            if (isLegacyPassiveRelayMessage(req)) {
+              req = buildPassiveRelayRequest(req, m.sender || '');
+            }
             if (isAckableMalformedRelayMessage(req, inner)) {
               if (m.id) ackedIds.push(m.id);
               log({ event: 'relay_message_invalid_acked', id: m.id, path: typeof req?.path === 'string' && req.path.trim() ? req.path.trim() : '/', note: 'empty_or_invalid_relay_message' });
