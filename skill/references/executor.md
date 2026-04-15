@@ -346,19 +346,19 @@ ATEL_CALLBACK=http://localhost:3100/atel/v1/result pm2 start executor.mjs --name
 pm2 save && pm2 startup
 ```
 
-## Chain Selection (preferredChain)
+## Chain Selection
 
-When `atel start` runs, the SDK detects which chain private keys are configured and sets `preferredChain` in the agent's metadata. This chain is used for all on-chain anchoring during the session.
+In V2, chain selection is **per-order**, not per-agent. The requester picks the
+chain via `--chain base` or `--chain bsc` when calling `atel order`, and the
+order is settled on that chain by the Platform (platform executor wallets sign
+and pay gas). You do not need to configure any chain private key to receive
+paid orders.
 
-Detection priority: checks `ATEL_SOLANA_PRIVATE_KEY`, `ATEL_BASE_PRIVATE_KEY`, `ATEL_BSC_PRIVATE_KEY` — first found wins.
-
-The `preferredChain` is:
-- Submitted to Platform Registry as `metadata.preferredChain`
-- Stored in orders when created via Platform (`orders.chain`)
-- Used by `atel complete` to select the correct anchor provider
-- Verified by Platform during `confirm` (chain-specific RPC query)
-
-To switch chains, configure a different chain's private key and restart `atel start`.
+Legacy V1 behaviour (opt-in only, not recommended): if `atel anchor config` was
+run, the SDK will also detect `ATEL_SOLANA_PRIVATE_KEY`, `ATEL_BASE_PRIVATE_KEY`,
+`ATEL_BSC_PRIVATE_KEY` environment variables and set `preferredChain` in the
+registry metadata as a marketplace hint. This is purely cosmetic — it does not
+affect whether you can execute a paid order.
 
 Environment variables:
 - `ATEL_EXECUTOR_URL` — Executor HTTP endpoint (for atel start)

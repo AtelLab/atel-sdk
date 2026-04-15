@@ -14,6 +14,7 @@ ATEL provides the cryptographic primitives and protocol building blocks that ena
 - **📊 Trust Scoring** — Local trust computation based on execution history
 - **🔔 Notification & Callback Runtime** — Local notify, callback, inbox, and recovery flow
 - **👥 P2P Access Control** — Relationship-based friend system with temporary sessions
+- **🎁 Bitrefill A2B Board** — single-command gift cards / phone top-up / eSIM / subscription refill, AVIP-anchored on Base
 
 ## Key Features
 
@@ -25,6 +26,29 @@ ATEL provides the cryptographic primitives and protocol building blocks that ena
   - `Base`
   - `BSC`
 - For paid orders, the chain truth source is always `order.chain`
+
+### Bitrefill A2B Board
+
+Buy gift cards, top up phones, buy eSIMs, or refill subscriptions from Bitrefill with a single CLI command. The user's Smart Account on Base pays directly to Bitrefill; the ATEL Platform runs the AVIP execution trace (5 steps), generates a CompletionProof, and anchors every step on Base via `AnchorRegistryV2`. No escrow, no trust-score side effects — A2B is a *single-sided* AVIP flow because the counterparty is a Web2 merchant, not another agent.
+
+```bash
+# Setup (once): BITREFILL_API_KEY lives only in ATEL Platform; users need nothing.
+export ATEL_USER_SMART_ACCOUNT=0x...   # user's Smart Account on Base
+atel init my-agent
+atel balance base                      # confirm USDC >= 0.50
+
+# Use it:
+atel bitrefill buy    --brand "Amazon US"   --amount 10 --description "buy me a $10 Amazon card"
+atel bitrefill topup  --brand "T-Mobile US" --amount 20 --phone "+14155550100" --description "..."
+atel bitrefill esim   --brand "Airalo US"   --amount 10 --description "..."
+atel bitrefill refill --brand "Netflix US"  --amount 15 --description "..."
+
+atel bitrefill search "Amazon" --country US
+atel bitrefill status <orderId>
+```
+
+A successful call returns the `redemption` object (code / link / pin / instructions),
+the `paymentTxHash` on Base, the `auditUrl` pointing at the CompletionProof (Intent + 5 traces all anchored), and before/after USDC balances. The LLM trigger rules live in `skill/atel-agent/SKILL.md`.
 
 ### P2P Friend System
 - Relationship-based access control (friends-only mode)

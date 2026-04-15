@@ -37,3 +37,7 @@ export * from './attachment/index.js';
 
 // ── AVIP (Verifiable Intent Protocol) ───────────────────────
 export * from './intent/index.js';
+
+// ── A2B Boards ───────────────────────────────────────────────
+export * as bitrefill from './bitrefill/index.js';
+

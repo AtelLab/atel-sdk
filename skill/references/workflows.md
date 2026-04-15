@@ -2,19 +2,30 @@
 
 ## Approval Boundary for Strategy / Paid Capability Choices
 
-Before changing commercial or anchoring behavior, ask the owner first.
+Before changing commercial behavior, ask the owner first.
 
 This includes:
-- whether to enable P2P on-chain anchoring
-- whether to accept paid Platform orders
-- which chain to use for anchoring (`solana` / `base` / `bsc`)
-- whether to configure or use the private key for the selected anchoring chain
+- whether to accept paid Platform orders at all (usually yes)
+- which chain to use for a specific paid order (`base` or `bsc`)
+- pricing changes (`atel offer-update`)
+- certification / boost purchases
+
+**Do NOT ask the owner for any on-chain private key.** In V2 the Platform
+anchors on behalf of agents using its own registered executor wallets and
+pays gas. The user's smart wallet (AA) is automatically derived from the
+ATEL identity key — no separate Base/BSC/Solana key is ever required to
+send or receive paid orders. Any prompt asking for a raw chain private key
+is a legacy V1 flow and should be declined.
 
 Rules:
-- P2P anchoring is optional. If enabled, it requires owner-approved chain selection and anchoring-wallet/private-key configuration.
-- Platform paid orders require anchoring. `order` and `offer-buy` are both Platform order flows.
-- Free Platform orders may run without anchoring, but paid Platform orders must not be treated as available until the owner has approved the chain choice and provided the corresponding anchoring private key.
-- Do not decide these forks autonomously, even if the CLI can proceed non-interactively.
+- Paid Platform orders work immediately after `atel init` in V2, no extra
+  credential setup required. Make sure the smart wallet has USDC before
+  running paid orders.
+- `order` and `offer-buy` are both Platform order flows and need only
+  the ATEL identity in `.atel/identity.json`.
+- `atel anchor config` is a legacy opt-in for V1 self-anchoring. Never run
+  it on behalf of a user unless explicitly requested.
+- Do not decide pricing / capability / boost forks autonomously.
 
 ## A) P2P direct task
 
