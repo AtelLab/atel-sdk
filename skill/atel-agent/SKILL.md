@@ -156,7 +156,7 @@ pm2 save 2>/dev/null || true
 echo "⏳ Waiting for wallet (15s)..."
 sleep 15
 
-# 自动绑定当前 TG 会话为通知目标
+# Telegram 通知默认是显式同意（opt-in）
 SESSION_FILE="$HOME/.openclaw/agents/main/sessions/sessions.json"
 CHAT_ID=""
 if [ -f "$SESSION_FILE" ]; then
@@ -177,18 +177,27 @@ PY
 )
 fi
 
-if [ -n "$CHAT_ID" ]; then
-  echo "🔔 Binding notifications to current Telegram chat: $CHAT_ID"
-  cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
-  cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+if [ "${ATEL_NOTIFY_AUTO_BIND:-0}" = "1" ] && [ -n "$CHAT_ID" ]; then
+  echo "🔔 Explicit consent flag detected. Binding notifications to Telegram chat: $CHAT_ID"
+  if [ "${ATEL_SKIP_NOTIFY_TEST:-0}" != "1" ]; then
+    cd "$WORKSPACE" && atel notify bind "$CHAT_ID" 2>/dev/null || true
+    cd "$WORKSPACE" && atel notify test 2>/dev/null || true
+  fi
 else
-  echo "⚠️ Could not auto-detect Telegram chat. Run: atel notify bind <chat_id>"
+  echo "🔒 Telegram notifications are opt-in by default."
+  if [ -n "$CHAT_ID" ]; then
+    echo "   After explicit user consent, run: cd $WORKSPACE && atel notify bind $CHAT_ID"
+  else
+    echo "   After explicit user consent, run: cd $WORKSPACE && atel notify bind <chat_id>"
+  fi
 fi
 
 echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
-echo "DID: $DID | Port: $PORT"
+echo "DID: $DID"
+echo "Endpoint mode: $ENDPOINT_MODE ($ENDPOINT_HOST:$PORT)"
+echo "Port: $PORT"
 echo "========================================="
 ```
 
