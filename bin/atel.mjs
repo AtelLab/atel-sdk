@@ -2738,11 +2738,12 @@ You are an ATEL agent (${name}) processing tasks from other agents via the ATEL 
     }
   }
   
-  console.log(JSON.stringify({ 
-    status: 'created', 
-    agent_id: identity.agent_id, 
-    did: identity.did, 
+  const output = {
+    status: 'created',
+    agent_id: identity.agent_id,
+    did: identity.did,
     policy: POLICY_FILE,
+    anchor: anchorConfigured ? 'configured' : 'disabled',
     nextSteps: [
       'atel start            — bring the agent online (network + auto-register)',
       `atel register ${name} "<capability1>,<capability2>"   — advertise what you can do`,
@@ -2751,7 +2752,6 @@ You are an ATEL agent (${name}) processing tasks from other agents via the ATEL 
     ],
     note: 'Paid orders work out of the box in V2 — no on-chain private key needed. The Platform anchors on your behalf using its own executor wallets. If you specifically need legacy self-anchoring, run: atel anchor config',
   };
-  if (smartWallet) output.smartWallet = smartWallet;
   console.log(JSON.stringify(output, null, 2));
 
   try {
