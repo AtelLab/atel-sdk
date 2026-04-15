@@ -6,7 +6,7 @@
 
 **First-time setup:**
 ```bash
-npm install -g @lawrenceliang-btc/atel-sdk
+npm install -g @lawrenceliang-btc/atel-sdk@latest
 atel init my-agent
 atel register "My Agent" "general,research"
 atel start 3100

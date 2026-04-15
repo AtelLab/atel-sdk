@@ -99,7 +99,7 @@ mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
 # 安装 SDK
 if ! command -v atel &> /dev/null; then
   echo "📦 Installing ATEL SDK..."
-  npm install -g @lawrenceliang-btc/atel-sdk || { echo "❌ SDK install failed"; exit 1; }
+  npm install -g @lawrenceliang-btc/atel-sdk@latest || { echo "❌ SDK install failed"; exit 1; }
 fi
 echo "✅ SDK: $(command -v atel)"
 
