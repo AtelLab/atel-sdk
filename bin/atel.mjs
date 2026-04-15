@@ -92,6 +92,8 @@ const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
 const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
 const NOTIFY_ROUTES_FILE = resolve(ATEL_DIR, 'notify-routes.json');
+const TELEGRAM_UPDATES_STATE_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-updates.json');
+const TELEGRAM_BINDINGS_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-bindings.json');
 const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
 const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
 const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
@@ -397,6 +399,202 @@ function discoverTelegramBot() {
     return botToken;
   } catch { return null; }
   // Also check env
+}
+
+function loadTelegramUpdatesState() {
+  try { return JSON.parse(readFileSync(TELEGRAM_UPDATES_STATE_FILE, 'utf-8')); }
+  catch { return { version: 1, cursors: {}, leaders: {} }; }
+}
+
+function saveTelegramUpdatesState(data) {
+  ensureDir();
+  writeFileSync(TELEGRAM_UPDATES_STATE_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadTelegramBindings() {
+  try { return JSON.parse(readFileSync(TELEGRAM_BINDINGS_FILE, 'utf-8')); }
+  catch { return { version: 1, bindings: {} }; }
+}
+
+function saveTelegramBindings(data) {
+  mkdirSync(dirname(TELEGRAM_BINDINGS_FILE), { recursive: true });
+  writeFileSync(TELEGRAM_BINDINGS_FILE, JSON.stringify(data, null, 2));
+}
+
+function registerTelegramInboundBinding(did, config) {
+  if (!did || !config?.cursorKey || !config?.chatId) return { ownerDid: '', rebound: false };
+  const data = loadTelegramBindings();
+  if (!data.bindings || typeof data.bindings !== 'object') data.bindings = {};
+  const key = config.cursorKey;
+  const current = data.bindings[key];
+  const ownerDid = String(current?.ownerDid || '').trim();
+  if (ownerDid && ownerDid !== did) {
+    return { ownerDid, rebound: false };
+  }
+  data.bindings[key] = {
+    chatId: config.chatId,
+    botId: config.botId,
+    ownerDid: did,
+    updatedAt: new Date().toISOString(),
+  };
+  saveTelegramBindings(data);
+  return { ownerDid: did, rebound: true };
+}
+
+function acquireTelegramInboundLeader(did, config) {
+  const state = loadTelegramUpdatesState();
+  if (!state.leaders || typeof state.leaders !== 'object') state.leaders = {};
+  const now = Date.now();
+  const leaseMs = 15000;
+  const current = state.leaders[config.cursorKey];
+  if (current && current.did && current.did !== did && Number(current.expiresAt || 0) > now) {
+    return { leader: current.did, acquired: false };
+  }
+  state.leaders[config.cursorKey] = { did, expiresAt: now + leaseMs, updatedAt: new Date().toISOString() };
+  saveTelegramUpdatesState(state);
+  return { leader: did, acquired: true };
+}
+
+function getTelegramInboundConfig() {
+  const routes = loadNotifyRoutes();
+  const primary = getPrimaryTelegramTarget();
+  const chatId = String(routes.defaultTelegram?.chatId || primary?.target || '').trim();
+  const botToken = String(routes.defaultTelegram?.botToken || primary?.botToken || discoverTelegramBot() || '').trim();
+  if (!chatId || !botToken) return null;
+  const botId = botToken.split(':', 1)[0] || 'telegram';
+  return { chatId, botToken, botId, cursorKey: `${botId}:${chatId}` };
+}
+
+function extractTelegramInboundPayload(update) {
+  const msg = update?.message || update?.edited_message;
+  if (!msg || msg?.from?.is_bot) return null;
+  const chatId = String(msg?.chat?.id || '').trim();
+  const text = typeof msg?.text === 'string' && msg.text.trim()
+    ? msg.text.trim()
+    : (typeof msg?.caption === 'string' && msg.caption.trim() ? msg.caption.trim() : '');
+  if (!chatId || !text) return null;
+  const nameParts = [];
+  if (typeof msg?.from?.username === 'string' && msg.from.username.trim()) nameParts.push(`@${msg.from.username.trim()}`);
+  if (typeof msg?.from?.first_name === 'string' && msg.from.first_name.trim()) nameParts.push(msg.from.first_name.trim());
+  if (typeof msg?.from?.last_name === 'string' && msg.from.last_name.trim()) nameParts.push(msg.from.last_name.trim());
+  const unixTs = Number(msg?.date || update?.edited_message?.date || 0);
+  const occurredAt = unixTs > 0 ? new Date(unixTs * 1000).toISOString() : new Date().toISOString();
+  return {
+    chatId,
+    text,
+    occurredAt,
+    messageId: msg?.message_id ?? null,
+    senderName: nameParts.join(' ').trim(),
+  };
+}
+
+async function queueTelegramInboundMirror(targetDid, config, update) {
+  const payload = extractTelegramInboundPayload(update);
+  if (!payload || payload.chatId !== config.chatId) return false;
+  const sender = `telegram:${payload.chatId}`;
+  const relayMessage = {
+    method: 'POST',
+    path: '/atel/v1/relay-message',
+    body: {
+      kind: 'telegram_message',
+      channel: 'telegram',
+      text: payload.text,
+      senderDid: sender,
+      timestamp: payload.occurredAt,
+      telegramChatId: payload.chatId,
+      telegramUpdateId: update?.update_id ?? null,
+      telegramMessageId: payload.messageId,
+      telegramSender: payload.senderName || '',
+    },
+  };
+  const resp = await fetch(`${ATEL_PLATFORM}/relay/v1/respond/${encodeURIComponent(targetDid)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sender, message: relayMessage }),
+    signal: AbortSignal.timeout(10000),
+  });
+  const raw = await resp.text().catch(() => '');
+  if (!resp.ok) throw new Error(`telegram_mirror_http_${resp.status}:${raw || 'unknown'}`);
+  log({ event: 'telegram_inbound_mirrored', did: targetDid, chatId: payload.chatId, updateId: update?.update_id ?? null, text: payload.text.slice(0, 120) });
+  return true;
+}
+
+async function mirrorTelegramInboundToBindings(config, update) {
+  const bindings = loadTelegramBindings();
+  const ownerDid = String(bindings.bindings?.[config.cursorKey]?.ownerDid || '').trim();
+  if (!ownerDid) return 0;
+  try {
+    return (await queueTelegramInboundMirror(ownerDid, config, update)) ? 1 : 0;
+  } catch (e) {
+    log({ event: 'telegram_inbound_mirror_error', did: ownerDid, chatId: config.chatId, updateId: update?.update_id ?? null, error: e.message || 'unknown_error' });
+    return 0;
+  }
+}
+
+async function pollTelegramInboundUpdates(targetDid) {
+  const config = getTelegramInboundConfig();
+  if (!config) return { status: 'noop' };
+
+  const binding = registerTelegramInboundBinding(targetDid, config);
+  if (binding.ownerDid && binding.ownerDid !== targetDid) {
+    return { status: 'follower', ownerDid: binding.ownerDid };
+  }
+
+  const leadership = acquireTelegramInboundLeader(targetDid, config);
+  if (!leadership.acquired) {
+    return { status: 'follower', leader: leadership.leader };
+  }
+
+  const state = loadTelegramUpdatesState();
+  if (!state.cursors || typeof state.cursors !== 'object') state.cursors = {};
+  const cursor = state.cursors[config.cursorKey] || {};
+  const nextUpdateId = Number(cursor.nextUpdateId || 0);
+  const params = new URLSearchParams({ timeout: '0', limit: '20' });
+  if (nextUpdateId > 0) params.set('offset', String(nextUpdateId));
+
+  const resp = await fetch(`https://api.telegram.org/bot${config.botToken}/getUpdates?${params.toString()}`, {
+    signal: AbortSignal.timeout(12000),
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || data?.ok === false) {
+    throw new Error(data?.description || `telegram_getUpdates_http_${resp.status}`);
+  }
+
+  const updates = Array.isArray(data?.result) ? data.result : [];
+  if (updates.length === 0) return { status: 'idle' };
+
+  let nextCursor = nextUpdateId;
+  for (const update of updates) {
+    const updateId = Number(update?.update_id || 0);
+    if (updateId > 0) nextCursor = Math.max(nextCursor, updateId + 1);
+  }
+
+  let effectiveUpdates = updates;
+  if (nextUpdateId === 0) {
+    effectiveUpdates = updates.slice(-1);
+    state.cursors[config.cursorKey] = {
+      nextUpdateId: nextCursor,
+      chatId: config.chatId,
+      botId: config.botId,
+      updatedAt: new Date().toISOString(),
+    };
+    saveTelegramUpdatesState(state);
+    log({ event: 'telegram_inbound_bootstrap', did: targetDid, chatId: config.chatId, skipped: Math.max(0, updates.length - effectiveUpdates.length), mirroredOnBootstrap: effectiveUpdates.length, nextUpdateId: nextCursor });
+  }
+
+  let mirrored = 0;
+  for (const update of effectiveUpdates) {
+    mirrored += await mirrorTelegramInboundToBindings(config, update);
+  }
+
+  state.cursors[config.cursorKey] = {
+    nextUpdateId: nextCursor,
+    chatId: config.chatId,
+    botId: config.botId,
+    updatedAt: new Date().toISOString(),
+  };
+  saveTelegramUpdatesState(state);
+  return { status: 'ok', mirrored, nextUpdateId: nextCursor };
 }
 
 // Send notification to all enabled targets (fire-and-forget, never blocks)
@@ -1329,7 +1527,8 @@ function isLegacyPassiveRelayMessage(req) {
   const kind = typeof req.kind === 'string' ? req.kind.trim() : '';
   const text = typeof req.text === 'string' ? req.text.trim() : '';
   const msgType = typeof req.msgType === 'string' ? req.msgType.trim() : '';
-  return Boolean(text || msgType === 'message' || kind === 'portal_message' || kind === 'contact_added');
+  const p2pType = typeof req.type === 'string' ? req.type.trim() : '';
+  return Boolean(text || msgType === 'message' || kind === 'portal_message' || kind === 'contact_added' || ['friend_request','friend_accept','friend_reject'].includes(p2pType));
 }
 function buildPassiveRelayRequest(req, senderDid = '') {
   const normalizedSender = String(req?.senderDid || req?.from || senderDid || '').trim();
@@ -1348,6 +1547,33 @@ function buildPassiveRelayRequest(req, senderDid = '') {
       timestamp: req?.timestamp || new Date().toISOString(),
     },
   };
+}
+function extractSignedRelayEnvelope(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return {};
+  if (
+    message.envelope === 'atel.msg.v1' &&
+    typeof message.from === 'string' &&
+    typeof message.to === 'string' &&
+    typeof message.type === 'string' &&
+    message.payload !== undefined &&
+    typeof message.signature === 'string'
+  ) {
+    return {
+      envelope: message.envelope,
+      type: message.type,
+      from: message.from,
+      to: message.to,
+      timestamp: message.timestamp,
+      nonce: message.nonce,
+      payload: message.payload,
+      signature: message.signature,
+    };
+  }
+  const signed = {};
+  for (const key of ['to', 'from', 'type', 'action', 'msgType', 'msgId', 'text', 'images', 'attachments', 'summary', 'kind', 'nonce', 'payload', 'envelope', 'signature', 'timestamp']) {
+    if (message[key] !== undefined) signed[key] = message[key];
+  }
+  return signed;
 }
 function isAckableMalformedRelayMessage(req, inner) {
   if (typeof inner === 'string') {
@@ -1603,7 +1829,9 @@ function removeFriend(did) {
 
 // Check if DID is a friend
 function isFriend(did) {
-  const data = getCachedFriends();
+  // Friendship can be updated by a separate CLI process (for example `atel friend accept`).
+  // Read from disk here so the long-running agent process does not enforce a stale cache.
+  const data = loadFriends();
   return data.friends.some(f => f.did === did && f.status === 'accepted');
 }
 
@@ -2039,6 +2267,121 @@ function checkP2PAccess(from, action, payload, currentPolicy) {
     allowed: false,
     reason: 'NOT_FRIEND',
     message: 'Access denied. Please send a friend request first.',
+    code: 'NOT_FRIEND'
+  };
+}
+
+function checkP2PMessageAccess(from, currentPolicy) {
+  if (!from) {
+    return {
+      allowed: false,
+      reason: 'UNKNOWN_SENDER',
+      message: 'Missing sender DID',
+      code: 'INVALID_SENDER'
+    };
+  }
+
+  if (currentPolicy.blockedDIDs && currentPolicy.blockedDIDs.length > 0 && currentPolicy.blockedDIDs.includes(from)) {
+    log({
+      event: 'p2p_access_denied',
+      from,
+      action: 'message',
+      reason: 'DID_BLOCKED',
+      timestamp: new Date().toISOString()
+    });
+    return {
+      allowed: false,
+      reason: 'DID_BLOCKED',
+      message: 'You are blocked by this agent',
+      code: 'BLOCKED'
+    };
+  }
+
+  const relPolicy = currentPolicy.relationshipPolicy || getDefaultRelationshipPolicy();
+
+  if (isFriend(from)) {
+    log({
+      event: 'p2p_access_granted',
+      from,
+      action: 'message',
+      reason: 'FRIEND',
+      relationship: 'friend',
+      timestamp: new Date().toISOString()
+    });
+    return {
+      allowed: true,
+      reason: 'FRIEND',
+      relationship: 'friend'
+    };
+  }
+
+  const tempSession = getActiveTempSession(from);
+  if (tempSession) {
+    if (Date.now() > new Date(tempSession.expiresAt).getTime()) {
+      removeTempSession(tempSession.sessionId);
+      log({
+        event: 'p2p_access_denied',
+        from,
+        action: 'message',
+        reason: 'TEMP_SESSION_EXPIRED',
+        sessionId: tempSession.sessionId,
+        timestamp: new Date().toISOString()
+      });
+      return {
+        allowed: false,
+        reason: 'TEMP_SESSION_EXPIRED',
+        message: 'Your temporary session has expired. Please request a new one.',
+        code: 'TEMP_EXPIRED'
+      };
+    }
+
+    log({
+      event: 'p2p_access_granted',
+      from,
+      action: 'message',
+      reason: 'TEMP_SESSION',
+      relationship: 'temporary',
+      sessionId: tempSession.sessionId,
+      timestamp: new Date().toISOString()
+    });
+    return {
+      allowed: true,
+      reason: 'TEMP_SESSION',
+      relationship: 'temporary',
+      sessionId: tempSession.sessionId
+    };
+  }
+
+  if (relPolicy.defaultMode === 'open') {
+    log({
+      event: 'p2p_access_granted',
+      from,
+      action: 'message',
+      reason: 'OPEN_MODE',
+      relationship: 'stranger',
+      timestamp: new Date().toISOString()
+    });
+    return {
+      allowed: true,
+      reason: 'OPEN_MODE',
+      relationship: 'stranger'
+    };
+  }
+
+  log({
+    event: 'p2p_access_denied',
+    from,
+    action: 'message',
+    reason: 'NOT_FRIEND',
+    defaultMode: relPolicy.defaultMode || 'unknown',
+    timestamp: new Date().toISOString()
+  });
+
+  return {
+    allowed: false,
+    reason: 'NOT_FRIEND',
+    message: 'You are not a friend. Please send a friend request first.',
+    hint: 'Send friend request: atel friend request <your-did>',
     code: 'NOT_FRIEND'
   };
 }
@@ -3886,25 +4229,100 @@ Advance the current milestone strictly based on these approved results. Do not i
   endpoint.app?.post?.('/atel/v1/relay-message', async (req, res) => {
     const body = req.body || {};
     const senderDid = String(body.senderDid || body.from || '').trim();
+    const p2pType = typeof body.type === 'string' ? body.type.trim() : '';
+    const relaySignedMessage = extractSignedRelayEnvelope(body);
+    const relaySignedSenderDid = String(relaySignedMessage.from || senderDid || '').trim();
+
+    if (p2pType === 'friend_accept') {
+      const { requestId } = relaySignedMessage.payload || {};
+      const verified = relaySignedSenderDid ? verifyMessage(relaySignedMessage, parseDID(relaySignedSenderDid)) : { valid: false };
+      if (!verified.valid) {
+        log({ event: 'friend_accept_rejected', from: relaySignedSenderDid || body.from, reason: 'invalid_signature_via_relay' });
+        return res.json({ status: 'rejected', error: 'Invalid signature' });
+      }
+      const requests = loadFriendRequests();
+      if (!requests.outgoing) requests.outgoing = [];
+      const request = requests.outgoing.find(r => r.requestId === requestId);
+      if (!request) {
+        log({ event: 'friend_accept_ignored', from: relaySignedSenderDid, requestId, reason: 'request_not_found_via_relay' });
+        return res.json({ status: 'error', error: 'Request not found' });
+      }
+      request.status = 'accepted';
+      request.acceptedAt = new Date().toISOString();
+      saveFriendRequests(requests);
+      addFriend(relaySignedSenderDid, { addedBy: 'request', alias: '', notes: `Accepted our request ${requestId}` });
+      log({ event: 'friend_request_accepted_by_peer', from: relaySignedSenderDid, requestId, via: 'relay' });
+      return res.json({ status: 'ok', type: 'friend_accept' });
+    }
+
+    if (p2pType === 'friend_reject') {
+      const { requestId, reason } = relaySignedMessage.payload || {};
+      const verified = relaySignedSenderDid ? verifyMessage(relaySignedMessage, parseDID(relaySignedSenderDid)) : { valid: false };
+      if (!verified.valid) {
+        log({ event: 'friend_reject_ignored', from: relaySignedSenderDid || body.from, reason: 'invalid_signature_via_relay' });
+        return res.json({ status: 'rejected', error: 'Invalid signature' });
+      }
+      const requests = loadFriendRequests();
+      if (!requests.outgoing) requests.outgoing = [];
+      const request = requests.outgoing.find(r => r.requestId === requestId);
+      if (request) {
+        request.status = 'rejected';
+        request.rejectedAt = new Date().toISOString();
+        request.reason = reason || '';
+        saveFriendRequests(requests);
+      }
+      log({ event: 'friend_request_rejected_by_peer', from: relaySignedSenderDid, requestId, reason, via: 'relay' });
+      return res.json({ status: 'ok', type: 'friend_reject' });
+    }
+
     const kind = String(body.kind || ((typeof body.msgType === 'string' && body.msgType === 'message') || typeof body.text === 'string' ? 'portal_message' : 'relay_message')).trim();
     const text = typeof body.text === 'string' && body.text.trim()
       ? body.text.trim()
       : (typeof body.summary === 'string' && body.summary.trim()
         ? body.summary.trim()
         : (kind === 'contact_added' && senderDid ? `${senderDid} added you as a contact` : '[message]'));
+    const messageSenderDid = relaySignedSenderDid || senderDid;
+
+    if (kind === 'portal_message' && messageSenderDid && messageSenderDid !== 'did:atel:platform') {
+      if (relaySignedMessage.signature) {
+        const verified = verifyMessage(relaySignedMessage, parseDID(messageSenderDid));
+        if (!verified.valid) {
+          log({ event: 'relay_message_rejected', kind, from: messageSenderDid, reason: 'invalid_signature' });
+          return res.json({ status: 'rejected', error: 'Invalid signature', code: 'INVALID_SIGNATURE' });
+        }
+      }
+
+      const currentPolicy = loadPolicy();
+      const accessCheck = checkP2PMessageAccess(messageSenderDid, currentPolicy);
+      if (!accessCheck.allowed) {
+        log({
+          event: 'p2p_message_rejected',
+          from: messageSenderDid,
+          reason: accessCheck.reason,
+          code: accessCheck.code,
+          timestamp: new Date().toISOString()
+        });
+        return res.json({
+          status: 'rejected',
+          error: accessCheck.message || 'Access denied',
+          code: accessCheck.code,
+          hint: accessCheck.hint
+        });
+      }
+    }
 
     log({
       event: 'relay_message_received',
       kind,
-      from: senderDid,
+      from: messageSenderDid || senderDid,
       text,
       timestamp: body.timestamp || new Date().toISOString(),
     });
 
     if (kind === 'contact_added') {
-      pushP2PNotification('p2p_contact_added', { peerDid: senderDid, alias: body.alias || '', text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
-    } else {
-      pushP2PNotification('p2p_message_received', { peerDid: senderDid, text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+      pushP2PNotification('p2p_contact_added', { peerDid: messageSenderDid || senderDid, alias: body.alias || '', text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+    } else if (kind !== 'telegram_message') {
+      pushP2PNotification('p2p_message_received', { peerDid: messageSenderDid || senderDid, text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
     }
 
     res.json({ status: 'ok', kind });
@@ -4829,6 +5247,42 @@ Advance the current milestone strictly based on these approved results. Do not i
       };
     }
 
+    if (payload.msgType === 'message') {
+      const text = typeof payload.text === 'string' && payload.text.trim()
+        ? payload.text.trim()
+        : (typeof payload.summary === 'string' && payload.summary.trim() ? payload.summary.trim() : '[message]');
+      const currentPolicy = loadPolicy();
+      const accessCheck = checkP2PMessageAccess(message.from, currentPolicy);
+      if (!accessCheck.allowed) {
+        log({
+          event: 'p2p_message_rejected',
+          from: message.from,
+          reason: accessCheck.reason,
+          code: accessCheck.code,
+          timestamp: new Date().toISOString()
+        });
+        return {
+          status: 'rejected',
+          error: accessCheck.message || 'Access denied',
+          code: accessCheck.code,
+          hint: accessCheck.hint
+        };
+      }
+      log({
+        event: 'relay_message_received',
+        kind: 'portal_message',
+        from: message.from,
+        text,
+        timestamp: new Date().toISOString(),
+      });
+      pushP2PNotification('p2p_message_received', { peerDid: message.from, text }).catch((e) => log({ event: 'p2p_notify_error', kind: 'portal_message', error: e.message }));
+      return {
+        status: 'ok',
+        kind: 'portal_message',
+        msgId: payload.msgId || null,
+      };
+    }
+
     // Ignore task-result messages (these are responses, not new tasks)
     if (message.type === 'task-result' || payload.status === 'completed' || payload.status === 'failed') {
       log({ event: 'result_received', type: 'task-result', from: message.from, taskId: payload.taskId, status: payload.status, proof: payload.proof || null, anchor: payload.anchor || null, execution: payload.execution || null, result: payload.result || null, timestamp: new Date().toISOString() });
@@ -5352,6 +5806,23 @@ Advance the current milestone strictly based on these approved results. Do not i
       } catch {}
     }, 120000);
   }
+
+  let telegramInboundBusy = false;
+  const pollTelegramInbound = async () => {
+    if (telegramInboundBusy) return;
+    telegramInboundBusy = true;
+    try {
+      await pollTelegramInboundUpdates(id.did);
+    } catch (e) {
+      log({ event: 'telegram_inbound_poll_error', did: id.did, error: e.message || 'unknown_error' });
+    } finally {
+      telegramInboundBusy = false;
+    }
+  };
+  pollTelegramInbound().catch((e) => log({ event: 'telegram_inbound_poll_bootstrap_error', did: id.did, error: e.message || 'unknown_error' }));
+  setInterval(() => {
+    pollTelegramInbound().catch((e) => log({ event: 'telegram_inbound_poll_interval_error', did: id.did, error: e.message || 'unknown_error' }));
+  }, 4000);
 
   console.log(JSON.stringify({
     status: 'listening', agent_id: id.agent_id, did: id.did,
@@ -8185,23 +8656,109 @@ async function sendP2PMessage(targetDid, signedMsg) {
   if (!id) throw new Error('No identity found');
 
   let endpoint = null;
+  let relayEndpoint = '';
   try {
     const resp = await fetch(`${REGISTRY_URL}/registry/v1/agent/${encodeURIComponent(targetDid)}`, { signal: AbortSignal.timeout(5000) });
     if (resp.ok) {
       const entry = await resp.json();
-      const candidates = entry.endpoint_candidates || [];
+      const candidates = entry.endpoint_candidates || entry.candidates || [];
+      const local  = candidates.find(c => c.type === 'local');
       const direct = candidates.find(c => c.type === 'direct');
       const relay  = candidates.find(c => c.type === 'relay');
-      endpoint = direct?.url || relay?.url || entry.endpoint;
+      endpoint = local?.url || direct?.url || relay?.url || entry.endpoint;
+      relayEndpoint = relay?.url || '';
     }
   } catch (e) {
-    throw new Error(`Registry lookup failed for ${targetDid}: ${e.message}`);
+    log({ event: 'p2p_registry_lookup_failed', to: targetDid, error: e.message });
   }
-  if (!endpoint) throw new Error(`No reachable endpoint for ${targetDid}`);
+
+  const tryRelayFallback = async (reason) => {
+    const base = relayEndpoint || process.env.ATEL_RELAY || process.env.ATEL_PLATFORM || REGISTRY_URL;
+    if (!base) throw new Error(reason || `No reachable endpoint for ${targetDid}`);
+    const relayUrl = `${String(base).replace(/\/+$/, '')}/relay/v1/respond/${encodeURIComponent(targetDid)}`;
+    const resp = await fetch(relayUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: id.did, message: signedMsg }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`${reason || 'direct_send_failed'}; relay fallback ${resp.status}: ${text || 'unknown error'}`);
+    }
+    log({ event: 'p2p_relay_fallback_ok', to: targetDid, relay: relayUrl, reason });
+    return { status: 'queued_via_relay', relay: relayUrl };
+  };
+
+  if (!endpoint) {
+    return await tryRelayFallback(`no_reachable_endpoint_for_${targetDid}`);
+  }
 
   const hsManager = new HandshakeManager(id);
   const client    = new AgentClient(id);
-  return await client.sendTask(endpoint, signedMsg, hsManager);
+  try {
+    return await client.sendTask(endpoint, signedMsg, hsManager);
+  } catch (e) {
+    log({ event: 'p2p_direct_send_failed', to: targetDid, endpoint, error: e.message });
+    return await tryRelayFallback(`direct_send_failed:${e.message}`);
+  }
+}
+
+async function sendPortalMessage(targetDid, messageBody, options = {}) {
+  const id = loadIdentity();
+  if (!id) throw new Error('No identity found');
+
+  const relayEndpoint = String(options.relayEndpoint || '').trim();
+  const directEndpoint = String(options.directEndpoint || '').trim();
+  const signedEnvelope = options.signedEnvelope || null;
+
+  const tryRelayFallback = async (reason) => {
+    const base = relayEndpoint || process.env.ATEL_RELAY || process.env.ATEL_PLATFORM || REGISTRY_URL;
+    if (!base || !targetDid) throw new Error(reason || `No reachable endpoint for ${targetDid || 'target'}`);
+    const relayUrl = `${String(base).replace(/\/+$/, '')}/relay/v1/respond/${encodeURIComponent(targetDid)}`;
+    const resp = await fetch(relayUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: id.did, message: messageBody }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const raw = await resp.text().catch(() => '');
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch {}
+    if (!resp.ok) throw new Error(`${reason || 'direct_send_failed'}; relay fallback ${resp.status}: ${raw || 'unknown error'}`);
+    log({ event: 'p2p_message_relay_fallback_ok', to: targetDid, relay: relayUrl, reason });
+    return { status: 'queued_via_relay', relay: relayUrl, result: parsed };
+  };
+
+  if (directEndpoint) {
+    const directUrl = `${String(directEndpoint).replace(/\/+$/, '')}/atel/v1/task`;
+    try {
+      const resp = await fetch(directUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signedEnvelope || messageBody),
+        signal: AbortSignal.timeout(8000),
+      });
+      const raw = await resp.text().catch(() => '');
+      let parsed = null;
+      try { parsed = raw ? JSON.parse(raw) : null; } catch {}
+      if (!resp.ok) {
+        throw new Error(`direct_send ${resp.status}: ${raw || 'unknown error'}`);
+      }
+      if (parsed && (parsed.status === 'rejected' || parsed.status === 'error')) {
+        return { status: parsed.status, direct: directUrl, result: parsed };
+      }
+      return { status: 'delivered', direct: directUrl, result: parsed };
+    } catch (e) {
+      log({ event: 'p2p_message_direct_send_failed', to: targetDid || directEndpoint, endpoint: directEndpoint, error: e.message });
+      if (targetDid) {
+        return await tryRelayFallback(`direct_send_failed:${e.message}`);
+      }
+      throw e;
+    }
+  }
+
+  return await tryRelayFallback(`no_reachable_endpoint_for_${targetDid}`);
 }
 
 // ─── Send Command (Rich Media P2P Messaging) ─────────────────────
@@ -8298,6 +8855,7 @@ async function cmdSend(args) {
   let remoteEndpoint = target;
   let remoteDid;
   let registryEntry = null;
+  let remoteRelayEndpoint = '';
 
   // Resolve @alias
   try { const r = resolveDID(target); if (r !== target) remoteEndpoint = r; } catch (_) {}
@@ -8317,10 +8875,12 @@ async function cmdSend(args) {
     if (!entry) { console.error(`Agent not found: ${target}`); process.exit(1); }
     registryEntry = entry;
     remoteDid = entry.did;
-    const candidates = entry.endpoint_candidates || [];
+    const candidates = entry.endpoint_candidates || entry.candidates || [];
+    const local  = candidates.find(c => c.type === 'local');
     const direct = candidates.find(c => c.type === 'direct');
     const relay  = candidates.find(c => c.type === 'relay');
-    remoteEndpoint = direct?.url || relay?.url || entry.endpoint;
+    remoteRelayEndpoint = relay?.url || '';
+    remoteEndpoint = local?.url || direct?.url || (entry.endpoint && entry.endpoint !== remoteRelayEndpoint ? entry.endpoint : '');
   } else {
     remoteDid = target.startsWith('did:') ? target : undefined;
     // Try to get remoteDid from handshake cache for direct endpoints
@@ -8338,33 +8898,38 @@ async function cmdSend(args) {
     process.exit(1);
   }
 
-  const advertisedCapabilities = extractCapabilityTypes(registryEntry?.capabilities);
-  if (advertisedCapabilities.length > 0 && !advertisedCapabilities.includes('general')) {
-    const message = 'Registry says the recipient does not advertise the "general" capability for free-form chat messages.';
-    if (isJson) {
-      console.log(JSON.stringify({
-        status: 'error',
-        code: 'CAPABILITY_REJECTED',
-        message,
-        advertisedCapabilities,
-        hint: 'Use atel task / atel order, or enable "general" on the recipient.'
-      }, null, 2));
-    } else {
-      console.error('✗ Message not sent: registry says the recipient does not advertise the "general" capability.');
-      console.error('  Advertised capabilities: ' + advertisedCapabilities.join(', '));
-      console.error('  Use atel task / atel order, or enable "general" on the recipient.');
-    }
-    process.exit(1);
-  }
+  // IM-style messages are relationship-gated, not capability-gated.
 
   // Send
   try {
-    const hsManager = new HandshakeManager(id);
-    const client    = new AgentClient(id);
-    const msg       = createMessage({ type: 'task', from: id.did, to: remoteDid || remoteEndpoint, payload, secretKey: id.secretKey });
-    const result    = await client.sendTask(remoteEndpoint, msg, hsManager);
+    const messagePayload = {
+      msgType: 'message',
+      msgId,
+      text,
+      images: payload.images,
+      attachments: payload.attachments,
+      timestamp: payload.timestamp,
+    };
+    const msg = createMessage({
+      type: 'task_delegate',
+      from: id.did,
+      to: remoteDid || remoteEndpoint,
+      payload: messagePayload,
+      secretKey: id.secretKey,
+    });
+    const messageBody = {
+      ...messagePayload,
+      from: msg.from,
+      to: msg.to,
+      type: msg.type,
+      payload: msg.payload,
+      nonce: msg.nonce,
+      envelope: msg.envelope,
+      signature: msg.signature,
+      timestamp: msg.timestamp,
+    };
+    const result = await sendPortalMessage(remoteDid, messageBody, { directEndpoint: remoteEndpoint, relayEndpoint: remoteRelayEndpoint, signedEnvelope: msg });
 
-    // Surface friendly errors
     const inner = result?.result;
     if (inner?.code === 'NOT_FRIEND' || inner?.error?.includes('NOT_FRIEND') || inner?.error?.includes('not a friend')) {
       if (isJson) {
@@ -8376,30 +8941,28 @@ async function cmdSend(args) {
       }
       process.exit(1);
     }
-    if (inner?.status === 'rejected') {
-      const rejectionMessage = inner.error || 'Message rejected';
-      const capabilityRejected = /outside capability boundary/i.test(rejectionMessage);
+    if (inner?.status === 'rejected' || result?.status === 'rejected') {
+      const rejectionMessage = inner?.error || 'Message rejected';
       if (isJson) {
         console.log(JSON.stringify({
           status: 'error',
-          code: capabilityRejected ? 'CAPABILITY_REJECTED' : undefined,
+          code: inner?.code,
           message: rejectionMessage,
-          hint: capabilityRejected ? 'Recipient must allow the general capability for chat messages; otherwise use atel task / atel order.' : undefined,
+          hint: inner?.hint,
           result
         }));
-      } else if (capabilityRejected) {
-        console.error('✗ Message rejected: the recipient does not accept generic chat messages.');
-        console.error('  Enable the "general" capability on the recipient, or use atel task / atel order instead.');
       } else {
         console.error('✗ Message rejected: ' + rejectionMessage);
+        if (inner?.hint) console.error('  ' + inner.hint);
       }
       process.exit(1);
     }
 
     if (isJson) {
-      console.log(JSON.stringify({ status: 'sent', msgId, to: remoteDid || remoteEndpoint, attachments: (payload.images?.length || 0) + (payload.attachments?.length || 0), result }, null, 2));
+      console.log(JSON.stringify({ status: 'sent', msgId, to: remoteDid || remoteEndpoint, attachments: (payload.images?.length || 0) + (payload.attachments?.length || 0), delivery: result }, null, 2));
     } else {
-      console.log(`✓ Message sent to ${remoteDid || remoteEndpoint}`);
+      const deliveryLabel = result?.status === 'queued_via_relay' ? 'queued via relay' : 'sent';
+      console.log(`✓ Message ${deliveryLabel} to ${remoteDid || remoteEndpoint}`);
       if (payload.images?.length)      console.log(`  Images:      ${payload.images.length}`);
       if (payload.attachments?.length) console.log(`  Attachments: ${payload.attachments.length}`);
     }
