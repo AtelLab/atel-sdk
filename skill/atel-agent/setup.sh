@@ -149,4 +149,27 @@ echo "DID: $DID"
 echo "Endpoint mode: $ENDPOINT_MODE ($ENDPOINT_HOST:$PORT)"
 echo "Port: $PORT"
 echo "pm2: $(pm2 jlist 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['pm2_env']['status'] if d else 'unknown')" 2>/dev/null || echo 'check: pm2 status')"
+
+# ─── Bitrefill 板块自检 ──────────────────────────────────────────────
+# A2B 板块不需要额外配置;只要 ATEL DID 存在 + Smart Account 有 USDC,
+# 就可以让 agent 用 `atel bitrefill buy/topup/esim/refill` 完成购物。
+# 这里做两件事:(1) 搜一次产品验证 Platform 代理可达,(2) 提示用户
+# 在环境变量里配自己的 Smart Account 地址。
+if command -v atel >/dev/null 2>&1; then
+  echo ""
+  echo "🎁 Bitrefill board self-check..."
+  if atel bitrefill search "Amazon" --limit 1 >/dev/null 2>&1; then
+    echo "✅ Bitrefill 板块可达 (产品搜索代理响应正常)"
+  else
+    echo "⚠️  Bitrefill 板块暂不可达(网络 / Platform 未启用)— 不阻塞主 setup"
+  fi
+  if [ -z "${ATEL_USER_SMART_ACCOUNT:-}" ]; then
+    echo "ℹ️  要启用买卡功能,请把你的 Smart Account on Base 地址写进环境变量:"
+    echo "    export ATEL_USER_SMART_ACCOUNT=0x..."
+    echo "    然后往里面转一点 USDC (>= 0.50 建议值) 就可以开始用了。"
+  else
+    echo "✅ ATEL_USER_SMART_ACCOUNT=${ATEL_USER_SMART_ACCOUNT}"
+  fi
+fi
+
 echo "========================================="

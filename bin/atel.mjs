@@ -603,6 +603,13 @@ async function pushTradeNotification(eventType, payload, body) {
   const { targets, enabled } = resolveNotifyTargets(orderId);
   if (enabled.length === 0) return;
 
+  const chainLabel = (p) => {
+    const c = p?.chain || body?.chain || '';
+    // NOTE: fast-coop 分支为与合作方集成预留,合作推进中未开放正式路径,保留仅为避免订单链路解析失败
+    if (c === 'fast-coop') return ' (Fast)';
+    if (c === 'bsc') return ' (BSC)';
+    return '';
+  };
   const templates = {
     'order_created': (p) => `📥 收到新订单
 订单: ${p.orderId || body?.orderId || '?'}
@@ -2606,8 +2613,19 @@ async function promptInput(question) {
 // ─── Anchor Configuration ────────────────────────────────────────
 
 async function configureAnchor() {
-  console.log('\n🔗 Configure On-Chain Anchoring\n');
-  
+  console.log('\n🔗 Configure On-Chain Anchoring (legacy V1 mode)\n');
+  console.log('⚠️  In V2 the ATEL Platform anchors on behalf of agents using its own');
+  console.log('    executor wallets — you do NOT need this for paid orders.');
+  console.log('    Your smart wallet addresses (derived from your DID) already receive');
+  console.log('    USDC and the platform pays gas for you. Only continue if you are');
+  console.log('    running a legacy V1 self-anchoring agent.');
+  console.log('');
+  const go = await promptYesNo('Continue anyway?');
+  if (!go) {
+    console.log('Aborted. Your identity is unchanged.');
+    return;
+  }
+
   // 1. Select chain
   const chain = await promptChoice(
     'Select blockchain for anchoring:',
@@ -2688,7 +2706,7 @@ async function cmdInit(agentId) {
   const identity = new AgentIdentity({ agent_id: name });
   saveIdentity(identity);
   savePolicy(DEFAULT_POLICY);
-  
+
   // Create default agent-context.md for built-in executor
   const ctxFile = resolve(ATEL_DIR, 'agent-context.md');
   if (!existsSync(ctxFile)) {
@@ -2725,38 +2743,74 @@ You are an ATEL agent (${name}) processing tasks from other agents via the ATEL 
     agent_id: identity.agent_id, 
     did: identity.did, 
     policy: POLICY_FILE,
-    anchor: anchorConfigured ? 'configured' : 'disabled',
-    next: 'Run: atel start [port] — auto-configures network and registers'
-  }, null, 2));
+    nextSteps: [
+      'atel start            — bring the agent online (network + auto-register)',
+      `atel register ${name} "<capability1>,<capability2>"   — advertise what you can do`,
+      'atel info             — show your DID, wallets, and policy',
+      'atel balance          — check USDC balance on Base/BSC smart wallets',
+    ],
+    note: 'Paid orders work out of the box in V2 — no on-chain private key needed. The Platform anchors on your behalf using its own executor wallets. If you specifically need legacy self-anchoring, run: atel anchor config',
+  };
+  if (smartWallet) output.smartWallet = smartWallet;
+  console.log(JSON.stringify(output, null, 2));
 
   try {
-    const sdkSkillPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent', 'SKILL.md');
-    if (existsSync(sdkSkillPath)) {
-      const home = process.env.HOME || '';
-      const candidates = [
-        join(home, '.openclaw', 'skills', 'atel-agent'),
-        join(home, '.openclaw', 'workspace', 'skills', 'atel-agent'),
-      ];
-      let installed = false;
-      for (const dir of candidates) {
-        if (existsSync(dirname(dir))) {
-          mkdirSync(dir, { recursive: true });
-          copyFileSync(sdkSkillPath, join(dir, 'SKILL.md'));
-          console.log(`\n✅ ATEL Skill auto-installed to ${dir}`);
-          console.log('   Your AI agent will automatically know how to use ATEL.');
-          console.log('');
-          console.log('📌 Tell your agent this message to get started:');
-          console.log('   "Read the atel-agent skill at ~/.openclaw/skills/atel-agent/SKILL.md carefully, then help me set up ATEL and start earning."');
-          installed = true;
-          break;
-        }
-      }
-      if (!installed) {
-        console.log('\n📋 To teach your AI agent about ATEL, send it this message:');
-        console.log(`   "Read ${sdkSkillPath} carefully, then help me set up ATEL and start earning."`);
-      }
+    const installed = syncAtelSkillToOpenClaw({ verbose: true });
+    if (!installed.length) {
+      const sdkSkillPath = resolveSdkSkillPath();
+      console.log('\n📋 To teach your AI agent about ATEL, send it this message:');
+      console.log(`   "Read ${sdkSkillPath} carefully, then help me set up ATEL and start earning."`);
     }
   } catch (e) { /* skill install is best-effort */ }
+}
+
+// Path to the SKILL.md shipped inside the currently-installed SDK package.
+// Used both at `atel init` time and on every `atel start` to keep openclaw's
+// workspace copy in sync with the latest published skill content.
+function resolveSdkSkillPath() {
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'skill', 'atel-agent', 'SKILL.md');
+}
+
+// Sync the SDK's SKILL.md into every openclaw skills dir that already hosts
+// an atel-agent skill. Written to fix a subtle version-drift bug: `npm i -g`
+// upgrades the SDK package on disk, but openclaw's session `skillsSnapshot`
+// reads from `~/.openclaw/workspace/skills/atel-agent/SKILL.md`, which is a
+// physical copy made at init time and never refreshed. After an upgrade the
+// agent keeps seeing stale skill content indefinitely. See incident
+// 2026-04-09, order ord-4c12a03d-ea8, where the workspace copy was ~12 days
+// older than the npm copy and missing the "--desc required" guidance.
+//
+// We intentionally sync to *every* candidate dir where an `atel-agent` sibling
+// is present (not just the first one), because different openclaw versions
+// read from different roots and we want all of them to end up coherent.
+// Returns the list of destinations actually written.
+function syncAtelSkillToOpenClaw({ verbose = false } = {}) {
+  const sdkSkillPath = resolveSdkSkillPath();
+  if (!existsSync(sdkSkillPath)) return [];
+  const home = process.env.HOME || '';
+  // Candidate parent dirs, in the order we want to probe. We sync to any
+  // that exist, creating the leaf `atel-agent/` dir if its parent is present.
+  const parents = [
+    join(home, '.openclaw', 'workspace', 'skills'),
+    join(home, '.openclaw', 'skills'),
+  ];
+  const written = [];
+  for (const parent of parents) {
+    if (!existsSync(parent)) continue;
+    const dir = join(parent, 'atel-agent');
+    try {
+      mkdirSync(dir, { recursive: true });
+      const dest = join(dir, 'SKILL.md');
+      copyFileSync(sdkSkillPath, dest);
+      written.push(dest);
+      if (verbose) {
+        console.log(`✅ ATEL skill synced → ${dest}`);
+      }
+    } catch (e) {
+      if (verbose) console.error(`   (skipped ${dir}: ${e.message})`);
+    }
+  }
+  return written;
 }
 
 async function cmdAnchor(subcommand) {
@@ -3100,6 +3154,21 @@ async function cmdStart(port) {
     }
   } catch (e) {
     log({ event: 'openclaw_lock_cleanup_error', error: e.message });
+  }
+
+  // Refresh workspace SKILL.md from the currently-installed SDK package.
+  // Without this, `npm i -g` upgrades leave a stale copy at
+  // ~/.openclaw/workspace/skills/atel-agent/SKILL.md that openclaw keeps
+  // reading — the documented behaviour of the upgrade then silently lags
+  // behind the code. Fixes incident 2026-04-09 where a ~12-day-old workspace
+  // skill copy was missing "--desc is required" guidance.
+  try {
+    const synced = syncAtelSkillToOpenClaw();
+    if (synced.length > 0) {
+      log({ event: 'atel_skill_synced', count: synced.length, destinations: synced });
+    }
+  } catch (e) {
+    log({ event: 'atel_skill_sync_error', error: e.message });
   }
 
   // Initialize Ollama only if explicitly enabled (optional local AI audit)
@@ -4387,6 +4456,33 @@ Advance the current milestone strictly based on these approved results. Do not i
       sequenceNo: body.sequenceNo,
       dedupeKey: body.dedupeKey,
     });
+
+    // ⚠️ Fast-coop 待合作推进(2026-04):此分支代码为与合作方集成预留,
+    // Platform 端 fast-coop 路径尚未全部打通。本块只在 chain === 'fast-coop' 时
+    // 触发,正式订单不会走到这里,合作方就绪后再启用。
+    //
+    // ── Fast-coop: auto-submit deliverable when all milestones verified ──
+    // When executor receives the final milestone_verified for a fast-coop order,
+    // sign and submit Escrow::Submit on Fast staging so the Platform can Complete.
+    if (event === 'milestone_verified' && payload.allComplete === true) {
+      const fastOrderId = body.orderId || payload.orderId || '';
+      if (fastOrderId) {
+        // Payload may not include chain — fetch order to check
+        try {
+          const _resp = await fetch(`${PLATFORM_URL}/trade/v1/order/${fastOrderId}`, { signal: AbortSignal.timeout(10000) });
+          const orderInfo = _resp.ok ? await _resp.json() : null;
+          const orderChain = orderInfo?.chain || orderInfo?.Chain || '';
+          if (orderChain === 'fast-coop') {
+            log({ event: 'fast_submit_triggered', orderId: fastOrderId, chain: orderChain });
+            submitFastDeliverable(fastOrderId, id).catch(e => {
+              log({ event: 'fast_submit_error', orderId: fastOrderId, error: e.message });
+            });
+          }
+        } catch (e) {
+          log({ event: 'fast_submit_check_error', orderId: fastOrderId, error: e.message });
+        }
+      }
+    }
 
     const dedupeKey = body.dedupeKey || `${event}:${body.orderId || payload.orderId || ''}`;
     const orderIdForCwd = body.orderId || payload.orderId || '';
@@ -6825,11 +6921,19 @@ async function cmdTransactions() {
 // ─── Trade Task: High-level one-shot command ────────────────────
 async function cmdTradeTask(capability, description) {
   if (!capability) { console.error('Usage: atel trade-task <capability> <description> [--budget N] [--executor DID] [--timeout 300]'); process.exit(1); }
+  if (!description || !description.trim()) {
+    console.error('Error: <description> is required and must contain the full task description.');
+    console.error('       The executor can only understand what to do via this field.');
+    console.error('       Pass the user\'s original task text verbatim, e.g.:');
+    console.error('         atel trade-task <capability> "<full user message>" --budget 5');
+    console.error('       Do NOT summarize, translate, or shorten the user\'s request.');
+    process.exit(2);
+  }
   const id = requireIdentity();
   const budget = parseFloat(rawArgs.find((a, i) => rawArgs[i-1] === '--budget') || '0');
   const executorArg = rawArgs.find((a, i) => rawArgs[i-1] === '--executor') || '';
   const timeout = parseInt(rawArgs.find((a, i) => rawArgs[i-1] === '--timeout') || '300') * 1000;
-  const desc = description || capability;
+  const desc = description;
 
   // Step 1: Find executor
   let executorDid = executorArg;
@@ -6851,6 +6955,7 @@ async function cmdTradeTask(capability, description) {
   console.error(`[trade-task] Creating order: ${capability}, budget: $${budget}...`);
   const orderData = await signedFetch('POST', '/trade/v1/order', {
     executorDid, capabilityType: capability, priceAmount: budget, priceCurrency: 'USD', pricingModel: 'per_task',
+    description: desc,
   });
   const orderId = orderData.orderId;
   console.error(`[trade-task] Order created: ${orderId}`);
@@ -6898,12 +7003,27 @@ async function cmdTradeTask(capability, description) {
 }
 
 async function cmdOrder(executorDid, capType, price) {
-  if (!executorDid || !capType || !price) { console.error('Usage: atel order <executorDid> <capabilityType> <price> [--desc "task description"]'); process.exit(1); }
+  if (!executorDid || !capType || !price) { console.error('Usage: atel order <executorDid> <capabilityType> <price> --desc "task description"'); process.exit(1); }
   // Resolve @alias to full DID
   if (executorDid.startsWith('@')) {
     try { executorDid = resolveDID(executorDid); } catch (e) { console.error(e.message); process.exit(1); }
   }
   const description = rawArgs.find((a, i) => rawArgs[i-1] === '--desc') || '';
+  // --desc is MANDATORY: the executor can only see the task via this field.
+  // An empty description would make the executor work from its own imagination
+  // (see production incident 2026-04-09, order ord-4c12a03d-ea8 where the
+  // executor generated an off-topic "system validation" milestone because
+  // orderDescription arrived empty). We fail loudly here so the caller
+  // (human or ReAct agent loop) gets an actionable error and can retry
+  // with the real task text from the user's message.
+  if (!description || !description.trim()) {
+    console.error('Error: --desc is required and must contain the full task description.');
+    console.error('       The executor can only understand what to do via --desc.');
+    console.error('       Pass the user\'s original task text verbatim, e.g.:');
+    console.error('         atel order <executorDid> <capability> <price> --desc "<full user message>"');
+    console.error('       Do NOT summarize, translate, or shorten the user\'s request.');
+    process.exit(2);
+  }
   const chainArg = rawArgs.find((a, i) => rawArgs[i-1] === '--chain') || '';
   const id = requireIdentity();
   
@@ -9322,6 +9442,134 @@ async function cmdAliasRemove(args) {
 
 // ─── Main ────────────────────────────────────────────────────────
 
+// ⚠️ Fast-coop 待合作推进(2026-04):整个函数为与合作方集成预留。
+// 只在订单 chain === 'fast-coop' 时被调用,Platform 端 fast-coop 路径
+// 尚未全部打通,合作方就绪后可直接启用,届时再做联调验证。
+//
+// ── Fast-coop: Executor auto-submit deliverable to Fast escrow ──────
+// Called when executor receives milestone_verified with allComplete=true
+// for a fast-coop order. Signs Escrow::Submit with the agent's DID
+// private key (= Fast Ed25519 account key).
+async function submitFastDeliverable(orderId, identity) {
+  try {
+    // 1. Get order info
+    const orderResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+    if (!orderResp.ok) throw new Error(`order fetch failed: ${orderResp.status}`);
+    const orderInfo = await orderResp.json();
+    const chain = orderInfo.chain || orderInfo.Chain || '';
+    if (chain !== 'fast-coop') return;
+
+    // 2. Find escrow job_id from chain-records
+    const recordsResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    // The job_id is stored in the on_chain_records by the Platform.
+    // We need to get it from the order or from the chain-records endpoint.
+    // For now, compute it the same way Platform does: keccak256(orderId)
+    const { createHash } = await import('node:crypto');
+
+    // 3. Get the agent's Fast account info
+    const FAST_RPC = process.env.ATEL_FASTCOOP_RPC_URL || 'https://staging.api.fast.xyz/proxy-rest';
+    const pubKeyHex = Buffer.from(identity.publicKey).toString('hex');
+
+    const accountResp = await fetch(`${FAST_RPC}/v1/accounts/${pubKeyHex}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!accountResp.ok) throw new Error(`Fast account query failed: ${accountResp.status}`);
+    const accountData = (await accountResp.json()).data;
+    const nonce = accountData.next_nonce;
+
+    // 4. Find escrow job for this order (query by provider)
+    const jobsResp = await fetch(`${FAST_RPC}/v1/escrow-jobs?provider=${pubKeyHex}&status=Funded`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!jobsResp.ok) throw new Error(`escrow jobs query failed: ${jobsResp.status}`);
+    const jobs = (await jobsResp.json()).data || [];
+    const job = jobs.find(j => j.description && j.description.includes(orderId));
+    if (!job) {
+      log({ event: 'fast_submit_no_job', orderId, note: 'no Funded escrow job found for this order' });
+      return;
+    }
+
+    // 5. Build Escrow::Submit transaction
+    // deliverable = keccak256(orderId) as 32-byte hash
+    const deliverableHash = createHash('sha3-256').update(orderId).digest('hex');
+
+    // BCS encode: Operation::Escrow(12) → Escrow::Submit(2) → jobId(32) + deliverable(32)
+    const jobIdBytes = Buffer.from(job.job_id, 'hex');
+    const deliverableBytes = Buffer.from(deliverableHash, 'hex');
+
+    // Build minimal BCS by hand (matching Go implementation):
+    // ULEB128(12) = 0x0c, ULEB128(2) = 0x02, then 32+32 bytes
+    const claimBytes = Buffer.concat([
+      Buffer.from([0x0c]),        // Operation::Escrow variant 12
+      Buffer.from([0x02]),        // Escrow::Submit variant 2
+      jobIdBytes.subarray(0, 32), // job_id 32 bytes
+      deliverableBytes.subarray(0, 32), // deliverable 32 bytes
+    ]);
+
+    // Transaction BCS: VersionedTransaction variant 1 (Release20260407)
+    const networkId = process.env.ATEL_FASTCOOP_NETWORK_ID || 'fast:devnet';
+    const senderBytes = Buffer.from(identity.publicKey);
+    const tsNanos = BigInt(Date.now()) * 1000000n;
+
+    // ULEB128 encoder
+    const uleb128 = (v) => {
+      const buf = [];
+      do { let b = Number(v & 0x7fn); v >>= 7n; if (v > 0n) b |= 0x80; buf.push(b); } while (v > 0n);
+      return Buffer.from(buf.length ? buf : [0]);
+    };
+    const u64le = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+    const u128le = (v) => { const b = Buffer.alloc(16); b.writeBigUInt64LE(v & 0xffffffffffffffffn); b.writeBigUInt64LE(v >> 64n, 8); return b; };
+    const bcsString = (s) => { const b = Buffer.from(s, 'utf-8'); return Buffer.concat([uleb128(BigInt(b.length)), b]); };
+
+    // Transaction body
+    const txBody = Buffer.concat([
+      bcsString(networkId),
+      senderBytes.subarray(0, 32),
+      u64le(nonce),
+      u128le(tsNanos),
+      uleb128(1n), // claims vector length = 1
+      claimBytes,
+      Buffer.from([0x00]), // archival = false
+      Buffer.from([0x00]), // fee_token = None
+    ]);
+
+    // VersionedTransaction = enum variant 1
+    const versionedTx = Buffer.concat([uleb128(1n), txBody]);
+
+    // 6. Sign
+    const { default: nacl } = await import('tweetnacl');
+    const sigMessage = Buffer.concat([Buffer.from('VersionedTransaction::'), versionedTx]);
+    const signature = nacl.sign.detached(sigMessage, identity.secretKey);
+
+    // SignatureOrMultiSig::Signature = variant 0 + 64 bytes
+    const bcsSig = Buffer.concat([Buffer.from([0x00]), Buffer.from(signature)]);
+
+    // 7. Submit to Fast
+    const submitResp = await fetch(`${FAST_RPC}/v1/submit-transaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transaction: versionedTx.toString('hex'),
+        signature: bcsSig.toString('hex'),
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    const submitResult = await submitResp.json();
+    if (submitResult.error) {
+      throw new Error(`Fast submit failed: ${submitResult.error.message || JSON.stringify(submitResult.error)}`);
+    }
+
+    log({ event: 'fast_submit_success', orderId, jobId: job.job_id, nonce });
+    console.log(`⚡ [Fast] Deliverable submitted for ${orderId} (job: ${job.job_id.substring(0, 16)}...)`);
+  } catch (e) {
+    log({ event: 'fast_submit_error', orderId, error: e.message });
+    console.error(`⚠️  [Fast] Submit failed for ${orderId}: ${e.message}`);
+  }
+}
+
 const [,, cmd, ...rawArgs] = process.argv;
 const args = rawArgs.filter(a => !a.startsWith('--'));
 const commands = {
@@ -9369,6 +9617,8 @@ const commands = {
   'intent-info': () => cmdIntentInfo(args[0]),
   'completion-proof': () => cmdCompletionProof(args[0]),
   'verify-tx': () => cmdVerifyTx(args[0]),
+  // AVIP-A2B Bitrefill board (atomic ops)
+  bitrefill: () => cmdBitrefill(args[0], rawArgs),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
   evidence: () => cmdEvidence(args[0], args[1]),
@@ -9720,6 +9970,20 @@ Dispute Commands:
   disputes                             List your disputes
   dispute-info <disputeId>             Get dispute details
 
+Bitrefill A2B Commands (买礼品卡 / 充值 / 充话费 / esim / 订阅充值 — Web2 商户购买):
+  bitrefill intent --category <cat> --max <usdc>     Create signed intent
+  bitrefill search --intent <id> "<query>"            Search products (Gateway audited)
+  bitrefill deposit --intent <id> --amount <usdc>     Lock USDC into A2BOrderGateway contract
+  bitrefill create-invoice --intent <id> --product <id> --value <n>   Create Bitrefill invoice
+  bitrefill pay --intent <id>                         Trigger contract executePayment
+  bitrefill redemption --intent <id>                  Fetch gift code + confirmDelivery
+  bitrefill status --intent <id>                      Query on-chain order state
+
+  bitrefill verify-intent <intentId>                  Verify your Intent's ed25519 signature + on-chain Order
+  bitrefill audit <intentId>                          Recompute hash chain + merkle root, compare to on-chain audit_root
+  bitrefill proof <intentId>                          Verify on-chain CompletionProof anchor tx (verdict + governance)
+  (add --did <did> to verify someone else's intent — default is your own DID)
+
 Certification Commands:
   cert-apply [level]                   Apply for certification (level: certified|enterprise)
   cert-status [did]                    Check certification status
@@ -9800,6 +10064,416 @@ Task Mode: Configure .atel/policy.json taskMode (auto|confirm|off).
   confirm - Queue tasks for manual approval (atel pending / atel approve)
   off     - Reject all incoming tasks (communication still works)`);
   process.exit(cmd ? 1 : 0);
+}
+
+// ─── AVIP-A2B Bitrefill board (atomic ops) ───────────────────────
+// Sub-commands:
+//   atel bitrefill intent --category gift_card --max 50 [--confirm-above N] [--deadline-min N]
+//   atel bitrefill search --intent <id> <query> [--country US] [--limit 5]
+//   atel bitrefill deposit --intent <id> --amount 10.5
+//   atel bitrefill create-invoice --intent <id> --product amazon-us --value 10
+//   atel bitrefill pay --intent <id> --amount 10.05
+//   atel bitrefill redemption --intent <id>
+//   atel bitrefill status --intent <id>
+async function cmdBitrefill(sub, subArgs) {
+  const flag = (name, def) => {
+    const i = subArgs.indexOf('--' + name);
+    if (i < 0) return def;
+    return subArgs[i + 1];
+  };
+
+  // Verification commands — default to caller's own identity (用户即审计).
+  // --did flag overrides for verifying someone else's intent.
+  // subArgs[0] is the sub-command itself; positional args start at [1].
+  const rawArgsEarly = subArgs.filter(a => !a.startsWith('--')).slice(1);
+  if (sub === 'verify-intent' || sub === 'audit' || sub === 'proof') {
+    const intentId = rawArgsEarly[0];
+    let did = flag('did');
+    if (!did) {
+      // Default to caller's own DID — most common case: "verify my own order"
+      try {
+        const me = requireIdentity();
+        did = me.did;
+      } catch {
+        console.error(`Usage: atel bitrefill ${sub} <intentId> [--did <issuer_did>]`);
+        console.error(`  No local identity found. Either run 'atel init' first, or pass --did <did> for someone else's intent.`);
+        process.exit(1);
+      }
+    }
+    if (!intentId) {
+      console.error(`Usage: atel bitrefill ${sub} <intentId> [--did <issuer_did>]`);
+      process.exit(1);
+    }
+    if (sub === 'verify-intent') return cmdBitrefillVerifyIntent(intentId, did);
+    if (sub === 'audit')         return cmdBitrefillAudit(intentId, did);
+    if (sub === 'proof')         return cmdBitrefillProof(intentId, did);
+  }
+
+  const id = requireIdentity();
+  const { bitrefill } = await import('@lawrenceliang-btc/atel-sdk');
+  const num = (name, def) => {
+    const v = flag(name, def);
+    return v === undefined ? undefined : Number(v);
+  };
+
+  const userSA = process.env.ATEL_USER_SMART_ACCOUNT
+    || (id?.wallets && id.wallets.base)
+    || null;
+
+  try {
+    switch (sub) {
+      case 'intent': {
+        if (!userSA) { console.error('ATEL_USER_SMART_ACCOUNT required'); process.exit(1); }
+        const res = await bitrefill.createIntent(id, {
+          category: flag('category', 'gift_card'),
+          maxAmount: num('max', 50),
+          requiresConfirmAbove: num('confirm-above', 50),
+          deadlineMinutes: num('deadline-min', 10),
+          userSmartAccount: userSA,
+        });
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'search': {
+        const intentId = flag('intent');
+        const query = subArgs.find((a, i) => i > 0 && !a.startsWith('--') && subArgs[i-1] !== '--intent' && subArgs[i-1] !== '--country' && subArgs[i-1] !== '--limit') || '';
+        if (!intentId || !query) { console.error('Usage: atel bitrefill search --intent <id> <query>'); process.exit(1); }
+        const products = await bitrefill.search(id, intentId, query, { country: flag('country'), limit: num('limit') });
+        console.log(JSON.stringify(products, null, 2));
+        return;
+      }
+      case 'deposit': {
+        if (!userSA) { console.error('ATEL_USER_SMART_ACCOUNT required'); process.exit(1); }
+        const intentId = flag('intent');
+        const amount = num('amount');
+        if (!intentId || !amount) { console.error('Usage: atel bitrefill deposit --intent <id> --amount <n>'); process.exit(1); }
+        const res = await bitrefill.deposit(id, intentId, amount, userSA);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'create-invoice': {
+        const intentId = flag('intent');
+        const productId = flag('product');
+        const value = num('value');
+        if (!intentId || !productId) { console.error('Usage: atel bitrefill create-invoice --intent <id> --product <id> [--value n]'); process.exit(1); }
+        const res = await bitrefill.createInvoice(id, intentId, productId, value || 0);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'pay': {
+        const intentId = flag('intent');
+        const amount = num('amount');
+        if (!intentId) { console.error('Usage: atel bitrefill pay --intent <id> --amount <n>'); process.exit(1); }
+        const res = await bitrefill.pay(id, intentId, amount || 0);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'redemption': {
+        const intentId = flag('intent');
+        if (!intentId) { console.error('Usage: atel bitrefill redemption --intent <id>'); process.exit(1); }
+        const res = await bitrefill.getRedemption(id, intentId);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'status': {
+        const intentId = flag('intent');
+        if (!intentId) { console.error('Usage: atel bitrefill status --intent <id>'); process.exit(1); }
+        const res = await bitrefill.status(id, intentId);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      default:
+        console.error('Usage: atel bitrefill <intent|search|deposit|create-invoice|pay|redemption|status|verify-intent|audit|proof> ...');
+        process.exit(1);
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ ok: false, error: e.message, code: e.code, data: e.data }));
+    process.exit(2);
+  }
+}
+
+// ─── Bitrefill A2B verification commands ─────────────────────────────────────
+// All three are READ-ONLY: anyone with the intentId + did can verify the on-chain
+// truth independently of Platform's word. These re-implement the same checks the
+// Platform's CompletionProof generation does, using only on-chain data + the
+// detail API's unsigned trace export.
+
+const BASE_RPC = process.env.ATEL_BASE_RPC || 'https://mainnet.base.org';
+const BASESCAN_TX = (tx) => `https://basescan.org/tx/${tx}`;
+
+async function fetchA2BDetail(intentId, did) {
+  const url = `${PLATFORM_URL.replace(/\/+$/, '')}/trade/v1/a2b/detail/${encodeURIComponent(intentId)}?did=${encodeURIComponent(did)}`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error(`detail fetch HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return await r.json();
+}
+
+async function ethCall(to, data) {
+  const r = await fetch(BASE_RPC, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(`eth_call: ${j.error.message}`);
+  return j.result;
+}
+
+async function ethGetTxReceipt(tx) {
+  const r = await fetch(BASE_RPC, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [tx] }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(`receipt: ${j.error.message}`);
+  return j.result;
+}
+
+// ─── verify-intent: checks ed25519 sig + on-chain createOrder consistency ───
+async function cmdBitrefillVerifyIntent(intentId, did) {
+  const naclMod = await import('tweetnacl');
+  const bs58 = await import('bs58');
+  const ethers = await import('ethers');
+
+  console.log(JSON.stringify({ event: 'verify_intent', intentId, did }));
+  let detail;
+  try { detail = await fetchA2BDetail(intentId, did); } catch (e) {
+    console.log(JSON.stringify({ verified: false, error: e.message }));
+    process.exit(1);
+  }
+
+  const out = {
+    intentId,
+    issuer_did: detail.intent.issuer_did,
+    checks: {},
+    verdict: 'PASS',
+  };
+
+  // 1. signature exists
+  if (!detail.intent.signature || !detail.intent.signed_payload) {
+    out.checks.signature_present = { ok: false, msg: 'missing signature or signed_payload' };
+    out.verdict = 'FAIL';
+  } else {
+    out.checks.signature_present = { ok: true };
+  }
+
+  // 2. ed25519 verify
+  if (out.checks.signature_present.ok) {
+    try {
+      const did2 = detail.intent.issuer_did;
+      const b58Key = did2.split(':').slice(-1)[0];
+      const pubKey = bs58.default.decode(b58Key);
+      const sigBytes = Buffer.from(detail.intent.signature, 'base64');
+      const msgBytes = Buffer.from(detail.intent.signed_payload);
+      const ok = naclMod.default.sign.detached.verify(msgBytes, sigBytes, pubKey);
+      out.checks.ed25519_signature = { ok, msg: ok ? 'signature valid' : 'signature INVALID' };
+      if (!ok) out.verdict = 'FAIL';
+    } catch (e) {
+      out.checks.ed25519_signature = { ok: false, msg: 'verify error: ' + e.message };
+      out.verdict = 'FAIL';
+    }
+  }
+
+  // 3. on-chain createOrder hash matches keccak256(intentId)
+  const expected = ethers.keccak256(ethers.toUtf8Bytes(intentId));
+  if (detail.onchain && detail.onchain.user_addr) {
+    out.checks.intent_onchain = {
+      ok: true,
+      msg: `on-chain Order exists: userAddr=${detail.onchain.user_addr} status=${detail.onchain.status_name}`,
+      intent_hash: expected,
+    };
+  } else {
+    out.checks.intent_onchain = { ok: false, msg: 'no on-chain Order found for this intentHash' };
+    out.verdict = 'FAIL';
+  }
+
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(out.verdict === 'PASS' ? 0 : 1);
+}
+
+// ─── audit: recomputes ActionTrace hash chain + merkle root, compares on-chain ─
+async function cmdBitrefillAudit(intentId, did) {
+  const ethers = await import('ethers');
+  console.log(JSON.stringify({ event: 'audit_a2b', intentId, did }));
+  let detail;
+  try { detail = await fetchA2BDetail(intentId, did); } catch (e) {
+    console.log(JSON.stringify({ verified: false, error: e.message }));
+    process.exit(1);
+  }
+
+  const out = { intentId, checks: {}, verdict: 'PASS' };
+
+  // 1. Hash chain integrity (each trace's prev_trace_hash should equal previous trace's trace_hash)
+  const traces = (detail.traces || []).slice().sort((a, b) => a.sequence - b.sequence);
+  let prev = '';
+  let chainOk = true;
+  const chainErrs = [];
+  for (const t of traces) {
+    if (t.prev_trace_hash !== prev) {
+      chainOk = false;
+      chainErrs.push(`seq #${t.sequence}: prev mismatch (expected '${prev}', got '${t.prev_trace_hash}')`);
+    }
+    prev = t.trace_hash;
+  }
+  out.checks.hash_chain = { ok: chainOk, traces: traces.length, errors: chainErrs.length ? chainErrs : undefined };
+  if (!chainOk) out.verdict = 'FAIL';
+
+  // 2. Merkle root over PRE-PAY traces (search/deposit/createInvoice). Match Gateway's logic.
+  // Per AVIP-A2B spec, on-chain audit_root only covers traces BEFORE wallet.pay.
+  const prePay = [];
+  for (const t of traces) {
+    if (t.tool === 'wallet.pay') break;
+    prePay.push(t);
+  }
+  const leaves = prePay.map(t => '0x' + t.trace_hash);
+  const computedRoot = leaves.length === 0 ? '0x' + '00'.repeat(32) : merkleRootKeccak(leaves, ethers);
+  const onchainAuditRoot = detail.onchain ? detail.onchain.audit_root : null;
+  if (onchainAuditRoot) {
+    const ok = computedRoot.toLowerCase() === onchainAuditRoot.toLowerCase();
+    out.checks.audit_root = {
+      ok,
+      computed: computedRoot,
+      onchain: onchainAuditRoot,
+      pre_pay_traces: prePay.length,
+      msg: ok ? 'merkle root matches on-chain audit_root' : 'MISMATCH — Platform may have tampered with traces',
+    };
+    if (!ok) out.verdict = 'FAIL';
+  } else {
+    out.checks.audit_root = { ok: false, msg: 'no on-chain audit_root (pay not yet executed?)' };
+  }
+
+  // 3. Decision counts (informational)
+  const allowed = traces.filter(t => t.policy_decision === 'allow').length;
+  const denied = traces.filter(t => t.policy_decision === 'deny').length;
+  out.checks.governance = { ok: true, total: traces.length, allowed, denied };
+
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(out.verdict === 'PASS' ? 0 : 1);
+}
+
+// Standard binary merkle root with last-leaf duplication on odd levels.
+function merkleRootKeccak(leaves, ethers) {
+  let level = leaves.slice();
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const a = level[i];
+      const b = (i + 1 < level.length) ? level[i + 1] : level[i];
+      next.push(ethers.keccak256(ethers.concat([a, b])));
+    }
+    level = next;
+  }
+  return level[0];
+}
+
+// ─── proof: fetches CompletionProof anchor tx + verifies content matches local ──
+async function cmdBitrefillProof(intentId, did) {
+  console.log(JSON.stringify({ event: 'verify_proof_a2b', intentId, did }));
+  let detail;
+  try { detail = await fetchA2BDetail(intentId, did); } catch (e) {
+    console.log(JSON.stringify({ verified: false, error: e.message }));
+    process.exit(1);
+  }
+
+  const out = { intentId, checks: {}, verdict: 'PASS' };
+
+  if (!detail.proof || !detail.proof.anchor_tx) {
+    out.checks.anchored = { ok: false, msg: 'no CompletionProof anchor tx — order not yet completed' };
+    out.verdict = 'FAIL';
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(1);
+  }
+
+  const anchorTx = detail.proof.anchor_tx;
+  out.anchor_tx = anchorTx;
+  out.basescan = BASESCAN_TX(anchorTx);
+
+  // 1. Receipt exists + status = 1
+  let receipt;
+  try { receipt = await ethGetTxReceipt(anchorTx); } catch (e) {
+    out.checks.receipt = { ok: false, msg: 'fetch failed: ' + e.message };
+    out.verdict = 'FAIL';
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(1);
+  }
+  if (!receipt) {
+    out.checks.receipt = { ok: false, msg: 'tx not found on Base mainnet' };
+    out.verdict = 'FAIL';
+  } else if (receipt.status !== '0x1') {
+    out.checks.receipt = { ok: false, msg: `tx reverted (status=${receipt.status})` };
+    out.verdict = 'FAIL';
+  } else {
+    out.checks.receipt = {
+      ok: true,
+      block: parseInt(receipt.blockNumber, 16),
+      to: receipt.to,
+      logs: receipt.logs.length,
+    };
+  }
+
+  // 2. Decode AnchorRegistry log → extract on-chain JSON
+  let onchainJSON = null;
+  if (receipt && receipt.logs) {
+    for (const log of receipt.logs) {
+      const data = log.data || '';
+      // Logs include the dataJSON as a raw bytes UTF-8 string
+      const buf = Buffer.from(data.slice(2), 'hex');
+      // Find first '{' and matching close
+      const start = buf.indexOf('{');
+      if (start < 0) continue;
+      const sub = buf.slice(start);
+      const end = sub.lastIndexOf('}');
+      if (end < 0) continue;
+      try {
+        onchainJSON = JSON.parse(sub.slice(0, end + 1).toString('utf8'));
+        break;
+      } catch {}
+    }
+  }
+
+  if (!onchainJSON) {
+    out.checks.onchain_json = { ok: false, msg: 'failed to decode AnchorRegistry data JSON from logs' };
+    out.verdict = 'FAIL';
+  } else {
+    out.checks.onchain_json = {
+      ok: true,
+      type: onchainJSON.type,
+      verdict: onchainJSON.verdict,
+      product: onchainJSON.product,
+      actualAmount: onchainJSON.actualAmount,
+    };
+
+    // 3. Compare on-chain verdict + governance with local DB version
+    const local = detail.proof;
+    const verdictMatch = onchainJSON.verdict === local.verdict;
+    out.checks.verdict_consistency = {
+      ok: verdictMatch,
+      onchain: onchainJSON.verdict,
+      local: local.verdict,
+      msg: verdictMatch ? 'verdict matches' : 'MISMATCH — DB and on-chain disagree',
+    };
+    if (!verdictMatch) out.verdict = 'FAIL';
+
+    // 4. Compare action_governance numbers
+    if (onchainJSON.actionGovernance && local.action_governance) {
+      const fields = ['allowed', 'denied', 'total_agent_calls'];
+      const mismatches = [];
+      for (const f of fields) {
+        if (onchainJSON.actionGovernance[f] !== local.action_governance[f]) {
+          mismatches.push(`${f}: onchain=${onchainJSON.actionGovernance[f]} local=${local.action_governance[f]}`);
+        }
+      }
+      out.checks.governance_consistency = {
+        ok: mismatches.length === 0,
+        mismatches: mismatches.length ? mismatches : undefined,
+      };
+      if (mismatches.length) out.verdict = 'FAIL';
+    }
+  }
+
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(out.verdict === 'PASS' ? 0 : 1);
 }
 
 commands[cmd]().catch(err => { console.error(JSON.stringify({ error: err.message })); process.exit(1); });

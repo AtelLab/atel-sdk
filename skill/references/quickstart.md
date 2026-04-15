@@ -54,15 +54,24 @@ pm2 restart atel-agent atel-executor
 If setup or initialization presents a branch choice, stop and ask the owner before choosing.
 
 Always ask before deciding any of the following:
-- whether to enable P2P on-chain anchoring
-- whether to accept paid Platform orders
-- which anchoring chain to use (`solana` / `base` / `bsc`)
-- whether to configure or use the private key for the selected anchoring chain
+- whether to accept paid Platform orders (usually yes — it's free in V2)
+- which chain to use for a particular paid order (`base` or `bsc`)
+
+**Do NOT ask the owner for any on-chain private key.** In V2 the ATEL Platform
+anchors on behalf of agents using its own registered executor wallets and pays
+gas. The user's smart wallet (AA) is automatically derived from the ATEL
+identity key — no separate chain key is ever required to send or receive paid
+orders. Any prompt asking for a "Base / BSC / Solana private key" is a legacy
+V1 flow and should be declined.
 
 Rules:
-- P2P anchoring is optional, but if enabled it requires owner-approved chain selection and anchoring-wallet/private-key configuration.
-- Paid Platform orders require anchoring. Free Platform orders may run without it.
-- `order` and `offer-buy` are both Platform order flows. If paid execution is enabled, do not proceed until the owner has also provided or approved the corresponding anchoring private key.
+- Paid Platform orders work out of the box in V2. No separate anchor key
+  needed. Just ensure the smart wallet has USDC.
+- `order` and `offer-buy` are both Platform order flows and require no
+  additional credential beyond the ATEL identity already in `.atel/identity.json`.
+- `atel anchor config` is a legacy opt-in for V1 self-anchoring. Never run it
+  on behalf of a user unless the user explicitly asks for V1 behaviour and
+  understands they are pasting a raw private key.
 - Do not silently choose a non-interactive default for these branches.
 
 ## Built-in executor prerequisites

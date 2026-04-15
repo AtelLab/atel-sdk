@@ -31,3 +31,7 @@ start-test.sh
 /*COMPLIANCE*.md
 /*DELIVERY*.md
 /*STATUS*.md
+
+# Local debug scripts (not for publication)
+setup_wallet*.mjs
+transfer_usdc.mjs
