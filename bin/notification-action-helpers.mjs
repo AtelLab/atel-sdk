@@ -1,5 +1,22 @@
-export function getDirectExecutableActions(eventType, recommendedActions) {
+export function getDirectExecutableActions(eventType, recommendedActions, payload = {}, policy = {}) {
   if (!Array.isArray(recommendedActions) || recommendedActions.length === 0) return [];
+
+  if (eventType === 'order_created') {
+    const amount = Number(payload?.priceAmount || 0);
+    const autoPolicy = policy?.autoPolicy || {};
+    const acceptMaxAmount = Number(autoPolicy.acceptMaxAmount || 0);
+    const shouldAutoAcceptFree = policy?.taskMode === 'auto' && policy?.autoAcceptPlatform === true && amount <= 0;
+    const shouldAutoAcceptByPolicy = autoPolicy.acceptOrders === true && (acceptMaxAmount <= 0 || amount <= acceptMaxAmount);
+    if (shouldAutoAcceptFree || shouldAutoAcceptByPolicy) {
+      return recommendedActions.filter((action) =>
+        action?.type === 'cli' &&
+        action?.action === 'accept' &&
+        Array.isArray(action.command) &&
+        action.command[0] === 'atel'
+      );
+    }
+    return [];
+  }
 
   if (eventType === 'order_accepted') {
     return recommendedActions.filter((action) =>

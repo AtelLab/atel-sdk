@@ -67,6 +67,7 @@ import {
 } from '@lawrenceliang-btc/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
 import { buildAgentCallbackAction, getDirectExecutableActions, normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from './notification-action-helpers.mjs';
+import { parseOrderCancelArgs, preflightOrderCancel } from './order-cancel-helpers.mjs';
 // ollama-manager removed — SDK does not run local models
 const initializeOllama = async () => {};
 const getOllamaStatus = async () => ({ running: false, models: [] });
@@ -113,6 +114,8 @@ const TELEGRAM_UPDATES_STATE_FILE = resolve(process.env.HOME || '/root', '.openc
 const TELEGRAM_BINDINGS_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-bindings.json');
 const OPENCLAW_CONFIG_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
 const OPENCLAW_TG_OFFSET_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'telegram', 'update-offset-default.json');
+const OPENCLAW_GATEWAY_SYSTEMD_FILE = resolve(process.env.HOME || '/root', '.config', 'systemd', 'user', 'openclaw-gateway.service');
+const OPENCLAW_GATEWAY_SYSTEMD_OVERRIDE_FILE = resolve(process.env.HOME || '/root', '.config', 'systemd', 'user', 'openclaw-gateway.service.d', 'env.conf');
 const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
 const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
 const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
@@ -521,22 +524,128 @@ function autoBindNotifications() {
 }
 
 // Auto-discover OpenClaw gateway: read token + find port
-function discoverGateway() {
-  // 1. Env override
-  if (process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL) {
-    const url = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL;
-    let token = '';
-    try { token = JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8')).gateway?.auth?.token || ''; } catch {}
-    return { url, token };
+function loadOpenClawGatewayRuntimeHints() {
+  const hints = { ports: [], binds: [], urls: [] };
+  const addPort = (value) => {
+    const port = Number.parseInt(String(value || '').trim(), 10);
+    if (Number.isFinite(port) && port > 0 && !hints.ports.includes(port)) hints.ports.push(port);
+  };
+  const addBind = (value) => {
+    const bind = normalizeGatewayBind(String(value || '').trim() || '127.0.0.1');
+    if (bind && !hints.binds.includes(bind)) hints.binds.push(bind);
+  };
+  const addUrl = (value) => {
+    const url = String(value || '').trim();
+    if (url && !hints.urls.includes(url)) hints.urls.push(url);
+  };
+  const parseRuntimeText = (content) => {
+    if (!content) return;
+    for (const match of content.matchAll(/(?:--port|OPENCLAW_GATEWAY_PORT=)(\d+)/g)) addPort(match[1]);
+    for (const match of content.matchAll(/(?:--host|--bind)\s+([^\s"']+)/g)) addBind(match[1]);
+    for (const match of content.matchAll(/OPENCLAW_GATEWAY_URL=([^\s"']+)/g)) addUrl(match[1]);
+  };
+  addPort(process.env.OPENCLAW_GATEWAY_PORT);
+  addBind(process.env.OPENCLAW_GATEWAY_BIND || process.env.OPENCLAW_GATEWAY_HOST);
+  addUrl(process.env.OPENCLAW_GATEWAY_URL || process.env.ATEL_NOTIFY_GATEWAY);
+  for (const candidate of [OPENCLAW_GATEWAY_SYSTEMD_FILE, OPENCLAW_GATEWAY_SYSTEMD_OVERRIDE_FILE]) {
+    try {
+      if (existsSync(candidate)) parseRuntimeText(readFileSync(candidate, 'utf-8'));
+    } catch {}
   }
-  // 2. Read from OpenClaw config
+  return hints;
+}
+
+function discoverGateway() {
+  const candidateUrls = [];
+  const seen = new Set();
+  const addCandidate = (url, source) => {
+    const normalized = String(url || '').trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidateUrls.push({ url: normalized, source });
+  };
+  const addPortCandidates = (port, bind, source) => {
+    const parsedPort = Number.parseInt(String(port || '').trim(), 10);
+    if (!Number.isFinite(parsedPort) || parsedPort <= 0) return;
+    const hosts = new Set([
+      normalizeGatewayBind(bind || '127.0.0.1'),
+      '127.0.0.1',
+      'localhost',
+    ]);
+    for (const host of hosts) addCandidate(`http://${host}:${parsedPort}`, source);
+  };
+
+  let token = '';
+  let cfg = null;
   try {
-    const cfg = JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8'));
-    const token = cfg.gateway?.auth?.token || '';
-    const port = cfg.gateway?.port || 18789;
-    const bind = normalizeGatewayBind(cfg.gateway?.bind || '127.0.0.1');
-    return { url: `http://${bind}:${port}`, token };
-  } catch { return null; }
+    cfg = JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8'));
+    token = String(cfg?.gateway?.auth?.token || '').trim();
+  } catch {}
+
+  const explicitUrl = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL;
+  if (explicitUrl) addCandidate(explicitUrl, 'env_url');
+
+  const hints = loadOpenClawGatewayRuntimeHints();
+  for (const url of hints.urls) addCandidate(url, 'runtime_url');
+  for (const port of hints.ports) addPortCandidates(port, hints.binds[0], 'runtime_port');
+
+  if (cfg?.gateway?.port) addPortCandidates(cfg.gateway.port, cfg.gateway?.bind || '127.0.0.1', 'config');
+
+  const fallbackPort = Number.parseInt(String(process.env.OPENCLAW_GATEWAY_PORT || '').trim(), 10);
+  if (Number.isFinite(fallbackPort) && fallbackPort > 0) addPortCandidates(fallbackPort, process.env.OPENCLAW_GATEWAY_BIND || process.env.OPENCLAW_GATEWAY_HOST || '127.0.0.1', 'env_port');
+
+  if (candidateUrls.length === 0) addPortCandidates(18789, '127.0.0.1', 'default');
+
+  if (!token && candidateUrls.length === 0) return null;
+  return { url: candidateUrls[0]?.url || '', token, candidates: candidateUrls };
+}
+
+async function invokeGatewayTelegramMessage(target, message, timeoutMs = 5000) {
+  const gw = discoverGateway();
+  const candidates = Array.isArray(gw?.candidates) && gw.candidates.length > 0 ? gw.candidates : (gw?.url ? [{ url: gw.url, source: 'legacy' }] : []);
+  let last = { ok: false, reason: 'missing_gateway', error: 'missing_gateway', status: 0, url: '' };
+  if (gw?.token && candidates.length > 0) {
+    for (const candidate of candidates) {
+      try {
+        const resp = await fetch(`${candidate.url}/tools/invoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
+          body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message, target } }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (resp.ok) return { ok: true, status: resp.status, url: candidate.url, source: candidate.source };
+        let detail = `http_${resp.status}`;
+        try {
+          const payload = await resp.json();
+          detail = payload?.error?.message || payload?.message || detail;
+        } catch {}
+        last = { ok: false, reason: 'http_error', error: detail, status: resp.status, url: candidate.url, source: candidate.source };
+      } catch (e) {
+        last = { ok: false, reason: 'fetch_failed', error: e.message || 'fetch_failed', status: 0, url: candidate.url, source: candidate.source };
+      }
+    }
+  }
+
+  const oc = loadOpenClawConfig();
+  const botToken = String(oc?.channels?.telegram?.botToken || '').trim();
+  if (botToken) {
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: target, text: message }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const data = await resp.json().catch(() => null);
+      if (resp.ok && data?.ok !== false) {
+        return { ok: true, status: resp.status, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
+      }
+      last = { ok: false, reason: 'telegram_http_error', error: data?.description || `http_${resp.status}`, status: resp.status, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
+    } catch (e) {
+      last = { ok: false, reason: 'telegram_fetch_failed', error: e.message || 'fetch_failed', status: 0, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
+    }
+  }
+  return last;
 }
 
 function loadOpenClawConfig() {
@@ -953,20 +1062,9 @@ USDC 已支付`;
           continue;
         }
       } else if (target.channel === 'gateway') {
-        const gw = discoverGateway();
-        if (gw?.url && gw?.token) {
-          const resp = await fetch(`${gw.url}/tools/invoke`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message, target: target.target } }),
-            signal: AbortSignal.timeout(5000),
-          });
-          if (!resp.ok) {
-            log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: resp.status, error: `http_${resp.status}` });
-            continue;
-          }
-        } else {
-          log({ event: 'trade_notify_target_skipped', eventType, channel: 'gateway', target: target.id || target.target, reason: 'missing_gateway' });
+        const delivery = await invokeGatewayTelegramMessage(target.target, message, 5000);
+        if (!delivery.ok) {
+          log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
           continue;
         }
       }
@@ -1039,20 +1137,9 @@ async function pushP2PNotification(eventType, payload = {}) {
           continue;
         }
       } else if (target.channel === 'gateway') {
-        const gw = discoverGateway();
-        if (gw?.url && gw?.token) {
-          const resp = await fetch(`${gw.url}/tools/invoke`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message, target: target.target } }),
-            signal: AbortSignal.timeout(5000),
-          });
-          if (!resp.ok) {
-            log({ event: 'p2p_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: resp.status, error: `http_${resp.status}` });
-            continue;
-          }
-        } else {
-          log({ event: 'p2p_notify_target_skipped', eventType, channel: 'gateway', target: target.id || target.target, reason: 'missing_gateway' });
+        const delivery = await invokeGatewayTelegramMessage(target.target, message, 5000);
+        if (!delivery.ok) {
+          log({ event: 'p2p_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
           continue;
         }
       }
@@ -3445,6 +3532,13 @@ async function cmdStart(port) {
   const enforcer = new PolicyEnforcer(policy);
   const pendingTasks = loadTasks();
   let resultPushQueue = loadResultPushQueue();
+  const notifyTargets = loadNotifyTargets();
+  const enabledNotifyTargets = notifyTargets.targets.filter(t => t.enabled !== false);
+  if (notifyTargets.targets.length === 0) {
+    console.warn('⚠️  No notification targets are bound. Run `atel notify bind <chatId>` or `atel notify add telegram <chatId>` before expecting callbacks.');
+  } else if (enabledNotifyTargets.length === 0) {
+    console.warn('⚠️  Notification targets exist, but all are disabled. Run `atel notify enable <id>` to restore callbacks.');
+  }
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -4886,7 +4980,7 @@ Advance the current milestone strictly based on these approved results. Do not i
     // to "say" it will run a command. This is the reliable path for state-transition actions
     // such as approving the milestone plan on order acceptance.
     let directExecutionSucceeded = false;
-    const directActions = getDirectExecutableActions(event, recommendedActions);
+    const directActions = getDirectExecutableActions(event, recommendedActions, payload, currentPolicy);
     for (const action of directActions) {
       const result = await executeRecommendedActionDirect(event, action, atelCwd, dedupeKey);
       if (result.ok) directExecutionSucceeded = true;
@@ -5953,10 +6047,8 @@ Advance the current milestone strictly based on these approved results. Do not i
 
   await endpoint.start();
 
-  // Telegram notifications are opt-in by default. Only auto-bind when explicit consent was already collected.
-  if (ATEL_NOTIFY_AUTO_BIND) {
-    try { autoBindNotifications(); } catch (e) { /* never block startup */ }
-  }
+  // In OpenClaw-hosted mode, self-heal notification binding automatically so TG callbacks survive reinstall / port drift.
+  try { autoBindNotifications(); } catch (e) { /* never block startup */ }
 
   // Background retry for failed result pushes (durable queue)
   const flushResultPushQueue = async () => {
@@ -7544,10 +7636,39 @@ async function cmdReject(orderId) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-async function cmdOrderCancel(orderId, reason) {
-  if (!orderId) { console.error('Usage: atel order-cancel <orderId> [reason]'); process.exit(1); }
+async function cmdOrderCancel(orderId, restArgs = []) {
+  if (!orderId) { console.error('Usage: atel order-cancel <orderId> [reason] [--dry-run]'); process.exit(1); }
+
+  const { dryRun, reason } = parseOrderCancelArgs(restArgs);
+  const cancelReason = reason || 'reset regression environment';
+
+  const res = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, { signal: AbortSignal.timeout(10000) });
+  const orderInfo = await res.json();
+  if (!res.ok) { console.error('Failed to get order:', orderInfo.error || `http_${res.status}`); process.exit(1); }
+
+  const currentDid = requireIdentity().did;
+  const preflight = preflightOrderCancel(orderInfo, currentDid);
+  if (!preflight.ok) {
+    console.error(preflight.error);
+    process.exit(1);
+  }
+
+  if (dryRun) {
+    console.log(JSON.stringify({
+      status: 'dry_run',
+      orderId: preflight.orderId,
+      orderStatus: preflight.orderStatus,
+      requesterDid: preflight.requesterDid,
+      executorDid: preflight.executorDid,
+      currentDid: preflight.currentDid,
+      reason: cancelReason,
+      canCancel: true,
+    }, null, 2));
+    return;
+  }
+
   const data = await signedFetch('POST', `/trade/v1/order/${orderId}/cancel`, {
-    reason: reason || 'reset regression environment',
+    reason: cancelReason,
   });
   if (data?.status === 'cancelled') untrackOrder(orderId);
   console.log(JSON.stringify(data, null, 2));
@@ -9873,7 +9994,7 @@ const commands = {
   // Trade
   'trade-task': () => cmdTradeTask(args[0], args.slice(1).join(' ')),
   order: () => cmdOrder(args[0], args[1], args[2]),
-  'order-cancel': () => cmdOrderCancel(args[0], args.slice(1).join(' ').trim()),
+  'order-cancel': () => cmdOrderCancel(args[0], args.slice(1)),
   'order-info': () => cmdOrderInfo(args[0]),
   accept: () => cmdAccept(args[0]),
   reject: () => _origCmdReject(args[0]),
@@ -10188,17 +10309,11 @@ const commands = {
             const data = await resp.json();
             console.log(`  ${target.id}: ${data.ok ? '✅ sent' : '❌ ' + (data.description || 'failed')}`);
           } else if (target.channel === 'gateway') {
-            const gw = discoverGateway();
-            if (gw?.url && gw?.token) {
-              const resp = await fetch(`${gw.url}/tools/invoke`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-                body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message: '🔔 ATEL notification test', target: target.target } }),
-                signal: AbortSignal.timeout(10000),
-              });
-              console.log(`  ${target.id}: ${resp.ok ? '✅ sent' : '❌ status ' + resp.status}`);
+            const delivery = await invokeGatewayTelegramMessage(target.target, '🔔 ATEL notification test', 10000);
+            if (delivery.ok) {
+              console.log(`  ${target.id}: ✅ sent via ${delivery.url}`);
             } else {
-              console.log(`  ${target.id}: ❌ gateway not found`);
+              console.log(`  ${target.id}: ❌ ${delivery.error || delivery.reason || 'gateway_failed'}${delivery.url ? ' @ ' + delivery.url : ''}`);
             }
           } else {
             console.log(`  ${target.id}: ❌ unsupported channel ${target.channel}`);
@@ -10289,7 +10404,7 @@ Hub Commands:
 Trade Commands:
   trade-task <cap> <desc> [--budget N]   One-shot: search → order → wait → confirm (requester)
   order <executorDid> <cap> <price>    Create a trade order
-  order-cancel <orderId> [reason]      Cancel an order
+  order-cancel <orderId> [reason] [--dry-run]  Cancel an order
   order-info <orderId>                 Get order details
   accept <orderId>                     Accept an order (executor)
   reject <orderId>                     Reject an order (executor)
