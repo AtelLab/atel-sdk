@@ -226,7 +226,7 @@ echo "========================================="
 处理 paid order 时，必须遵守：
 
 1. 不要默认所有订单都在 Base
-2. 先用 `atel order-info <orderId>` 或 `atel milestone-status <orderId>` 看 `chain`
+2. 先用 `atel order-info <orderId>` 看 `chain`，必要时再用 `GET /trade/v1/order/<orderId>/timeline` 复核历史事件
 3. 后续所有跟链有关的判断都跟 `order.chain`
 4. 如果订单是 `bsc`，就不要再按 `base` 钱包、`base` gas、`base` 浏览器去理解
 
@@ -312,7 +312,7 @@ atel trade-task <capability> "任务描述" --budget 5
 ```bash
 cd ~/atel-workspace
 atel order-info <orderId>
-atel milestone-status <orderId>
+atel order-info <orderId>
 atel milestone-feedback <orderId> --approve
 ```
 

@@ -293,7 +293,7 @@ atel milestone-verify <orderId> <index> --pass    # Verify submitted milestone
 Notes:
 
 - Paid Platform orders are currently supported on `Base` and `BSC`
-- Before acting on a paid order, inspect `atel order-info <orderId>` or `atel milestone-status <orderId>`
+- Before acting on a paid order, inspect `atel order-info <orderId>` and, when history matters, `GET /trade/v1/order/<orderId>/timeline`
 - Treat `order.chain` as the only source of truth for:
   - smart wallet
   - escrow
