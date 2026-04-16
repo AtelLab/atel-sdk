@@ -74,9 +74,25 @@ import { parseAttachmentFlags, processAttachments } from './atel-attachment-help
 
 const ATEL_DIR = resolve(process.env.ATEL_DIR || '.atel');
 const IDENTITY_FILE = resolve(ATEL_DIR, 'identity.json');
-const ATEL_PLATFORM = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
-const REGISTRY_URL = process.env.ATEL_REGISTRY || ATEL_PLATFORM || 'https://api.atelai.org';
-const ATEL_RELAY = process.env.ATEL_RELAY || 'https://api.atelai.org';
+
+function readDefaultPlatformBase() {
+  const explicit = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || '';
+  if (String(explicit).trim()) return String(explicit).trim().replace(/\/+$/, '');
+  try {
+    const networkFile = resolve(ATEL_DIR, 'network.json');
+    if (existsSync(networkFile)) {
+      const network = JSON.parse(readFileSync(networkFile, 'utf-8'));
+      const candidate = [network?.relayUrl, network?.platformUrl, network?.registryUrl].find((value) => typeof value === 'string' && value.trim());
+      if (candidate) return String(candidate).trim().replace(/\/+$/, '');
+    }
+  } catch {}
+  return 'https://api.atelai.org';
+}
+
+const DEFAULT_PLATFORM_BASE = readDefaultPlatformBase();
+const ATEL_PLATFORM = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || DEFAULT_PLATFORM_BASE;
+const REGISTRY_URL = process.env.ATEL_REGISTRY || ATEL_PLATFORM || DEFAULT_PLATFORM_BASE;
+const ATEL_RELAY = process.env.ATEL_RELAY || DEFAULT_PLATFORM_BASE;
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
 const ATEL_NOTIFY_AUTO_BIND = /^(1|true|yes)$/i.test(String(process.env.ATEL_NOTIFY_AUTO_BIND || ''));
@@ -92,8 +108,11 @@ const PENDING_FILE = resolve(ATEL_DIR, 'pending-tasks.json');
 const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
 const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
 const NOTIFY_ROUTES_FILE = resolve(ATEL_DIR, 'notify-routes.json');
+const NOTIFY_CONSENTS_FILE = resolve(ATEL_DIR, 'notify-consents.json');
 const TELEGRAM_UPDATES_STATE_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-updates.json');
 const TELEGRAM_BINDINGS_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-bindings.json');
+const OPENCLAW_CONFIG_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
+const OPENCLAW_TG_OFFSET_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'telegram', 'update-offset-default.json');
 const TRADE_TRACK_FILE = resolve(ATEL_DIR, 'tracked-orders.json');
 const P2P_STATUS_FILE = resolve(ATEL_DIR, 'p2p-task-status.jsonl');
 const PENDING_AGENT_CALLBACKS_FILE = resolve(ATEL_DIR, 'pending-agent-callbacks.json');
@@ -106,6 +125,47 @@ const DEFAULT_POLICY = { rateLimit: 60, maxPayloadBytes: 1048576, maxConcurrent:
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function ensureDir() { if (!existsSync(ATEL_DIR)) mkdirSync(ATEL_DIR, { recursive: true }); }
+
+function isPidAlive(pid) {
+  const n = Number(pid || 0);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; }
+  catch { return false; }
+}
+
+function getStartInstanceLockFile(port) {
+  return resolve(ATEL_DIR, `start-instance-${String(port || '3100')}.lock.json`);
+}
+
+function acquireStartInstanceLock(port) {
+  ensureDir();
+  const file = getStartInstanceLockFile(port);
+  let existing = null;
+  if (existsSync(file)) {
+    try { existing = JSON.parse(readFileSync(file, 'utf-8')); } catch {}
+  }
+  if (existing?.pid && existing.pid !== process.pid && isPidAlive(existing.pid)) {
+    return { ok: false, file, existing };
+  }
+  const payload = {
+    pid: process.pid,
+    port: Number(port || 0),
+    did: (() => { try { return requireIdentity().did; } catch { return ''; } })(),
+    startedAt: new Date().toISOString(),
+  };
+  writeFileSync(file, JSON.stringify(payload, null, 2));
+  return { ok: true, file, existing };
+}
+
+function releaseStartInstanceLock(port) {
+  const file = getStartInstanceLockFile(port);
+  if (!existsSync(file)) return false;
+  try {
+    const current = JSON.parse(readFileSync(file, 'utf-8'));
+    if (Number(current?.pid || 0) !== process.pid) return false;
+  } catch {}
+  try { unlinkSync(file); return true; } catch { return false; }
+}
 
 function ensureOrderWorkspace(orderId, context = {}) {
   ensureDir();
@@ -212,6 +272,18 @@ function summarizeAgentOutput(text, maxChars = 300) {
   return trimmed.substring(0, maxChars);
 }
 
+function isKnownInvalidLocalAgentStdout(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  const lowered = value.toLowerCase();
+  return lowered.includes('401 该令牌已过期')
+    || lowered.includes('token expired')
+    || lowered.includes('plugin register() called')
+    || lowered.includes('plugin registration complete')
+    || lowered.includes('session file locked')
+    || lowered.includes('session locked');
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Notification Target System — auto-discover gateway, manage targets
 // ═══════════════════════════════════════════════════════════════════
@@ -224,6 +296,86 @@ function loadNotifyTargets() {
 function saveNotifyTargets(data) {
   ensureDir();
   writeFileSync(NOTIFY_TARGETS_FILE, JSON.stringify(data, null, 2));
+}
+
+function markNotifyTargetUsed(targets, deliveredTarget, usedAt) {
+  const list = Array.isArray(targets?.targets) ? targets.targets : [];
+  const id = String(deliveredTarget?.id || '').trim();
+  const channel = String(deliveredTarget?.channel || '').trim();
+  const targetValue = String(deliveredTarget?.target || '').trim();
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    if (id && String(item.id || '').trim() === id) {
+      item.lastUsedAt = usedAt;
+      return true;
+    }
+    if (channel && targetValue && String(item.channel || '').trim() === channel && String(item.target || '').trim() === targetValue) {
+      item.lastUsedAt = usedAt;
+      return true;
+    }
+  }
+  return false;
+}
+
+function loadNotifyConsents() {
+  try { return JSON.parse(readFileSync(NOTIFY_CONSENTS_FILE, 'utf-8')); }
+  catch { return { version: 1, consents: [] }; }
+}
+
+function saveNotifyConsents(data) {
+  ensureDir();
+  writeFileSync(NOTIFY_CONSENTS_FILE, JSON.stringify(data, null, 2));
+}
+
+function extractTelegramBotId(botToken = '') {
+  const token = String(botToken || '').trim();
+  return token ? (token.split(':', 1)[0] || '') : '';
+}
+
+function upsertNotifyConsent({ did, channel, target, botToken, source = 'notify_bind', status = 'active' }) {
+  const ownerDid = String(did || '').trim();
+  const normalizedChannel = String(channel || '').trim();
+  const normalizedTarget = String(target || '').trim();
+  if (!ownerDid || !normalizedChannel || !normalizedTarget) return false;
+  const data = loadNotifyConsents();
+  if (!Array.isArray(data.consents)) data.consents = [];
+  const now = new Date().toISOString();
+  const botId = normalizedChannel === 'telegram' ? extractTelegramBotId(botToken) : '';
+  const existing = data.consents.find((item) => item && item.did === ownerDid && item.channel === normalizedChannel && item.target === normalizedTarget);
+  if (existing) {
+    existing.status = status;
+    existing.updatedAt = now;
+    existing.revokedAt = status === 'revoked' ? (existing.revokedAt || now) : null;
+    if (status !== 'revoked') existing.consentedAt = existing.consentedAt || now;
+    existing.source = source || existing.source || 'notify_bind';
+    if (botId) existing.botId = botId;
+  } else {
+    data.consents.push({
+      did: ownerDid,
+      channel: normalizedChannel,
+      target: normalizedTarget,
+      botId: botId || undefined,
+      source,
+      status,
+      consentedAt: status === 'revoked' ? null : now,
+      revokedAt: status === 'revoked' ? now : null,
+      updatedAt: now,
+    });
+  }
+  saveNotifyConsents(data);
+  return true;
+}
+
+function revokeNotifyConsent({ did, channel, target, reason = 'notify_remove' }) {
+  return upsertNotifyConsent({ did, channel, target, source: reason, status: 'revoked' });
+}
+
+function listNotifyConsentsForDid(did) {
+  const ownerDid = String(did || '').trim();
+  if (!ownerDid) return [];
+  const data = loadNotifyConsents();
+  const items = Array.isArray(data.consents) ? data.consents : [];
+  return items.filter((item) => item && item.did === ownerDid);
 }
 
 function loadNotifyRoutes() {
@@ -289,24 +441,26 @@ function resolveNotifyTargets(orderId = '') {
   const primary = getPrimaryTelegramTarget();
   const preferred = (orderId && routes.orderBindings && routes.orderBindings[orderId]) || routes.defaultTelegram || (primary ? { chatId: String(primary.target), botToken: primary.botToken, updatedAt: primary.lastUsedAt || primary.createdAt || new Date().toISOString() } : null);
   if (!preferred?.chatId) return { targets, enabled };
-  let hasTelegram = false;
+  const bindingTarget = resolveNotifyBindTarget(preferred.chatId, preferred.botToken || discoverTelegramBot() || '');
+  let hasBoundTarget = false;
   enabled = enabled.map((target) => {
-    if (target.channel !== 'telegram') return target;
-    hasTelegram = true;
+    if (target.channel !== bindingTarget.channel) return target;
+    if (String(target.target) !== String(preferred.chatId)) return target;
+    hasBoundTarget = true;
     return {
       ...target,
       target: String(preferred.chatId),
-      botToken: preferred.botToken || target.botToken,
+      botToken: bindingTarget.channel === 'telegram' ? (preferred.botToken || target.botToken) : undefined,
       routeSource: orderId && routes.orderBindings && routes.orderBindings[orderId] ? 'order' : 'default',
     };
   });
-  if (!hasTelegram) {
+  if (!hasBoundTarget) {
     enabled = [{
-      id: `tg_${preferred.chatId}`,
-      channel: 'telegram',
+      id: bindingTarget.id,
+      channel: bindingTarget.channel,
       target: String(preferred.chatId),
-      botToken: preferred.botToken || discoverTelegramBot() || undefined,
-      label: orderId ? `order:${orderId}` : 'owner',
+      botToken: bindingTarget.channel === 'telegram' ? (preferred.botToken || discoverTelegramBot() || undefined) : undefined,
+      label: orderId ? 'order:' + orderId : 'owner',
       enabled: true,
       createdAt: preferred.updatedAt || new Date().toISOString(),
       lastUsedAt: null,
@@ -351,16 +505,19 @@ function autoBindNotifications() {
   if (!chatId) return;
 
   const botToken = routes.defaultTelegram?.botToken || discoverTelegramBot();
-  const id = `tg_${chatId}`;
+  const bindingTarget = resolveNotifyBindTarget(chatId, botToken || '');
   targets.targets.push({
-    id, channel: 'telegram', target: chatId,
-    botToken: botToken || undefined,
+    id: bindingTarget.id,
+    channel: bindingTarget.channel,
+    target: String(chatId),
+    botToken: bindingTarget.channel === 'telegram' ? (botToken || undefined) : undefined,
     label: 'owner', enabled: true,
     createdAt: new Date().toISOString(), lastUsedAt: null,
   });
   saveNotifyTargets(targets);
   rememberTelegramRoute(chatId, botToken || undefined);
-  console.log(`🔔 Auto-bound TG notifications to chat ${chatId}`);
+  try { upsertNotifyConsent({ did: requireIdentity().did, channel: 'telegram', target: String(chatId), botToken, source: 'auto_bind', status: 'active' }); } catch {}
+  console.log(`🔔 Auto-bound ${bindingTarget.channel} notifications to chat ${chatId}`);
 }
 
 // Auto-discover OpenClaw gateway: read token + find port
@@ -369,12 +526,12 @@ function discoverGateway() {
   if (process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL) {
     const url = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL;
     let token = '';
-    try { token = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8')).gateway?.auth?.token || ''; } catch {}
+    try { token = JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8')).gateway?.auth?.token || ''; } catch {}
     return { url, token };
   }
-  // 2. Read from ~/.openclaw/openclaw.json
+  // 2. Read from OpenClaw config
   try {
-    const cfg = JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+    const cfg = JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8'));
     const token = cfg.gateway?.auth?.token || '';
     const port = cfg.gateway?.port || 18789;
     const bind = normalizeGatewayBind(cfg.gateway?.bind || '127.0.0.1');
@@ -384,10 +541,58 @@ function discoverGateway() {
 
 function loadOpenClawConfig() {
   try {
-    return JSON.parse(readFileSync(join(process.env.HOME || '', '.openclaw/openclaw.json'), 'utf-8'));
+    return JSON.parse(readFileSync(OPENCLAW_CONFIG_FILE, 'utf-8'));
   } catch {
     return null;
   }
+}
+
+function loadOpenClawTelegramOffset() {
+  try {
+    return JSON.parse(readFileSync(OPENCLAW_TG_OFFSET_FILE, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function getTelegramInboundHostMode(config) {
+  const explicit = String(process.env.ATEL_NOTIFY_TG_INGRESS || '').trim().toLowerCase();
+  if (explicit === 'sdk') return { mode: 'sdk', reason: 'env_override_sdk' };
+  if (explicit === 'openclaw') return { mode: 'openclaw', reason: 'env_override_openclaw' };
+  const oc = loadOpenClawConfig();
+  const enabled = oc?.channels?.telegram?.enabled === true;
+  const botToken = String(oc?.channels?.telegram?.botToken || '').trim();
+  const offset = loadOpenClawTelegramOffset();
+  const offsetBotId = String(offset?.botId || '').trim();
+  if (enabled && botToken && config?.botToken && botToken === config.botToken) {
+    return { mode: 'openclaw', reason: offsetBotId && offsetBotId === String(config.botId || '') ? 'openclaw_same_bot_active' : 'openclaw_same_bot_configured' };
+  }
+  return { mode: 'sdk', reason: 'sdk_default' };
+}
+
+function resolveNotifyBindTarget(chatId, botToken) {
+  const normalizedChatId = String(chatId || '').trim();
+  const normalizedBotToken = String(botToken || '').trim();
+  const botId = normalizedBotToken ? (normalizedBotToken.split(':', 1)[0] || 'telegram') : 'telegram';
+  const ingress = getTelegramInboundHostMode({ chatId: normalizedChatId, botToken: normalizedBotToken, botId });
+  if (ingress.mode === 'openclaw') {
+    return {
+      channel: 'gateway',
+      id: 'gw_' + normalizedChatId,
+      target: normalizedChatId,
+      label: 'owner',
+      ingress,
+      botToken: undefined,
+    };
+  }
+  return {
+    channel: 'telegram',
+    id: 'tg_' + normalizedChatId,
+    target: normalizedChatId,
+    label: 'owner',
+    ingress,
+    botToken: normalizedBotToken || undefined,
+  };
 }
 
 // Read TG bot token from openclaw config
@@ -440,6 +645,45 @@ function registerTelegramInboundBinding(did, config) {
   saveTelegramBindings(data);
   return { ownerDid: did, rebound: true };
 }
+
+function getTelegramBindingKey(chatId, botToken) {
+  const normalizedChatId = String(chatId || '').trim();
+  const normalizedBotToken = String(botToken || '').trim();
+  if (!normalizedChatId || !normalizedBotToken) return null;
+  const botId = normalizedBotToken.split(':', 1)[0] || 'telegram';
+  return { key: `${botId}:${normalizedChatId}`, botId, chatId: normalizedChatId };
+}
+
+function ensureTelegramBindingOwnership(did, chatId, botToken) {
+  const binding = getTelegramBindingKey(chatId, botToken);
+  if (!did || !binding) return { ok: true, ownerDid: String(did || '').trim(), key: binding?.key || '' };
+  const data = loadTelegramBindings();
+  if (!data.bindings || typeof data.bindings !== 'object') data.bindings = {};
+  const current = data.bindings[binding.key];
+  const ownerDid = String(current?.ownerDid || '').trim();
+  if (ownerDid && ownerDid !== did) {
+    return { ok: false, ownerDid, key: binding.key, botId: binding.botId, chatId: binding.chatId };
+  }
+  return { ok: true, ownerDid: ownerDid || String(did).trim(), key: binding.key, botId: binding.botId, chatId: binding.chatId };
+}
+
+function releaseTelegramBindingOwnership(did, chatId, botToken) {
+  const binding = getTelegramBindingKey(chatId, botToken);
+  if (!did || !binding) return false;
+  const data = loadTelegramBindings();
+  if (!data.bindings || typeof data.bindings !== 'object') data.bindings = {};
+  const current = data.bindings[binding.key];
+  if (!current || String(current.ownerDid || '').trim() !== String(did).trim()) return false;
+  delete data.bindings[binding.key];
+  saveTelegramBindings(data);
+  const state = loadTelegramUpdatesState();
+  if (state.leaders && state.leaders[binding.key] && String(state.leaders[binding.key].did || '').trim() === String(did).trim()) {
+    delete state.leaders[binding.key];
+    saveTelegramUpdatesState(state);
+  }
+  return true;
+}
+
 
 function acquireTelegramInboundLeader(did, config) {
   const state = loadTelegramUpdatesState();
@@ -534,6 +778,11 @@ async function mirrorTelegramInboundToBindings(config, update) {
 async function pollTelegramInboundUpdates(targetDid) {
   const config = getTelegramInboundConfig();
   if (!config) return { status: 'noop' };
+
+  const ingressMode = getTelegramInboundHostMode(config);
+  if (ingressMode.mode === 'openclaw') {
+    return { status: 'hosted_by_openclaw', reason: ingressMode.reason, botId: config.botId, chatId: config.chatId };
+  }
 
   const binding = registerTelegramInboundBinding(targetDid, config);
   if (binding.ownerDid && binding.ownerDid !== targetDid) {
@@ -709,7 +958,7 @@ USDC 已支付`;
           const resp = await fetch(`${gw.url}/tools/invoke`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message, target: target.target } }),
             signal: AbortSignal.timeout(5000),
           });
           if (!resp.ok) {
@@ -722,6 +971,8 @@ USDC 已支付`;
         }
       }
       target.lastUsedAt = new Date().toISOString();
+      markNotifyTargetUsed(targets, target, target.lastUsedAt);
+      log({ event: 'trade_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt });
     } catch (e) {
       log({ event: 'trade_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
     }
@@ -793,7 +1044,7 @@ async function pushP2PNotification(eventType, payload = {}) {
           const resp = await fetch(`${gw.url}/tools/invoke`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', message, target: target.target } }),
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message, target: target.target } }),
             signal: AbortSignal.timeout(5000),
           });
           if (!resp.ok) {
@@ -806,6 +1057,8 @@ async function pushP2PNotification(eventType, payload = {}) {
         }
       }
       target.lastUsedAt = new Date().toISOString();
+      markNotifyTargetUsed(targets, target, target.lastUsedAt);
+      log({ event: 'p2p_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt });
     } catch (e) {
       log({ event: 'p2p_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
     }
@@ -1704,9 +1957,9 @@ async function getWalletAddresses() {
 function detectPreferredChain() {
   const config = loadAnchorConfig();
   if (config?.preferredChain) return config.preferredChain;
-  if (getChainPrivateKey('solana')) return 'solana';
-  if (getChainPrivateKey('base')) return 'base';
   if (getChainPrivateKey('bsc')) return 'bsc';
+  if (getChainPrivateKey('base')) return 'base';
+  if (getChainPrivateKey('solana')) return 'solana';
   return null;
 }
 
@@ -3180,6 +3433,12 @@ async function cmdStart(port) {
   }
 
   const p = parseInt(port || '3100');
+  const startLock = acquireStartInstanceLock(p);
+  if (!startLock.ok) {
+    console.error(`Another atel start instance is already running for this ATEL_DIR on port ${p} (pid: ${startLock.existing?.pid || 'unknown'}).`);
+    process.exit(1);
+  }
+  process.on('exit', () => { releaseStartInstanceLock(p); });
   const caps = loadCapabilities();
   const capTypes = caps.map(c => c.type || c);
   const policy = loadPolicy();
@@ -3194,7 +3453,7 @@ async function cmdStart(port) {
       if (process.env.ATEL_DEBUG) console.error('[DEBUG] verifyAnchorFromChain input:', { chain, txHash, traceRoot });
       
       if (!txHash || !traceRoot) return { checked: false, verified: false, reason: 'missing_anchor_or_root' };
-      const c = (chain || 'solana').toLowerCase();
+      const c = (chain || 'base').toLowerCase();
       
       if (c === 'solana') {
         const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -3837,9 +4096,17 @@ For rejection:
 Important: you are not chatting with the user.
 Do not output markdown, headings, bullet points, explanations, or your reasoning.
 You must output exactly one line of JSON.
+Do not return a plan-only answer.
+Do not return vague wording like “可定义为/应当/建议/可以/后续将”.
+You must prefer factual evidence:
+- what you actually checked
+- what command or file/path or interface you actually touched
+- what concrete output / state / observation you actually got
+- whether that evidence satisfies the current milestone
+If you could not find evidence, say that explicitly in the JSON result, including what you checked.
 
 Format:
-{"result":"the actual deliverable for the current milestone"}`;
+{"result":"factual deliverable with concrete evidence and observations only"}`;
     }
 
     return promptText;
@@ -3965,6 +4232,9 @@ Format:
         const parsed = JSON.parse(cleaned);
         return buildAgentCallbackAction(eventType, payload, parsed);
       } catch {
+        if (isKnownInvalidLocalAgentStdout(cleaned)) {
+          return { ok: false, error: 'invalid_local_agent_stdout_known_failure' };
+        }
         return buildAgentCallbackAction(eventType, payload, { result: cleaned, summary: cleaned });
       }
     }
@@ -4290,7 +4560,13 @@ Advance the current milestone strictly based on these approved results. Do not i
         const order = await fetchOrderState(orderId);
         await reconcileSingleTradeOrder(order);
       } catch (e) {
-        log({ event: 'trade_reconcile_tracked_error', orderId, error: e.message });
+        const message = String(e?.message || '');
+        if (message.includes('order_info_http_404')) {
+          untrackOrder(orderId);
+          log({ event: 'trade_reconcile_tracked_removed', orderId, reason: 'order_info_http_404' });
+          continue;
+        }
+        log({ event: 'trade_reconcile_tracked_error', orderId, error: message });
       }
     }
   }
@@ -4901,7 +5177,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         const proofRecord = {
           traceRoot: proof.trace_root,
           txHash: anchor.txHash,
-          chain: anchor.chain || 'solana',
+          chain: anchor.chain || 'base',
           executor: id.did,
           taskFrom: task.from,
           action: task.action,
@@ -5004,7 +5280,7 @@ Advance the current milestone strictly based on these approved results. Do not i
     const anchorTx = anchor?.txHash || null;
     let anchorAudit = { checked: false, verified: false, chain: task?.chain || anchor?.chain || null, reason: null };
     if (anchorTx) {
-      anchorAudit = await verifyAnchorFromChain(task?.chain || anchor?.chain || 'solana', anchorTx, proof.trace_root);
+      anchorAudit = await verifyAnchorFromChain(task?.chain || anchor?.chain || 'base', anchorTx, proof.trace_root);
     }
 
     const auditReasons = [];
@@ -5038,7 +5314,7 @@ Advance the current milestone strictly based on these approved results. Do not i
             proofBundle: proof,
             traceRoot: proof.trace_root,
             anchorTx: anchor?.txHash || null,
-            chain: anchor?.chain || task?.chain || 'solana',
+            chain: anchor?.chain || task?.chain || 'base',
             traceEvents: trace.events, // Include trace events for verification
             audit: auditSummary,
           };
@@ -5088,7 +5364,7 @@ Advance the current milestone strictly based on these approved results. Do not i
           fetch(`${ATEL_NOTIFY_GATEWAY}/tools/invoke`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ tool: 'message', args: { action: 'send', message: msg, target: ATEL_NOTIFY_TARGET } }),
+            body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message: msg, target: ATEL_NOTIFY_TARGET } }),
             signal: AbortSignal.timeout(5000),
           }).then(() => log({ event: 'notify_sent', taskId })).catch(e => log({ event: 'notify_failed', taskId, error: e.message }));
         }
@@ -5120,7 +5396,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         status: (success !== false && auditPassed) ? 'completed' : 'failed',
         result,
         proof: { proof_id: proof.proof_id, trace_root: proof.trace_root, events_count: trace.events.length },
-        anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash, block: anchor.blockNumber } : null,
+        anchor: anchor ? { chain: anchor.chain || 'base', txHash: anchor.txHash, block: anchor.blockNumber } : null,
         execution: { duration_ms: durationMs, encrypted: task.encrypted },
         audit: auditSummary,
         rollback: rollbackReport ? { total: rollbackReport.total, succeeded: rollbackReport.succeeded, failed: rollbackReport.failed } : null,
@@ -5641,7 +5917,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         const echoDurationMs = Date.now() - new Date(echoAcceptedAt || Date.now()).getTime();
         if (anchor?.txHash) {
           const proofRecord = {
-            traceRoot: proof.trace_root, txHash: anchor.txHash, chain: anchor.chain || 'solana',
+            traceRoot: proof.trace_root, txHash: anchor.txHash, chain: anchor.chain || 'base',
             executor: id.did, taskFrom: message.from, action, success: echoSuccess,
             durationMs: echoDurationMs, riskLevel: 'low', policyViolations: 0,
             proofId: proof.proof_id, timestamp: new Date().toISOString(), verified: true,
@@ -6736,14 +7012,14 @@ async function cmdRotate() {
     newDid: newIdentity.did,
     backup: backupFile,
     proof_valid: verifyKeyRotation(proof),
-    anchor: anchor ? { chain: anchor.chain || 'solana', txHash: anchor.txHash } : null,
+    anchor: anchor ? { chain: anchor.chain || 'base', txHash: anchor.txHash } : null,
     next: 'Restart endpoint: atel start [port]',
   }, null, 2));
 }
 
 // ─── Platform API Helpers ────────────────────────────────────────
 
-const PLATFORM_URL = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+const PLATFORM_URL = ATEL_PLATFORM;
 
 async function signedFetch(method, path, payload = {}) {
   const id = requireIdentity();
@@ -7574,7 +7850,7 @@ async function cmdComplete(orderId, taskId) {
 
     if (anchor?.txHash) {
       const proofRecord = {
-        traceRoot: proof.trace_root, txHash: anchor.txHash, chain: anchor.chain || 'solana',
+        traceRoot: proof.trace_root, txHash: anchor.txHash, chain: anchor.chain || 'base',
         executor: id.did, taskFrom: requesterDid, action: 'cli-complete',
         success: true, durationMs: 0, riskLevel: 'low', policyViolations: 0,
         proofId: proof.proof_id, timestamp: new Date().toISOString(), verified: true,
@@ -7621,7 +7897,7 @@ async function cmdComplete(orderId, taskId) {
   const orderPrice = Number(orderInfo?.priceAmount ?? 0);
   const isPaidOrder = orderId.startsWith('ord-') && orderPrice > 0;
   const anchorTx = anchor?.txHash || null;
-  const anchorChain = anchorTx ? (anchor?.chain || orderInfo?.chain || 'solana') : (orderInfo?.chain || null);
+  const anchorChain = anchorTx ? (anchor?.chain || orderInfo?.chain || 'base') : (orderInfo?.chain || null);
   const auditReasons = [];
   if (!traceAudit.valid) auditReasons.push('trace_hash_chain_invalid');
   if (isPaidOrder && !anchorTx) auditReasons.push('paid_order_anchor_missing');
@@ -9745,13 +10021,28 @@ const commands = {
       console.log('Gateway:', gw ? `${gw.url} (token: ${gw.token ? '✅' : '❌'})` : '❌ not found');
       const botToken = discoverTelegramBot();
       console.log('TG Bot:', botToken ? `✅ (${botToken.split(':')[0]})` : '❌ not configured');
+      const inboundConfig = getTelegramInboundConfig();
+      const inboundMode = inboundConfig ? getTelegramInboundHostMode(inboundConfig) : { mode: 'disabled', reason: 'no_inbound_config' };
+      console.log('TG Ingress:', `${inboundMode.mode}${inboundMode.reason ? ` (${inboundMode.reason})` : ''}`);
+      let currentDid = '';
+      try { currentDid = requireIdentity().did; } catch {}
+      const consents = listNotifyConsentsForDid(currentDid);
       console.log(`\nTargets (${targets.targets.length}):`);
       if (targets.targets.length === 0) {
         console.log('  (none) — use "atel notify bind <chatId>" to add');
       }
       for (const t of targets.targets) {
         const status = t.enabled !== false ? '✅' : '🔇';
-        console.log(`  ${status} [${t.id}] ${t.channel}:${t.target} label=${t.label || '-'} last=${t.lastUsedAt || 'never'}`);
+        const consent = consents.find((item) => ((item.channel === t.channel) || (t.channel === 'gateway' && item.channel === 'telegram')) && item.target === String(t.target));
+        const consentLabel = consent ? `${consent.status || 'active'} @ ${consent.consentedAt || consent.updatedAt || 'unknown'}` : 'missing';
+        console.log(`  ${status} [${t.id}] ${t.channel}:${t.target} label=${t.label || '-'} last=${t.lastUsedAt || 'never'} consent=${consentLabel}`);
+      }
+      if (currentDid) {
+        console.log(`\nConsent Records (${consents.length}) for ${currentDid}:`);
+        if (consents.length === 0) console.log('  (none)');
+        for (const item of consents) {
+          console.log(`  - ${item.channel}:${item.target} status=${item.status || 'active'} source=${item.source || '-'} updated=${item.updatedAt || item.consentedAt || 'unknown'}`);
+        }
       }
       return;
     }
@@ -9772,18 +10063,32 @@ const commands = {
       let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
       if (!botToken) botToken = process.env.TELEGRAM_BOT_TOKEN || '';
       if (!botToken) botToken = discoverTelegramBot() || '';
-      const id = `tg_${chatId}`;
-      // Remove existing with same id
-      targets.targets = targets.targets.filter(t => t.id !== id);
+      const currentDid = requireIdentity().did;
+      const bindingTarget = resolveNotifyBindTarget(chatId, botToken);
+      if (bindingTarget.channel === 'telegram') {
+        const ownership = ensureTelegramBindingOwnership(currentDid, chatId, botToken);
+        if (!ownership.ok) {
+          console.error(`Telegram chat ${chatId} for bot ${ownership.botId || 'telegram'} is already owned by DID ${ownership.ownerDid}. Remove/disable it there before rebinding.`);
+          process.exit(1);
+        }
+      }
+      const id = bindingTarget.id;
+      // Remove existing notify targets for the same chat before rebinding
+      targets.targets = targets.targets.filter(t => !(String(t.target) === String(chatId) && (t.channel === 'telegram' || t.channel === 'gateway')));
       targets.targets.push({
-        id, channel: 'telegram', target: String(chatId),
-        botToken: botToken || undefined,
-        label: 'owner', enabled: true,
+        id, channel: bindingTarget.channel, target: String(bindingTarget.target),
+        botToken: bindingTarget.botToken,
+        label: bindingTarget.label, enabled: true,
         createdAt: new Date().toISOString(), lastUsedAt: null,
       });
       saveNotifyTargets(targets);
       rememberTelegramRoute(chatId, botToken || undefined);
-      console.log(`✅ Bound TG chat ${chatId} as notification target (id: ${id})`);
+      try { upsertNotifyConsent({ did: requireIdentity().did, channel: 'telegram', target: String(chatId), botToken, source: 'notify_bind', status: 'active' }); } catch {}
+      if (bindingTarget.channel === 'gateway') {
+        console.log(`✅ Bound OpenClaw gateway chat ${chatId} as notification target (id: ${id})`);
+      } else {
+        console.log(`✅ Bound TG chat ${chatId} as notification target (id: ${id})`);
+      }
       if (!botToken) console.log('⚠️  No bot token found. Set TELEGRAM_BOT_TOKEN or use --bot-token');
       return;
     }
@@ -9795,6 +10100,17 @@ const commands = {
       if (rawArgs.includes('--label')) label = rawArgs[rawArgs.indexOf('--label') + 1] || '';
       let botToken = rawArgs.includes('--bot-token') ? rawArgs[rawArgs.indexOf('--bot-token') + 1] : '';
       if (!botToken && channel === 'telegram') botToken = process.env.TELEGRAM_BOT_TOKEN || discoverTelegramBot() || '';
+      const currentDid = requireIdentity().did;
+      if (channel === 'telegram') {
+        const bindingTarget = resolveNotifyBindTarget(target, botToken);
+        if (bindingTarget.channel === 'telegram') {
+          const ownership = ensureTelegramBindingOwnership(currentDid, target, botToken);
+          if (!ownership.ok) {
+            console.error(`Telegram chat ${target} for bot ${ownership.botId || 'telegram'} is already owned by DID ${ownership.ownerDid}. Remove/disable it there before rebinding.`);
+            process.exit(1);
+          }
+        }
+      }
       const id = `${channel.substring(0,2)}_${target}`;
       targets.targets = targets.targets.filter(t => t.id !== id);
       targets.targets.push({
@@ -9804,6 +10120,7 @@ const commands = {
         createdAt: new Date().toISOString(), lastUsedAt: null,
       });
       saveNotifyTargets(targets);
+      try { upsertNotifyConsent({ did: requireIdentity().did, channel, target: String(target), botToken, source: 'notify_add', status: 'active' }); } catch {}
       console.log(`✅ Added ${channel}:${target} (id: ${id})`);
       return;
     }
@@ -9811,9 +10128,17 @@ const commands = {
     if (subCmd === 'remove') {
       const id = args[1];
       if (!id) { console.error('Usage: atel notify remove <id>'); process.exit(1); }
+      const removedTarget = targets.targets.find(t => t.id === id) || null;
       const before = targets.targets.length;
       targets.targets = targets.targets.filter(t => t.id !== id);
       saveNotifyTargets(targets);
+      if (removedTarget) {
+        try {
+          const did = requireIdentity().did;
+          if (removedTarget.channel === 'telegram') releaseTelegramBindingOwnership(did, removedTarget.target, removedTarget.botToken);
+          revokeNotifyConsent({ did, channel: removedTarget.channel, target: String(removedTarget.target), reason: 'notify_remove' });
+        } catch {}
+      }
       console.log(targets.targets.length < before ? `✅ Removed ${id}` : `⚠️ Target ${id} not found`);
       return;
     }
@@ -9823,8 +10148,26 @@ const commands = {
       if (!id) { console.error(`Usage: atel notify ${subCmd} <id>`); process.exit(1); }
       const t = targets.targets.find(t => t.id === id);
       if (!t) { console.error(`Target ${id} not found`); process.exit(1); }
+      const did = requireIdentity().did;
+      if (subCmd === 'enable' && t.channel === 'telegram') {
+        const bindingTarget = resolveNotifyBindTarget(t.target, t.botToken || '');
+        if (bindingTarget.channel === 'telegram') {
+          const ownership = ensureTelegramBindingOwnership(did, t.target, t.botToken);
+          if (!ownership.ok) {
+            console.error(`Telegram chat ${t.target} for bot ${ownership.botId || 'telegram'} is already owned by DID ${ownership.ownerDid}. Remove/disable it there before rebinding.`);
+            process.exit(1);
+          }
+        }
+      }
       t.enabled = subCmd === 'enable';
       saveNotifyTargets(targets);
+      try {
+        if (subCmd === 'enable') upsertNotifyConsent({ did, channel: t.channel, target: String(t.target), botToken: t.botToken, source: 'notify_enable', status: 'active' });
+        else {
+          if (t.channel === 'telegram') releaseTelegramBindingOwnership(did, t.target, t.botToken);
+          revokeNotifyConsent({ did, channel: t.channel, target: String(t.target), reason: 'notify_disable' });
+        }
+      } catch {}
       console.log(`✅ ${id} ${subCmd}d`);
       return;
     }
@@ -9850,7 +10193,7 @@ const commands = {
               const resp = await fetch(`${gw.url}/tools/invoke`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${gw.token}` },
-                body: JSON.stringify({ tool: 'message', args: { action: 'send', message: '🔔 ATEL notification test', target: target.target } }),
+                body: JSON.stringify({ tool: 'message', args: { action: 'send', channel: 'telegram', message: '🔔 ATEL notification test', target: target.target } }),
                 signal: AbortSignal.timeout(10000),
               });
               console.log(`  ${target.id}: ${resp.ok ? '✅ sent' : '❌ status ' + resp.status}`);
