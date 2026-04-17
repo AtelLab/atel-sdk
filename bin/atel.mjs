@@ -1010,9 +1010,14 @@ async function pushTradeNotification(eventType, payload, body) {
     'milestone_rejected': (p) => {
       const desc = p.milestoneDescription ? `
 目标: ${p.milestoneDescription}` : '';
+      const submitCount = Number(p.submitCount || 0);
+      const arbitrationNote = submitCount >= 3 || p.maxReached
+        ? `
+由于连续 3 次被拒，已进入仲裁待决状态，等待人工决定是否发起仲裁`
+        : '';
       return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝
 订单: ${p.orderId || body?.orderId || '?'}${desc}
-原因: ${p.rejectReason || '未说明'}`;
+原因: ${p.rejectReason || '未说明'}${arbitrationNote}`;
     },
     'order_completed': (p) => `📦 订单已提交完成
 订单: ${p.orderId || body?.orderId || '?'}
@@ -3863,8 +3868,9 @@ async function cmdStart(port) {
   const processedEvents = new Set();
   const pendingAgentCallbacks = new Map();
 
-  // ── Agent hook queue (serialize hook executions to avoid session lock conflicts) ──
-  let hookBusy = false;
+  // ── Agent hook queue (bounded concurrency, still guarded by recovery keys) ──
+  let activeHookWorkers = 0;
+  const MAX_HOOK_CONCURRENCY = Math.max(1, Math.min(4, Number.parseInt(process.env.ATEL_HOOK_CONCURRENCY || '3', 10) || 3));
   const hookQueue = [];
   const activeRecoveryKeys = new Set();
 
@@ -4458,7 +4464,7 @@ Format:
       activeRecoveryKeys.add(recoveryKey);
     }
     hookQueue.push({ event: eventType, dedupeKey, cmd: parsedCmd[0], args: parsedCmd.slice(1), cwd, payload, recoveryKey });
-    if (!hookBusy) processHookQueue();
+    processHookQueue();
     return true;
   }
 
@@ -4550,6 +4556,10 @@ Format:
               orderDescription,
               previousApprovedOutputs,
             });
+      if (isResubmission && Number(currentMilestone.submitCount || 0) >= 3) {
+        log({ event: 'trade_reconcile_executor_skip_manual_arbitration', orderId, currentMilestone: currentIndex, phase: ms.phase, submitCount: Number(currentMilestone.submitCount || 0) });
+        return;
+      }
       const promptText = isResubmission
         ? `You are the ATEL executor agent. Your previous submission for milestone M${currentIndex} was rejected.
 Original order requirements: ${orderDescription || 'not provided'}
@@ -4602,7 +4612,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         orderDescription,
         previousApprovedOutputs,
       };
-      const promptText = `You are the ATEL requester agent. You need to review the work submitted by the executor.\nOriginal order requirements: ${orderDescription || 'not provided'}\nMilestone goal: ${submittedMilestone.title || ''}\nPreviously approved outputs:\n${previousApprovedOutputs || 'none'}\nSubmission: ${submittedMilestone.resultSummary || ''}\nDecide carefully whether to pass or reject based only on the order requirements and the previously approved outputs, then return decision=pass or decision=reject via the callback.`;
+      const promptText = `You are the ATEL requester agent. You need to review the work submitted by the executor.\nOriginal order requirements: ${orderDescription || 'not provided'}\nMilestone goal: ${submittedMilestone.title || ''}\nPreviously approved outputs:\n${previousApprovedOutputs || 'none'}\nSubmission: ${submittedMilestone.resultSummary || ''}\nReview based on the submitted evidence, command outputs, file contents, and the previously approved outputs. Do not try to inspect executor-local filesystem paths like /tmp on your own machine unless the submission includes a reproducible proof that makes such a check valid.\nDecide carefully whether to pass or reject based only on the order requirements and the previously approved outputs, then return decision=pass or decision=reject via the callback.`;
       const recoveryKey = buildMilestoneHookRecoveryKey('milestone_submitted', payload);
       const queued = queueAgentHook('milestone_submitted', recoveryKey, promptText, workspace.dir, payload, { recoveryKey });
       if (queued) log({ event: 'trade_reconcile_requester', orderId, milestoneIndex: submittedMilestone.index, recoveryKey });
@@ -4908,7 +4918,7 @@ Advance the current milestone strictly based on these approved results. Do not i
               + `## 原任务\n${fullDesc}\n\n`
               + `## 当前里程碑\nM${mIdx}: ${mDesc}\n\n`
               + `## 执行方提交（第 ${submitCount}/3 次）\n${subSummary}\n\n`
-              + `请基于你自己的判断，评估这次提交是否真实地完成了原任务在当前里程碑应有的部分。如果符合原任务的要求和意图，PASS；如果偏离原任务、违反原任务的约束、或没有真正交付要求的内容，REJECT。\n\n`
+              + `请基于你自己的判断，评估这次提交是否真实地完成了原任务在当前里程碑应有的部分。如果符合原任务的要求和意图，PASS；如果偏离原任务、违反原任务的约束、或没有真正交付要求的内容，REJECT。评审时优先依据执行方提交的证据、命令输出、文件内容与前序已批准结果；不要在你自己的机器上直接检查执行方本地 /tmp 等路径，除非提交里已经给出可复现且合理的远端证明。\n\n`
               + `通过：\ncd ~/atel-workspace && atel milestone-verify ${orderIdForCwd} ${mIdx} --pass\n\n`
               + `不通过（必须给出具体理由）：\ncd ~/atel-workspace && atel milestone-verify ${orderIdForCwd} ${mIdx} --reject '具体原因'\n`;
             log({ event: 'verifier_prompt_overridden', orderId: orderIdForCwd, milestoneIndex: mIdx });
@@ -4980,7 +4990,11 @@ Advance the current milestone strictly based on these approved results. Do not i
     // to "say" it will run a command. This is the reliable path for state-transition actions
     // such as approving the milestone plan on order acceptance.
     let directExecutionSucceeded = false;
-    const directActions = getDirectExecutableActions(event, recommendedActions, payload, currentPolicy);
+    const rejectLimitReached = event === 'milestone_rejected' && Number(payload?.submitCount || body?.submitCount || 0) >= 3;
+    const directActions = rejectLimitReached ? [] : getDirectExecutableActions(event, recommendedActions, payload, currentPolicy);
+    if (rejectLimitReached) {
+      log({ event: 'direct_action_skip_manual_arbitration', eventType: event, dedupeKey, orderId: payload?.orderId || body?.orderId || '', milestoneIndex: payload?.milestoneIndex ?? body?.milestoneIndex ?? null, reason: 'rejection_limit_reached' });
+    }
     for (const action of directActions) {
       const result = await executeRecommendedActionDirect(event, action, atelCwd, dedupeKey);
       if (result.ok) directExecutionSucceeded = true;
@@ -4993,6 +5007,18 @@ Advance the current milestone strictly based on these approved results. Do not i
     const autoTriggerEvents = ['order_accepted', 'milestone_plan_confirmed', 'milestone_submitted', 'milestone_verified', 'milestone_rejected'];
     const hasGatewayAction = Array.isArray(recommendedActions) && recommendedActions.some((action) => Array.isArray(action?.command) && action.command[0] === 'atel');
     if (agentCmd && prompt && autoTriggerEvents.includes(event) && !shouldSkipAgentHook(event, directExecutionSucceeded)) {
+      if (rejectLimitReached) {
+        log({
+          event: 'agent_hook_skip_manual_arbitration',
+          eventType: event,
+          dedupeKey,
+          orderId: payload?.orderId || body?.orderId || '',
+          milestoneIndex: payload?.milestoneIndex ?? body?.milestoneIndex ?? null,
+          reason: 'rejection_limit_reached',
+        });
+        res.json({ status: 'received', eventId, eventType: event, skipped: true, requiresManualArbitration: true });
+        return;
+      }
       const needsActionablePayload = event !== 'milestone_submitted';
       if (needsActionablePayload && !hasGatewayAction) {
         log({ event: 'agent_hook_skip_no_action', eventType: event, dedupeKey, reason: 'informational_only_payload' });
@@ -5037,13 +5063,16 @@ Advance the current milestone strictly based on these approved results. Do not i
 
   // Process hook queue serially
   async function processHookQueue() {
-    if (hookBusy || hookQueue.length === 0) return;
-    hookBusy = true;
+    if (activeHookWorkers >= MAX_HOOK_CONCURRENCY || hookQueue.length === 0) return;
+    activeHookWorkers += 1;
     const { event: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, args: spawnArgs, cwd: hookCwd, payload: hookPayload, recoveryKey } = hookQueue.shift();
+    if (activeHookWorkers < MAX_HOOK_CONCURRENCY && hookQueue.length > 0) {
+      processHookQueue();
+    }
     const { execFile } = await import('child_process');
     const finishHook = () => {
       if (recoveryKey) activeRecoveryKeys.delete(recoveryKey);
-      hookBusy = false;
+      activeHookWorkers = Math.max(0, activeHookWorkers - 1);
       processHookQueue();
     };
     log({ event: 'agent_cmd_trigger', eventType: hookEvent, dedupeKey: hookKey, cmd: spawnCmd, argsCount: spawnArgs.length });
@@ -5065,7 +5094,7 @@ Advance the current milestone strictly based on these approved results. Do not i
 
     const MAX_ATTEMPTS = 5;
     const isMilestoneHook = ['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected', 'milestone_submitted'].includes(hookEvent);
-    const localHookTimeoutMs = isMilestoneHook ? 180000 : 600000;
+    const localHookTimeoutMs = isMilestoneHook ? 90000 : 600000;
     const preparedInvocation = prepareHookInvocation(spawnCmd, spawnArgs, hookKey, Math.ceil(localHookTimeoutMs / 1000));
     const runHook = (attempt, invocation = preparedInvocation) => {
       const hookStartedAt = Date.now();
@@ -5077,7 +5106,7 @@ Advance the current milestone strictly based on these approved results. Do not i
 
         if (isSessionLock && attempt < MAX_ATTEMPTS) {
           // OpenClaw session still held by previous call — wait for lock release then retry
-          const delay = 15000 + (attempt * 5000); // 15s, 20s, 25s, 30s
+          const delay = 3000 + (attempt * 2000); // 3s, 5s, 7s, 9s
           log({ event: 'agent_cmd_session_lock', eventType: hookEvent, attempt: attempt + 1, delayMs: delay, duration_ms: durationMs });
           setTimeout(() => runHook(attempt + 1), delay);
         } else if (isNetworkError && attempt < 2) {
@@ -6089,12 +6118,12 @@ Advance the current milestone strictly based on these approved results. Do not i
   flushResultPushQueue().catch((e) => log({ event: 'result_push_flush_error', error: e.message }));
   setInterval(() => {
     flushResultPushQueue().catch((e) => log({ event: 'result_push_flush_error', error: e.message }));
-  }, 15000);
+  }, 5000);
 
   reconcileActiveTradeOrders().catch((e) => log({ event: 'trade_reconcile_bootstrap_error', error: e.message }));
   setInterval(() => {
     reconcileActiveTradeOrders().catch((e) => log({ event: 'trade_reconcile_interval_error', error: e.message }));
-  }, 15000);
+  }, 3000);
 
   // Auto-register to Registry with candidates
   if (capTypes.length > 0 && networkConfig.candidates && networkConfig.candidates.length > 0) {
