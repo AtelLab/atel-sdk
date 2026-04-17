@@ -2200,9 +2200,8 @@ async function getWalletAddresses() {
 function detectPreferredChain() {
   const config = loadAnchorConfig();
   if (config?.preferredChain) return config.preferredChain;
-  if (getChainPrivateKey('bsc')) return 'bsc';
   if (getChainPrivateKey('base')) return 'base';
-  if (getChainPrivateKey('solana')) return 'solana';
+  if (getChainPrivateKey('bsc')) return 'bsc';
   return null;
 }
 
@@ -3131,7 +3130,7 @@ async function configureAnchor() {
   // 1. Select chain
   const chain = await promptChoice(
     'Select blockchain for anchoring:',
-    ['solana', 'bsc', 'base']
+    ['base', 'bsc']
   );
   
   // 2. Input private key
@@ -3673,6 +3672,15 @@ async function cmdStart(port) {
     log({ event: 'atel_skill_sync_error', error: e.message });
   }
 
+  try {
+    const syncedContacts = await syncAllFriendsToPlatform();
+    if (syncedContacts.attempted > 0) {
+      log({ event: 'contacts_backfill_sync_done', ...syncedContacts });
+    }
+  } catch (e) {
+    log({ event: 'contacts_backfill_sync_error', error: e.message });
+  }
+
   // Initialize Ollama only if explicitly enabled (optional local AI audit)
   if (process.env.ATEL_OLLAMA_ENABLED === 'true') {
     await initializeOllama().catch(err => {
@@ -4030,6 +4038,22 @@ async function cmdStart(port) {
   const MAX_HOOK_CONCURRENCY = Math.max(1, Math.min(4, Number.parseInt(process.env.ATEL_HOOK_CONCURRENCY || '3', 10) || 3));
   const hookQueue = [];
   const activeRecoveryKeys = new Set();
+  const recoveryKeyLogState = new Map();
+
+  function logRecoveryKeyActive(eventType, dedupeKey, recoveryKey) {
+    if (!recoveryKey) return;
+    const now = Date.now();
+    const previous = recoveryKeyLogState.get(recoveryKey) || { lastLoggedAt: 0, suppressed: 0 };
+    if (now - previous.lastLoggedAt < 15000) {
+      previous.suppressed += 1;
+      recoveryKeyLogState.set(recoveryKey, previous);
+      return;
+    }
+    const payload = { event: 'agent_hook_not_queued', eventType, dedupeKey, reason: 'recovery_key_active', recoveryKey };
+    if (previous.suppressed > 0) payload.suppressed = previous.suppressed;
+    log(payload);
+    recoveryKeyLogState.set(recoveryKey, { lastLoggedAt: now, suppressed: 0 });
+  }
 
   endpoint.app?.post?.('/atel/v1/agent-callback', async (req, res) => {
     const body = req.body || {};
@@ -4615,7 +4639,7 @@ Format:
     const recoveryKey = options.recoveryKey || '';
     if (recoveryKey) {
       if (activeRecoveryKeys.has(recoveryKey)) {
-        log({ event: 'agent_hook_not_queued', eventType, dedupeKey, reason: 'recovery_key_active', recoveryKey });
+        logRecoveryKeyActive(eventType, dedupeKey, recoveryKey);
         return false;
       }
       activeRecoveryKeys.add(recoveryKey);
@@ -5228,7 +5252,10 @@ Advance the current milestone strictly based on these approved results. Do not i
     }
     const { execFile } = await import('child_process');
     const finishHook = () => {
-      if (recoveryKey) activeRecoveryKeys.delete(recoveryKey);
+      if (recoveryKey) {
+        activeRecoveryKeys.delete(recoveryKey);
+        recoveryKeyLogState.delete(recoveryKey);
+      }
       activeHookWorkers = Math.max(0, activeHookWorkers - 1);
       processHookQueue();
     };
@@ -7315,6 +7342,24 @@ async function syncContactToPlatform(contactDid, options = {}) {
     log({ event: 'contact_sync_failed', contactDid: normalized, error: e.message || 'unknown_error' });
     return { ok: false, reason: e.message || 'sync_failed' };
   }
+}
+
+async function syncAllFriendsToPlatform() {
+  const friends = loadFriends();
+  const accepted = Array.isArray(friends?.friends) ? friends.friends : [];
+  if (accepted.length === 0) return { attempted: 0, synced: 0, failed: 0 };
+  let synced = 0;
+  let failed = 0;
+  for (const friend of accepted) {
+    const result = await syncContactToPlatform(friend.did, {
+      alias: friend.alias || '',
+      notes: friend.notes || ''
+    });
+    if (result.ok) synced += 1;
+    else failed += 1;
+  }
+  log({ event: 'contacts_backfill_sync', attempted: accepted.length, synced, failed });
+  return { attempted: accepted.length, synced, failed };
 }
 
 async function signedFetch(method, path, payload = {}) {
@@ -10582,7 +10627,7 @@ Auth Commands:
 
 Account Commands:
   balance                              Show platform account balance
-  deposit <amount> [channel]           Deposit funds (channel: manual|crypto_solana|crypto_base|crypto_bsc|stripe|alipay)
+  deposit <amount> [channel]           Deposit funds (channel: manual|crypto_base|crypto_bsc|stripe|alipay)
   withdraw <amount> [channel] [address] Withdraw funds (address required for crypto)
   transactions                         List payment history
 
