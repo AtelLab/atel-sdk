@@ -1176,7 +1176,8 @@ async function pushTradeNotification(eventType, payload, body) {
 订单: ${p.orderId || body?.orderId || '?'}
 原因: ${p.reason || '未说明'}`,
     'order_expired': (p) => `⌛ 订单已过期
-订单: ${p.orderId || body?.orderId || '?'}
+订单: ${p.orderId || p.order_id || body?.orderId || body?.order_id || '?'}
+原因: ${p.reason || '未说明'}
 系统已自动结束该订单`,
     'dispute_created': (p) => `⚖️ 争议已创建
 订单: ${p.orderId || body?.orderId || '?'}
