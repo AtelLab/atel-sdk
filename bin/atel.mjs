@@ -94,6 +94,50 @@ const DEFAULT_PLATFORM_BASE = readDefaultPlatformBase();
 const ATEL_PLATFORM = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || DEFAULT_PLATFORM_BASE;
 const REGISTRY_URL = process.env.ATEL_REGISTRY || ATEL_PLATFORM || DEFAULT_PLATFORM_BASE;
 const ATEL_RELAY = process.env.ATEL_RELAY || DEFAULT_PLATFORM_BASE;
+
+function normalizeUrl(value = '') {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function getEnvironmentProfile(url = '') {
+  const normalized = normalizeUrl(url);
+  if (!normalized) return { name: 'unknown', label: 'unknown', url: normalized };
+  try {
+    const parsed = new URL(normalized);
+    const host = String(parsed.hostname || '').toLowerCase();
+    if (host === 'api.atelai.org') return { name: 'production', label: 'production', url: normalized };
+    if (host === '127.0.0.1' || host === 'localhost') return { name: 'test', label: 'local-test', url: normalized };
+    if (host === '43.160.230.129' || host === '43.160.211.180') return { name: 'test', label: 'host-test', url: normalized };
+    return { name: 'custom', label: host || 'custom', url: normalized };
+  } catch {
+    return { name: 'custom', label: normalized, url: normalized };
+  }
+}
+
+function getCurrentEnvironmentSummary() {
+  const platform = getEnvironmentProfile(ATEL_PLATFORM);
+  const registry = getEnvironmentProfile(REGISTRY_URL);
+  const relay = getEnvironmentProfile(ATEL_RELAY);
+  const explicit = Boolean(String(process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || process.env.ATEL_RELAY || '').trim());
+  return {
+    profile: platform.name,
+    platform,
+    registry,
+    relay,
+    explicit,
+    atelDir: ATEL_DIR,
+  };
+}
+
+function ensureProductionAuthTarget() {
+  const env = getCurrentEnvironmentSummary();
+  if (env.platform.name === 'production') return env;
+  console.error(`Authorization blocked: current ATEL_DIR is targeting ${env.platform.label} (${env.platform.url || 'unknown'}), not production.`);
+  console.error(`ATEL_DIR: ${env.atelDir}`);
+  console.error('To authorize a code from https://atelai.org/login, run with explicit production endpoints:');
+  console.error('  ATEL_PLATFORM=https://api.atelai.org ATEL_REGISTRY=https://api.atelai.org ATEL_RELAY=https://api.atelai.org atel auth <code>');
+  process.exit(1);
+}
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
 const ATEL_NOTIFY_TARGET = process.env.ATEL_NOTIFY_TARGET || '';
 const ATEL_NOTIFY_AUTO_BIND = /^(1|true|yes)$/i.test(String(process.env.ATEL_NOTIFY_AUTO_BIND || ''));
@@ -3209,7 +3253,7 @@ async function cmdAnchor(subcommand) {
 
 async function cmdInfo() {
   const id = requireIdentity();
-  const info = { agent_id: id.agent_id, did: id.did, capabilities: loadCapabilities(), policy: loadPolicy(), network: loadNetwork(), executor: EXECUTOR_URL || 'not configured' };
+  const info = { agent_id: id.agent_id, did: id.did, capabilities: loadCapabilities(), policy: loadPolicy(), network: loadNetwork(), executor: EXECUTOR_URL || 'not configured', environment: getCurrentEnvironmentSummary() };
 
   // Fetch wallet info from Platform
   try {
@@ -7166,6 +7210,7 @@ async function cmdAuth(code) {
     console.error('  Authorize a Dashboard session using the code displayed on the login page.');
     process.exit(1);
   }
+  ensureProductionAuthTarget();
   const id = requireIdentity();
   const { default: nacl } = await import('tweetnacl');
   const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
