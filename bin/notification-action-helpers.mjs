@@ -1,3 +1,26 @@
+export function explainDirectExecutionSkip(eventType, recommendedActions, payload = {}, policy = {}) {
+  if (eventType !== 'order_created') return '';
+  if (!Array.isArray(recommendedActions) || recommendedActions.length === 0) return 'missing_recommended_actions';
+  const hasAcceptAction = recommendedActions.some((action) =>
+    action?.type === 'cli' &&
+    action?.action === 'accept' &&
+    Array.isArray(action.command) &&
+    action.command[0] === 'atel'
+  );
+  if (!hasAcceptAction) return 'missing_accept_action';
+  const amount = Number(payload?.priceAmount || 0);
+  const autoPolicy = policy?.autoPolicy || {};
+  const acceptMaxAmount = Number(autoPolicy.acceptMaxAmount || 0);
+  if (amount <= 0) {
+    if (policy?.taskMode !== 'auto') return 'task_mode_not_auto';
+    if (policy?.autoAcceptPlatform !== true) return 'auto_accept_platform_disabled';
+    return '';
+  }
+  if (autoPolicy.acceptOrders !== true) return 'paid_auto_accept_disabled';
+  if (acceptMaxAmount > 0 && amount > acceptMaxAmount) return 'price_exceeds_accept_max';
+  return '';
+}
+
 export function getDirectExecutableActions(eventType, recommendedActions, payload = {}, policy = {}) {
   if (!Array.isArray(recommendedActions) || recommendedActions.length === 0) return [];
 

@@ -66,7 +66,7 @@ import {
   TrustGraph, calculateTaskWeight,
 } from '@lawrenceliang-btc/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
-import { buildAgentCallbackAction, getDirectExecutableActions, normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from './notification-action-helpers.mjs';
+import { buildAgentCallbackAction, explainDirectExecutionSkip, getDirectExecutableActions, normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from './notification-action-helpers.mjs';
 import { parseOrderCancelArgs, preflightOrderCancel } from './order-cancel-helpers.mjs';
 // ollama-manager removed — SDK does not run local models
 const initializeOllama = async () => {};
@@ -5174,6 +5174,17 @@ Advance the current milestone strictly based on these approved results. Do not i
     let directExecutionSucceeded = false;
     const rejectLimitReached = event === 'milestone_rejected' && Number(payload?.submitCount || body?.submitCount || 0) >= 3;
     const directActions = rejectLimitReached ? [] : getDirectExecutableActions(event, recommendedActions, payload, currentPolicy);
+    if (event === 'order_created' && directActions.length === 0 && !rejectLimitReached) {
+      const skipReason = explainDirectExecutionSkip(event, recommendedActions, payload, currentPolicy);
+      if (skipReason) {
+        log({
+          event: 'order_created_auto_accept_skipped',
+          orderId: payload?.orderId || body?.orderId || '',
+          amount: Number(payload?.priceAmount || 0),
+          reason: skipReason,
+        });
+      }
+    }
     if (rejectLimitReached) {
       log({ event: 'direct_action_skip_manual_arbitration', eventType: event, dedupeKey, orderId: payload?.orderId || body?.orderId || '', milestoneIndex: payload?.milestoneIndex ?? body?.milestoneIndex ?? null, reason: 'rejection_limit_reached' });
     }
