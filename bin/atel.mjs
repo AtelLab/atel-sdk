@@ -674,22 +674,128 @@ async function invokeGatewayTelegramMessage(target, message, timeoutMs = 5000) {
   const botToken = String(oc?.channels?.telegram?.botToken || '').trim();
   if (botToken) {
     try {
-      const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: target, text: message }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const data = await resp.json().catch(() => null);
-      if (resp.ok && data?.ok !== false) {
-        return { ok: true, status: resp.status, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
+      const data = await sendTelegramBotRequest(botToken, 'sendMessage', { chat_id: target, text: message }, timeoutMs);
+      if (data?.ok !== false) {
+        return { ok: true, status: 200, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
       }
-      last = { ok: false, reason: 'telegram_http_error', error: data?.description || `http_${resp.status}`, status: resp.status, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
+      last = { ok: false, reason: 'telegram_http_error', error: data?.description || 'http_200', status: 200, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
     } catch (e) {
       last = { ok: false, reason: 'telegram_fetch_failed', error: e.message || 'fetch_failed', status: 0, url: 'telegram://openclaw-bot', source: 'openclaw_bot_fallback' };
     }
   }
   return last;
+}
+
+async function sendTelegramBotRequest(botToken, method, payload, timeoutMs = 5000) {
+  const url = `https://api.telegram.org/bot${botToken}/${method}`;
+  const options = {
+    method: 'POST',
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  if (payload instanceof FormData) {
+    options.body = payload;
+  } else {
+    options.headers = { 'Content-Type': 'application/json' };
+    options.body = JSON.stringify(payload);
+  }
+  const resp = await fetch(url, options);
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || data?.ok === false) {
+    throw new Error(data?.description || `http_${resp.status}`);
+  }
+  return data;
+}
+
+function decodeDataUrl(dataUrl = '') {
+  const match = String(dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) return null;
+  const [, mimeType, base64] = match;
+  try {
+    return { mimeType, buffer: Buffer.from(base64, 'base64') };
+  } catch {
+    return null;
+  }
+}
+
+function buildMediaCaption(message = '', payload = {}, index = 0) {
+  const base = String(message || '').trim();
+  const sender = String(payload.peerDid || '').trim();
+  const extra = index === 0 && sender ? `来自: ${sender}` : '';
+  return [base, extra].filter(Boolean).join('\n').slice(0, 900);
+}
+
+async function fetchTelegramUploadSource(item, defaultName, defaultMimeType, timeoutMs = 5000) {
+  if (item?.kind === 'inline' && item?.data) {
+    const decoded = decodeDataUrl(item.data);
+    if (decoded?.buffer) {
+      return {
+        name: item.name || defaultName,
+        mimeType: decoded.mimeType || item.mimeType || defaultMimeType,
+        buffer: decoded.buffer,
+      };
+    }
+  }
+  const mediaUrl = String(item?.downloadUrl || item?.url || '').trim();
+  if (!mediaUrl) throw new Error('missing_media_url');
+  const resp = await fetch(mediaUrl, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!resp.ok) throw new Error(`attachment_fetch_http_${resp.status}`);
+  const arrayBuffer = await resp.arrayBuffer();
+  return {
+    name: item?.name || defaultName,
+    mimeType: item?.mimeType || resp.headers.get('content-type') || defaultMimeType,
+    buffer: Buffer.from(arrayBuffer),
+  };
+}
+
+async function sendTelegramPhoto(botToken, chatId, image, caption = '', timeoutMs = 5000) {
+  const source = await fetchTelegramUploadSource(image, 'image', image?.mimeType || 'image/png', timeoutMs);
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', caption);
+  form.append('photo', new Blob([source.buffer], { type: source.mimeType || 'image/png' }), source.name || 'image');
+  return await sendTelegramBotRequest(botToken, 'sendPhoto', form, timeoutMs);
+}
+
+async function sendTelegramDocumentLike(botToken, method, fieldName, chatId, attachment, caption = '', timeoutMs = 5000) {
+  const source = await fetchTelegramUploadSource(attachment, attachment?.name || fieldName, attachment?.mimeType || 'application/octet-stream', timeoutMs);
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', caption);
+  form.append(fieldName, new Blob([source.buffer], { type: source.mimeType || 'application/octet-stream' }), source.name || fieldName);
+  return await sendTelegramBotRequest(botToken, method, form, timeoutMs);
+}
+
+async function sendTelegramRichMedia(botToken, chatId, message, payload = {}, timeoutMs = 5000) {
+  const images = Array.isArray(payload.images) ? payload.images : [];
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  let sent = false;
+  for (let i = 0; i < images.length; i++) {
+    await sendTelegramPhoto(botToken, chatId, images[i], buildMediaCaption(message, payload, i), timeoutMs);
+    sent = true;
+  }
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i] || {};
+    const kind = String(attachment.kind || '').toLowerCase();
+    const mimeType = String(attachment.mimeType || '').toLowerCase();
+    const caption = buildMediaCaption(message, payload, images.length + i);
+    if (kind === 'audio' || mimeType.startsWith('audio/')) {
+      try {
+        await sendTelegramDocumentLike(botToken, 'sendAudio', 'audio', chatId, attachment, caption, timeoutMs);
+      } catch {
+        await sendTelegramDocumentLike(botToken, 'sendDocument', 'document', chatId, attachment, caption, timeoutMs);
+      }
+    } else if (kind === 'video' || mimeType.startsWith('video/')) {
+      try {
+        await sendTelegramDocumentLike(botToken, 'sendVideo', 'video', chatId, attachment, caption, timeoutMs);
+      } catch {
+        await sendTelegramDocumentLike(botToken, 'sendDocument', 'document', chatId, attachment, caption, timeoutMs);
+      }
+    } else {
+      await sendTelegramDocumentLike(botToken, 'sendDocument', 'document', chatId, attachment, caption, timeoutMs);
+    }
+    sent = true;
+  }
+  return sent;
 }
 
 function loadOpenClawConfig() {
@@ -1169,27 +1275,28 @@ async function pushP2PNotification(eventType, payload = {}) {
 
   for (const target of enabled) {
     try {
+      const hasRichMedia = (Array.isArray(payload.images) && payload.images.length > 0) || (Array.isArray(payload.attachments) && payload.attachments.length > 0);
       if (target.channel === 'telegram') {
         if (!target.botToken) {
           log({ event: 'p2p_notify_target_skipped', eventType, channel: 'telegram', target: target.id || target.target, reason: 'missing_bot_token' });
           continue;
         }
-        const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: target.target, text: message }),
-          signal: AbortSignal.timeout(5000),
-        });
-        const data = await resp.json().catch(() => null);
-        if (!resp.ok || data?.ok === false) {
-          log({ event: 'p2p_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
-          continue;
+        if (hasRichMedia) {
+          await sendTelegramRichMedia(target.botToken, target.target, message, payload, 5000);
+        } else {
+          await sendTelegramBotRequest(target.botToken, 'sendMessage', { chat_id: target.target, text: message }, 5000);
         }
       } else if (target.channel === 'gateway') {
-        const delivery = await invokeGatewayTelegramMessage(target.target, message, 5000);
-        if (!delivery.ok) {
-          log({ event: 'p2p_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
-          continue;
+        const oc = loadOpenClawConfig();
+        const botToken = String(oc?.channels?.telegram?.botToken || '').trim();
+        if (hasRichMedia && botToken) {
+          await sendTelegramRichMedia(botToken, target.target, message, payload, 5000);
+        } else {
+          const delivery = await invokeGatewayTelegramMessage(target.target, message, 5000);
+          if (!delivery.ok) {
+            log({ event: 'p2p_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
+            continue;
+          }
         }
       }
       target.lastUsedAt = new Date().toISOString();
@@ -4815,7 +4922,7 @@ Advance the current milestone strictly based on these approved results. Do not i
     if (kind === 'contact_added') {
       pushP2PNotification('p2p_contact_added', { peerDid: messageSenderDid || senderDid, alias: body.alias || '', text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
     } else if (kind !== 'telegram_message') {
-      pushP2PNotification('p2p_message_received', { peerDid: messageSenderDid || senderDid, text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+      pushP2PNotification('p2p_message_received', { peerDid: messageSenderDid || senderDid, text, images: body.images, attachments: body.attachments }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
     }
 
     res.json({ status: 'ok', kind });
@@ -5814,7 +5921,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         text,
         timestamp: new Date().toISOString(),
       });
-      pushP2PNotification('p2p_message_received', { peerDid: message.from, text }).catch((e) => log({ event: 'p2p_notify_error', kind: 'portal_message', error: e.message }));
+      pushP2PNotification('p2p_message_received', { peerDid: message.from, text, images: payload.images, attachments: payload.attachments }).catch((e) => log({ event: 'p2p_notify_error', kind: 'portal_message', error: e.message }));
       return {
         status: 'ok',
         kind: 'portal_message',
