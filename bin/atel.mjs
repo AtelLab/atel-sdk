@@ -3372,11 +3372,11 @@ async function cmdSetup(port) {
   const net = await autoNetworkSetup(p, ATEL_RELAY);
   for (const step of net.steps) console.log(JSON.stringify({ event: 'step', message: step }));
   if (net.endpoint) {
-    saveNetwork({ publicIP: net.publicIP, port: p, endpoint: net.endpoint, upnp: net.upnpSuccess, reachable: net.reachable, configuredAt: new Date().toISOString() });
+    saveNetwork({ ...net, publicIP: net.publicIP, port: p, endpoint: net.endpoint, upnp: net.upnpSuccess, reachable: net.reachable, configuredAt: new Date().toISOString() });
     console.log(JSON.stringify({ status: 'ready', endpoint: net.endpoint }));
   } else if (net.publicIP) {
     const ep = `http://${net.publicIP}:${p}`;
-    saveNetwork({ publicIP: net.publicIP, port: p, endpoint: ep, upnp: false, reachable: false, needsManualPortForward: true, configuredAt: new Date().toISOString() });
+    saveNetwork({ ...net, publicIP: net.publicIP, port: p, endpoint: ep, upnp: false, reachable: false, needsManualPortForward: true, configuredAt: new Date().toISOString() });
     console.log(JSON.stringify({ status: 'needs_port_forward', publicIP: net.publicIP, port: p, instruction: `Forward external TCP port ${p} to this machine's port ${p} on your router. Then run: atel verify` }));
   } else {
     console.log(JSON.stringify({ status: 'failed', error: 'Could not determine public IP' }));
