@@ -61,7 +61,7 @@ import {
   createMessage, verifyMessage, parseDID, RegistryClient, ExecutionTrace, ProofGenerator,
   SolanaAnchorProvider, BaseAnchorProvider, BSCAnchorProvider,
   autoNetworkSetup, collectCandidates, connectToAgent,
-  discoverPublicIP, checkReachable, ContentAuditor, TrustScoreClient,
+  discoverPublicIP, checkReachable, verifyPortReachable, ContentAuditor, TrustScoreClient,
   RollbackManager, rotateKey, verifyKeyRotation, ToolGateway, PolicyEngine, mintConsentToken, sign,
   TrustGraph, calculateTaskWeight,
 } from '@lawrenceliang-btc/atel-sdk';
@@ -2312,6 +2312,12 @@ function addFriend(did, options = {}) {
   
   saveFriends(data);
   log({ event: 'friend_added', did, addedBy: options.addedBy });
+  syncContactToPlatform(did, { alias: options.alias || '', notes: options.notes || '' }).catch(() => {});
+  pushP2PNotification('p2p_contact_added', {
+    peerDid: did,
+    alias: options.alias || '',
+    text: options.notes || ''
+  }).catch((e) => log({ event: 'p2p_notify_error', kind: 'friend_added', error: e.message }));
   return true;
 }
 
@@ -7292,6 +7298,24 @@ async function cmdRotate() {
 // ─── Platform API Helpers ────────────────────────────────────────
 
 const PLATFORM_URL = ATEL_PLATFORM;
+
+async function syncContactToPlatform(contactDid, options = {}) {
+  const id = requireIdentity();
+  const normalized = String(contactDid || '').trim();
+  if (!normalized || normalized === id.did) return { ok: false, reason: 'invalid_contact' };
+  try {
+    await signedFetch('POST', '/contacts/v1/sync', {
+      contactDid: normalized,
+      alias: String(options.alias || '').trim(),
+      notes: String(options.notes || '').trim(),
+    });
+    log({ event: 'contact_sync_ok', contactDid: normalized });
+    return { ok: true };
+  } catch (e) {
+    log({ event: 'contact_sync_failed', contactDid: normalized, error: e.message || 'unknown_error' });
+    return { ok: false, reason: e.message || 'sync_failed' };
+  }
+}
 
 async function signedFetch(method, path, payload = {}) {
   const id = requireIdentity();
