@@ -1118,12 +1118,26 @@ async function pushTradeNotification(eventType, payload, body) {
     if (c === 'bsc') return ' (BSC)';
     return '';
   };
+  const autoAcceptReasonText = (reason) => {
+    if (reason === 'missing_recommended_actions') return '平台未提供可执行接单动作';
+    if (reason === 'missing_accept_action') return '事件里没有 accept 动作';
+    if (reason === 'task_mode_not_auto') return '当前 taskMode 不是 auto';
+    if (reason === 'auto_accept_platform_disabled') return '当前未启用免费单自动接单';
+    if (reason === 'paid_auto_accept_disabled') return '当前未启用付费单自动接单';
+    if (reason === 'price_exceeds_accept_max') return '订单金额超过自动接单上限';
+    return reason || '未说明';
+  };
+
   const templates = {
     'order_created': (p) => `📥 收到新订单
 订单: ${p.orderId || body?.orderId || '?'}
 金额: $${p.priceAmount ?? '?'} USDC
 来自: ${p.requesterDid || '未知请求方'}
 请审核后决定是否接单`,
+    'order_created_auto_accept_skipped': (p) => `⏸️ 未自动接单
+订单: ${p.orderId || body?.orderId || '?'}
+原因: ${autoAcceptReasonText(p.reasonCode)}
+请人工判断是否接单`,
     'order_accepted': (p) => `📋 订单已被接单
 订单: ${p.orderId || body?.orderId || '?'}
 执行方已开始处理，进入里程碑阶段`,
@@ -5183,6 +5197,11 @@ Advance the current milestone strictly based on these approved results. Do not i
           amount: Number(payload?.priceAmount || 0),
           reason: skipReason,
         });
+        pushTradeNotification('order_created_auto_accept_skipped', {
+          ...payload,
+          orderId: payload?.orderId || body?.orderId || '',
+          reasonCode: skipReason,
+        }, body).catch(e => log({ event: 'trade_notify_error', error: e.message }));
       }
     }
     if (rejectLimitReached) {
