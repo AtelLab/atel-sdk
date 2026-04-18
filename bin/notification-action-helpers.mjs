@@ -57,11 +57,13 @@ export function shouldSkipAgentHook(eventType, directExecutionSucceeded) {
   return eventType === 'order_accepted' && directExecutionSucceeded;
 }
 
+const EXECUTOR_MILESTONE_EVENTS = new Set(['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected']);
+
 export function shouldUseGatewaySession(eventType) {
-  // Keep gateway sub-sessions only for explicit P2P task execution.
-  // Milestone automation must not depend on gateway callback health; use the
-  // local structured fallback so order progression cannot stall on subagent I/O.
-  return eventType === 'p2p_task';
+  // Use isolated gateway sub-sessions for milestone executor turns so each
+  // order+milestone attempt runs in a clean room instead of sharing the main
+  // agent runtime context.
+  return eventType === 'p2p_task' || EXECUTOR_MILESTONE_EVENTS.has(eventType);
 }
 
 export function normalizeGatewayBind(bind) {
@@ -79,6 +81,44 @@ function normalizeIndex(value, fallback = 0) {
 function normalizeResult(value) {
   if (typeof value !== 'string') return '';
   return value.trim();
+}
+
+function normalizeOrderId(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function extractForeignOrderId(text, expectedOrderId) {
+  const current = normalizeOrderId(expectedOrderId);
+  if (!current) return '';
+  const found = Array.from(String(text || '').matchAll(/ord-[a-f0-9-]+/g)).map((m) => m[0]);
+  return found.find((item) => item !== current) || '';
+}
+
+function validateExecutorMilestoneBody(eventType, payload, body) {
+  if (!EXECUTOR_MILESTONE_EVENTS.has(eventType)) return { ok: true };
+  const expectedOrderId = normalizeOrderId(payload?.orderId);
+  if (!expectedOrderId) return { ok: false, error: 'missing_order_id' };
+  const actualOrderId = normalizeOrderId(body?.orderId);
+  if (!actualOrderId) return { ok: false, error: 'missing_result_order_id' };
+  if (actualOrderId !== expectedOrderId) return { ok: false, error: 'mismatched_result_order_id' };
+
+  const expectedIndex = eventType === 'milestone_plan_confirmed'
+    ? normalizeIndex(payload?.milestoneIndex, 0)
+    : normalizeIndex(payload?.currentMilestone ?? payload?.milestoneIndex, 0);
+  if (!Number.isFinite(Number(body?.milestoneIndex))) return { ok: false, error: 'missing_result_milestone_index' };
+  const actualIndex = normalizeIndex(body?.milestoneIndex, -1);
+  if (actualIndex !== expectedIndex) return { ok: false, error: 'mismatched_result_milestone_index' };
+
+  const result = normalizeResult(body?.result || body?.summary);
+  if (!result) return { ok: false, error: 'missing_result' };
+  const lowered = result.toLowerCase();
+  if (lowered.includes('invalid_cross_order_reference')) return { ok: false, error: 'invalid_cross_order_reference' };
+  if (lowered.includes('context overflow')) return { ok: false, error: 'context_overflow_output' };
+  if (lowered.includes('plugin register() called') || lowered.includes('plugin registration complete')) return { ok: false, error: 'plugin_noise_output' };
+  if (lowered.includes('session file locked') || lowered.includes('session locked')) return { ok: false, error: 'session_locked_output' };
+  const foreign = extractForeignOrderId(result, expectedOrderId);
+  if (foreign) return { ok: false, error: 'foreign_order_reference_detected' };
+  return { ok: true, result, orderId: expectedOrderId, milestoneIndex: expectedIndex };
 }
 
 export function buildAgentCallbackAction(eventType, payload, body) {
@@ -102,44 +142,41 @@ export function buildAgentCallbackAction(eventType, payload, body) {
   if (!orderId) return { ok: false, error: 'missing_order_id' };
 
   if (eventType === 'milestone_plan_confirmed') {
-    const result = normalizeResult(body?.result || body?.summary);
-    if (!result) return { ok: false, error: 'missing_result' };
-    const index = normalizeIndex(payload?.milestoneIndex, 0);
+    const validated = validateExecutorMilestoneBody(eventType, payload, body);
+    if (!validated.ok) return validated;
     return {
       ok: true,
       action: {
         type: 'cli',
         action: 'submit_milestone',
-        command: ['atel', 'milestone-submit', orderId, String(index), '--result', result],
+        command: ['atel', 'milestone-submit', orderId, String(validated.milestoneIndex), '--result', validated.result],
       },
     };
   }
 
   if (eventType === 'milestone_verified') {
     if (payload?.allComplete) return { ok: false, skipped: true, reason: 'all_complete' };
-    const result = normalizeResult(body?.result || body?.summary);
-    if (!result) return { ok: false, error: 'missing_result' };
-    const index = normalizeIndex(payload?.currentMilestone, 0);
+    const validated = validateExecutorMilestoneBody(eventType, payload, body);
+    if (!validated.ok) return validated;
     return {
       ok: true,
       action: {
         type: 'cli',
         action: 'submit_milestone',
-        command: ['atel', 'milestone-submit', orderId, String(index), '--result', result],
+        command: ['atel', 'milestone-submit', orderId, String(validated.milestoneIndex), '--result', validated.result],
       },
     };
   }
 
   if (eventType === 'milestone_rejected') {
-    const result = normalizeResult(body?.result || body?.summary);
-    if (!result) return { ok: false, error: 'missing_result' };
-    const index = normalizeIndex(payload?.milestoneIndex, 0);
+    const validated = validateExecutorMilestoneBody(eventType, payload, body);
+    if (!validated.ok) return validated;
     return {
       ok: true,
       action: {
         type: 'cli',
         action: 'resubmit',
-        command: ['atel', 'milestone-submit', orderId, String(index), '--result', result],
+        command: ['atel', 'milestone-submit', orderId, String(validated.milestoneIndex), '--result', validated.result],
       },
     };
   }
