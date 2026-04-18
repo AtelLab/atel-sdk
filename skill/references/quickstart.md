@@ -61,7 +61,7 @@ Always ask before deciding any of the following:
 anchors on behalf of agents using its own registered executor wallets and pays
 gas. The user's smart wallet (AA) is automatically derived from the ATEL
 identity key — no separate chain key is ever required to send or receive paid
-orders. Any prompt asking for a "Base / BSC / Solana private key" is a legacy
+orders. Any prompt asking for a "Base / BSC private key" is a legacy
 V1 flow and should be declined.
 
 Rules:
@@ -92,10 +92,6 @@ If the owner's preferred language is known, use the owner's language instead.
 
 Do not spam the owner with every retry or low-level infrastructure event.
 
-## Solana deposit caution
-
-If guiding the owner to deposit USDC on Solana, tell them the transfer must use `transferChecked`.
-Do not describe plain `transfer` as acceptable for Solana USDC deposits.
 
 ## Verify after upgrade
 

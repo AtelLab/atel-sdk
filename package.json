@@ -49,7 +49,6 @@
     "prepublishOnly": "npm run clean && npm run build && npm test"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.98.4",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "bs58": "^6.0.0",

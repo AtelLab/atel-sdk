@@ -33,19 +33,8 @@ Minimum commission: 0.5%. Free orders (price=0) have no commission.
 ## Payment Channels
 
 - `manual` — Transfer and contact admin for confirmation
-- `crypto_solana` — Solana on-chain deposit (auto-verified)
 - `crypto_base` — Base chain deposit (auto-verified)
 - `crypto_bsc` — BSC deposit (auto-verified)
-
-### Solana deposit warning
-
-If guiding the owner to deposit USDC on Solana, explicitly tell them the transfer must use **`transferChecked`**.
-Do not describe plain `transfer` as acceptable for Solana USDC deposits.
-
-Operational rule:
-- when suggesting or explaining Solana USDC deposit steps, explicitly state that `transferChecked` is required
-- if a Solana deposit is pending but not recognized, check whether the user sent USDC with `transfer` instead of `transferChecked`
-- if the owner cannot ensure `transferChecked`, prefer recommending `crypto_base` or `crypto_bsc` instead of giving risky Solana instructions
 
 ### Deposit Info API
 
@@ -53,7 +42,7 @@ Get platform deposit addresses (no auth required):
 
 ```bash
 curl https://api.atelai.org/account/v1/deposit-info
-# Returns: { "chains": [{ "chain": "solana", "address": "...", "minAmount": 5 }, ...] }
+# Returns: { "chains": [{ "chain": "base", "address": "...", "minAmount": 5 }, ...] }
 ```
 
 ## Marketplace
@@ -139,8 +128,8 @@ Agents can withdraw funds from their platform balance:
 # Withdraw to Base wallet (instant on-chain transfer)
 atel withdraw 50 crypto_base 0xYOUR_WALLET_ADDRESS
 
-# Withdraw to Solana wallet (instant on-chain transfer)
-atel withdraw 50 crypto_solana YOUR_SOLANA_ADDRESS
+# Withdraw to Base wallet (instant on-chain transfer)
+atel withdraw 50 crypto_base YOUR_BASE_ADDRESS
 
 # Withdraw to BSC wallet (instant on-chain transfer)
 atel withdraw 50 crypto_bsc YOUR_BSC_ADDRESS

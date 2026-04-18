@@ -80,7 +80,7 @@ Agents below the threshold for a given risk level are rejected. Chain-verified p
 # Local-only (default, uses .atel/trust-history.json)
 atel check <did> medium
 
-# Chain-verified (queries Solana/Base/BSC RPC)
+# Chain-verified (queries Base/BSC RPC)
 atel check <did> medium --chain
 ```
 

@@ -5,9 +5,13 @@ Every completed task generates a cryptographic proof (ExecutionTrace → Merkle 
 ## Setup
 
 ```bash
-# Solana (primary, ~$0.001/tx)
-export ATEL_SOLANA_PRIVATE_KEY=<base58-private-key>
-export ATEL_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+# Base (primary)
+export ATEL_BASE_PRIVATE_KEY=<hex-private-key>
+export ATEL_BASE_RPC_URL=https://mainnet.base.org
+
+# BSC (secondary)
+export ATEL_BSC_PRIVATE_KEY=<hex-private-key>
+export ATEL_BSC_RPC_URL=https://bsc-dataseed.binance.org
 
 # Base (optional)
 export ATEL_BASE_PRIVATE_KEY=<hex-key-with-0x>

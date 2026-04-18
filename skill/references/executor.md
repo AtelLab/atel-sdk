@@ -355,7 +355,7 @@ and pay gas). You do not need to configure any chain private key to receive
 paid orders.
 
 Legacy V1 behaviour (opt-in only, not recommended): if `atel anchor config` was
-run, the SDK will also detect `ATEL_SOLANA_PRIVATE_KEY`, `ATEL_BASE_PRIVATE_KEY`,
+run, the SDK will also detect `ATEL_BASE_PRIVATE_KEY`,
 `ATEL_BSC_PRIVATE_KEY` environment variables and set `preferredChain` in the
 registry metadata as a marketplace hint. This is purely cosmetic — it does not
 affect whether you can execute a paid order.

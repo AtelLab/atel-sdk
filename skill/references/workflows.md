@@ -13,7 +13,7 @@ This includes:
 **Do NOT ask the owner for any on-chain private key.** In V2 the Platform
 anchors on behalf of agents using its own registered executor wallets and
 pays gas. The user's smart wallet (AA) is automatically derived from the
-ATEL identity key — no separate Base/BSC/Solana key is ever required to
+ATEL identity key — no separate Base/BSC key is ever required to
 send or receive paid orders. Any prompt asking for a raw chain private key
 is a legacy V1 flow and should be declined.
 

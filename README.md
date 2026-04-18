@@ -10,7 +10,7 @@ ATEL provides the cryptographic primitives and protocol building blocks that ena
 - **📋 Policy Enforcement** — Scoped consent tokens, call tracking, deterministic hashing
 - **🔍 Execution Tracing** — Tamper-evident, hash-chained audit logs with auto-checkpoints
 - **✅ Proof Generation** — Merkle-tree proof bundles with multi-check verification
-- **⚓ On-Chain Anchoring** — Multi-chain proof anchoring (Solana/Base/BSC)
+- **⚓ On-Chain Anchoring** — Multi-chain proof anchoring (Base/BSC)
 - **📊 Trust Scoring** — Local trust computation based on execution history
 - **🔔 Notification & Callback Runtime** — Local notify, callback, inbox, and recovery flow
 - **👥 P2P Access Control** — Relationship-based friend system with temporary sessions
@@ -60,7 +60,7 @@ the `paymentTxHash` on Base, the `auditUrl` pointing at the CompletionProof (Int
 ### Trust & Verification
 - Tamper-evident execution traces
 - Merkle-tree proof generation
-- On-chain anchoring (Solana/Base/BSC)
+- On-chain anchoring (Base/BSC)
 - Local trust score computation
 - Callback-driven execution and recovery
 
@@ -359,21 +359,21 @@ const report = ProofVerifier.verify(bundle, { trace });
 ### On-Chain Anchoring
 
 ```typescript
-import { SolanaAnchorProvider } from '@lawrenceliang-btc/atel-sdk';
+import { BaseAnchorProvider } from '@lawrenceliang-btc/atel-sdk';
 
-const solana = new SolanaAnchorProvider({ 
-  rpcUrl: 'https://api.mainnet-beta.solana.com',
-  privateKey: process.env.ATEL_SOLANA_PRIVATE_KEY 
+const base = new BaseAnchorProvider({ 
+  rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org',
+  privateKey: process.env.ATEL_BASE_PRIVATE_KEY 
 });
 
-const result = await solana.anchor(traceRoot, {
+const result = await base.anchor(traceRoot, {
   executorDid: 'did:atel:ed25519:...',
   requesterDid: 'did:atel:ed25519:...',
   taskId: 'task-123'
 });
 // result.txHash, result.blockNumber
 
-const verified = await solana.verify(traceRoot, txHash);
+const verified = await base.verify(traceRoot, txHash);
 // verified.valid, verified.detail
 ```
 
@@ -433,8 +433,6 @@ Friend system data is stored in `.atel/`:
 ## Environment Variables
 
 **On-Chain Anchoring:**
-- `ATEL_SOLANA_PRIVATE_KEY` - Solana wallet private key (base58)
-- `ATEL_SOLANA_RPC_URL` - Solana RPC endpoint
 - `ATEL_BASE_PRIVATE_KEY` - Base chain private key (hex)
 - `ATEL_BASE_RPC_URL` - Base RPC endpoint
 - `ATEL_BSC_PRIVATE_KEY` - BSC private key (hex)

@@ -5,14 +5,14 @@
  * (proof_id, trace_root, etc.) on public blockchains for tamper-evident
  * timestamping and auditability.
  *
- * Supported chains: Base (EVM), BSC (EVM), Solana.
+ * Supported chains: Base (EVM) and BSC (EVM).
  * A MockAnchorProvider is included for testing without real chain access.
  */
 
 // ─── Types ───────────────────────────────────────────────────────
 
 /** Supported chain identifiers */
-export type ChainId = 'base' | 'solana' | 'bsc' | 'mock';
+export type ChainId = 'base' | 'bsc' | 'mock';
 
 /**
  * A record of a hash anchored on-chain.
@@ -277,5 +277,4 @@ export class AnchorManager {
 export { EvmAnchorProvider, type EvmAnchorConfig, type EvmAnchorMemoV2 } from './evm.js';
 export { BaseAnchorProvider } from './base.js';
 export { BSCAnchorProvider } from './bsc.js';
-export { SolanaAnchorProvider, type SolanaAnchorConfig, type AnchorMemoV2 } from './solana.js';
 export { MockAnchorProvider } from './mock.js';

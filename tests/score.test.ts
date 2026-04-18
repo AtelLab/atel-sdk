@@ -187,7 +187,7 @@ describe('score', () => {
       return {
         traceRoot: overrides?.traceRoot ?? `hash-${Math.random().toString(36).slice(2)}`,
         txHash: overrides?.txHash ?? `tx-${Math.random().toString(36).slice(2)}`,
-        chain: overrides?.chain ?? 'solana',
+        chain: overrides?.chain ?? 'base',
         executor: overrides?.executor ?? 'did:atel:agent1',
         taskFrom: overrides?.taskFrom ?? 'did:atel:sender1',
         action: overrides?.action ?? 'general',

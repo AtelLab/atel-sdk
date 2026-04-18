@@ -2,7 +2,7 @@
  * Tests for the on-chain anchor module.
  *
  * Uses MockAnchorProvider so no real blockchain connection is needed.
- * Also tests static encoding/decoding helpers for EVM and Solana providers.
+ * Also tests static encoding/decoding helpers for the EVM anchor providers.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -10,7 +10,6 @@ import {
   AnchorManager,
   MockAnchorProvider,
   EvmAnchorProvider,
-  SolanaAnchorProvider,
 } from '../src/anchor/index.js';
 
 // ─── MockAnchorProvider ──────────────────────────────────────────
@@ -271,42 +270,5 @@ describe('EvmAnchorProvider encoding', () => {
 
   it('should return null for invalid hex data', () => {
     expect(EvmAnchorProvider.decodeData('0xZZZZ')).toBeNull();
-  });
-});
-
-// ─── SolanaAnchorProvider encoding ───────────────────────────────
-
-describe('SolanaAnchorProvider encoding', () => {
-  it('should encode a hash into memo buffer', () => {
-    const buf = SolanaAnchorProvider.encodeMemo('solana_hash_123');
-    expect(Buffer.isBuffer(buf)).toBe(true);
-    const text = buf.toString('utf-8');
-    expect(text).toContain('ATEL_ANCHOR:');
-    expect(text).toContain('solana_hash_123');
-  });
-
-  it('should decode a memo buffer back to hash', () => {
-    const buf = SolanaAnchorProvider.encodeMemo('my_hash');
-    const decoded = SolanaAnchorProvider.decodeMemo(buf);
-    expect(decoded).toBe('my_hash');
-  });
-
-  it('should decode from string', () => {
-    const decoded = SolanaAnchorProvider.decodeMemo('ATEL_ANCHOR:from_string');
-    expect(decoded).toBe('from_string');
-  });
-
-  it('should return null for non-anchor memo', () => {
-    const decoded = SolanaAnchorProvider.decodeMemo('just a random memo');
-    expect(decoded).toBeNull();
-  });
-
-  it('should round-trip arbitrary hashes', () => {
-    const hashes = ['abc', 'proof_xyz', '0'.repeat(64)];
-    for (const hash of hashes) {
-      const encoded = SolanaAnchorProvider.encodeMemo(hash);
-      const decoded = SolanaAnchorProvider.decodeMemo(encoded);
-      expect(decoded).toBe(hash);
-    }
   });
 });

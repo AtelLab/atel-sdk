@@ -123,8 +123,8 @@ describe('Handshake Protocol', () => {
 
   describe('wallet bundle verification', () => {
     it('should verify wallet ownership via DID signature', () => {
-      const aliceWallets = { solana: 'ALiCe1234567890abcdef', base: '0xAlice1234' };
-      const bobWallets = { solana: 'BoB1234567890abcdef', bsc: '0xBob5678' };
+      const aliceWallets = { base: '0xAlice1234', bsc: '0xAliceBsc1234' };
+      const bobWallets = { base: '0xBob1234', bsc: '0xBob5678' };
 
       const aliceHs = new HandshakeManager(alice);
       const bobHs = new HandshakeManager(bob);
@@ -142,11 +142,11 @@ describe('Handshake Protocol', () => {
     });
 
     it('should detect tampered wallet addresses', () => {
-      const wallets = { solana: 'MyRealWallet123' };
+      const wallets = { base: '0xMyRealWallet123' };
       const bundle = createWalletBundle(wallets, alice.secretKey);
 
       // Tamper with the address
-      const tampered = { ...bundle, addresses: { solana: 'FakeWallet999' } };
+      const tampered = { ...bundle, addresses: { base: '0xFakeWallet999' } };
       expect(verifyWalletBundle(tampered, alice.publicKey)).toBe(false);
 
       // Original should verify

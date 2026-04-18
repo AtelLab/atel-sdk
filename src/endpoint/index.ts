@@ -73,7 +73,7 @@ export interface EndpointConfig {
   /** Rate limiting (default: 100 req/min per DID) */
   rateLimit?: RateLimitConfig;
   /** Wallet addresses for on-chain trust verification during handshake */
-  wallets?: { solana?: string; base?: string; bsc?: string };
+  wallets?: { base?: string; bsc?: string };
 }
 
 /** Handler for incoming task delegations */
@@ -428,7 +428,7 @@ export class AgentClient {
     remoteEndpoint: string,
     handshakeManager: HandshakeManager,
     remoteDid: string,
-    wallets?: { solana?: string; base?: string; bsc?: string },
+    wallets?: { base?: string; bsc?: string },
   ): Promise<import('../handshake/index.js').Session> {
     const initMsg = handshakeManager.createInit(remoteDid, wallets);
     const ackResponse = await this.sendRaw(

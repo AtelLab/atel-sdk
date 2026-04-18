@@ -30,7 +30,7 @@ import {
 
 /** Wallet addresses with DID-signed proof of ownership */
 export interface WalletBundle {
-  addresses: { solana?: string; base?: string; bsc?: string };
+  addresses: { base?: string; bsc?: string };
   /** DID signature over sorted JSON of addresses — proves ownership */
   proof: string;
 }
@@ -43,7 +43,7 @@ export interface HandshakeInitPayload {
   challenge: string;
   capabilities?: string[];
   /** Wallet addresses for on-chain trust verification */
-  wallets?: { solana?: string; base?: string; bsc?: string };
+  wallets?: { base?: string; bsc?: string };
   /** Signed wallet bundle (v0.8.3+) */
   walletBundle?: WalletBundle;
 }
@@ -57,7 +57,7 @@ export interface HandshakeAckPayload {
   challengeResponse: string; // sign(their_challenge, my_sk)
   capabilities?: string[];
   /** Wallet addresses for on-chain trust verification */
-  wallets?: { solana?: string; base?: string; bsc?: string };
+  wallets?: { base?: string; bsc?: string };
   /** Signed wallet bundle (v0.8.3+) */
   walletBundle?: WalletBundle;
 }
@@ -82,7 +82,7 @@ export interface Session {
   /** Remote agent's capabilities (if provided) */
   remoteCapabilities?: string[];
   /** Remote agent's wallet addresses (if provided) */
-  remoteWallets?: { solana?: string; base?: string; bsc?: string };
+  remoteWallets?: { base?: string; bsc?: string };
   /** Whether remote wallet ownership is DID-verified */
   remoteWalletsVerified?: boolean;
   /** Session creation timestamp */
@@ -116,7 +116,7 @@ export class HandshakeError extends Error {
 
 /** Create a signed wallet bundle proving DID ownership of wallet addresses */
 export function createWalletBundle(
-  addresses: { solana?: string; base?: string; bsc?: string },
+  addresses: { base?: string; bsc?: string },
   secretKey: Uint8Array,
 ): WalletBundle {
   // Canonical JSON: sorted keys, no undefined values
@@ -175,7 +175,7 @@ export class HandshakeManager {
   /**
    * Create a handshake_init message (Step 1).
    */
-  createInit(remoteDid: string, wallets?: { solana?: string; base?: string; bsc?: string }): ATELMessage<HandshakeInitPayload> {
+  createInit(remoteDid: string, wallets?: { base?: string; bsc?: string }): ATELMessage<HandshakeInitPayload> {
     const challenge = randomBytes(this.challengeBytes).toString('hex');
     this.pendingChallenges.set(remoteDid, challenge);
 
@@ -270,7 +270,7 @@ export class HandshakeManager {
   /**
    * Process a handshake_init message and create handshake_ack (Step 2).
    */
-  processInit(initMessage: ATELMessage<HandshakeInitPayload>, wallets?: { solana?: string; base?: string; bsc?: string }): ATELMessage<HandshakeAckPayload> {
+  processInit(initMessage: ATELMessage<HandshakeInitPayload>, wallets?: { base?: string; bsc?: string }): ATELMessage<HandshakeAckPayload> {
     const payload = initMessage.payload;
 
     // Verify the init message signature
@@ -329,7 +329,7 @@ export class HandshakeManager {
     confirmMessage: ATELMessage<HandshakeConfirmPayload>,
     initiatorPublicKey: Uint8Array,
     initiatorCapabilities?: string[],
-    initiatorWallets?: { solana?: string; base?: string; bsc?: string },
+    initiatorWallets?: { base?: string; bsc?: string },
     initiatorWalletBundle?: WalletBundle,
   ): Session {
     const payload = confirmMessage.payload;
@@ -408,7 +408,7 @@ export class HandshakeManager {
     remotePublicKey: Uint8Array,
     encrypted: boolean,
     remoteCapabilities?: string[],
-    remoteWallets?: { solana?: string; base?: string; bsc?: string },
+    remoteWallets?: { base?: string; bsc?: string },
     remoteWalletBundle?: WalletBundle,
   ): Session {
     const now = new Date();

@@ -59,7 +59,7 @@ import crypto from 'node:crypto';
 import {
   AgentIdentity, AgentEndpoint, AgentClient, HandshakeManager,
   createMessage, verifyMessage, parseDID, RegistryClient, ExecutionTrace, ProofGenerator,
-  SolanaAnchorProvider, BaseAnchorProvider, BSCAnchorProvider,
+  BaseAnchorProvider, BSCAnchorProvider,
   autoNetworkSetup, collectCandidates, connectToAgent,
   discoverPublicIP, checkReachable, verifyPortReachable, ContentAuditor, TrustScoreClient,
   RollbackManager, rotateKey, verifyKeyRotation, ToolGateway, PolicyEngine, mintConsentToken, sign,
@@ -107,7 +107,6 @@ function getEnvironmentProfile(url = '') {
     const host = String(parsed.hostname || '').toLowerCase();
     if (host === 'api.atelai.org') return { name: 'production', label: 'production', url: normalized };
     if (host === '127.0.0.1' || host === 'localhost') return { name: 'test', label: 'local-test', url: normalized };
-    if (host === '43.160.230.129' || host === '43.160.211.180') return { name: 'test', label: 'host-test', url: normalized };
     return { name: 'custom', label: host || 'custom', url: normalized };
   } catch {
     return { name: 'custom', label: normalized, url: normalized };
@@ -2162,7 +2161,6 @@ function getChainPrivateKey(chain) {
     return config.chains[chain].privateKey;
   }
   // 2. Fall back to environment variables (backward compatibility)
-  if (chain === 'solana') return process.env.ATEL_SOLANA_PRIVATE_KEY;
   if (chain === 'base') return process.env.ATEL_BASE_PRIVATE_KEY;
   if (chain === 'bsc') return process.env.ATEL_BSC_PRIVATE_KEY;
   return null;
@@ -2172,19 +2170,6 @@ function getChainPrivateKey(chain) {
 async function getWalletAddresses() {
   const wallets = {};
   const config = loadAnchorConfig();
-  
-  // Solana: base58 private key → public key
-  const solKey = getChainPrivateKey('solana');
-  if (solKey) {
-    try {
-      const { Keypair } = await import('@solana/web3.js');
-      const bs58 = (await import('bs58')).default;
-      const kp = Keypair.fromSecretKey(bs58.decode(solKey));
-      wallets.solana = kp.publicKey.toBase58();
-    } catch {}
-  } else if (config?.chains?.solana?.address) {
-    wallets.solana = config.chains.solana.address;
-  }
   
   // Base: hex private key → address
   const baseKey = getChainPrivateKey('base');
@@ -2961,16 +2946,23 @@ function riskAllowed(maxRisk, requestedRisk) { return (RISK_ORDER[requestedRisk]
 // Verify anchor_tx list on-chain, return count of valid proofs
 async function verifyAnchorTxList(anchorTxList, targetDid) {
   if (!anchorTxList || anchorTxList.length === 0) return { verified: 0, total: 0, proofs: [] };
-  const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-  const provider = new SolanaAnchorProvider({ rpcUrl });
   let verified = 0;
   const proofs = [];
   for (const tx of anchorTxList) {
     try {
+      const chain = String(tx?.chain || detectPreferredChain() || 'base').toLowerCase();
+      let provider;
+      if (chain === 'base') {
+        provider = new BaseAnchorProvider({ rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org' });
+      } else if (chain === 'bsc') {
+        provider = new BSCAnchorProvider({ rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org' });
+      } else {
+        continue;
+      }
       const result = await provider.verify(tx.trace_root || '', tx.txHash || tx.anchor_tx || '');
       if (result.valid) {
         verified++;
-        proofs.push({ proof_id: tx.proof_id || tx.txHash, trace_root: tx.trace_root, verified: true, anchor_tx: tx.txHash || tx.anchor_tx, timestamp: new Date().toISOString() });
+        proofs.push({ proof_id: tx.proof_id || tx.txHash, trace_root: tx.trace_root, verified: true, anchor_tx: tx.txHash || tx.anchor_tx, chain, timestamp: new Date().toISOString() });
       }
     } catch {}
   }
@@ -3041,12 +3033,7 @@ async function anchorOnChain(traceRoot, metadata, preferredChain) {
     if (!key) return null;
     
     let provider;
-    if (chain === 'solana') {
-      provider = new SolanaAnchorProvider({ 
-        rpcUrl: process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com', 
-        privateKey: key 
-      });
-    } else if (chain === 'base') {
+    if (chain === 'base') {
       provider = new BaseAnchorProvider({
         rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org',
         privateKey: key,
@@ -3161,16 +3148,9 @@ async function configureAnchor() {
   // 3. Validate private key and derive address
   let address;
   try {
-    if (chain === 'solana') {
-      const { Keypair } = await import('@solana/web3.js');
-      const bs58 = (await import('bs58')).default;
-      const kp = Keypair.fromSecretKey(bs58.decode(privateKey));
-      address = kp.publicKey.toBase58();
-    } else {
-      const { ethers } = await import('ethers');
-      const wallet = new ethers.Wallet(privateKey);
-      address = wallet.address;
-    }
+    const { ethers } = await import('ethers');
+    const wallet = new ethers.Wallet(privateKey);
+    address = wallet.address;
   } catch (e) {
     console.error(`❌ Invalid ${chain.toUpperCase()} private key: ${e.message}`);
     process.exit(1);
@@ -3734,14 +3714,6 @@ async function cmdStart(port) {
       if (!txHash || !traceRoot) return { checked: false, verified: false, reason: 'missing_anchor_or_root' };
       const c = (chain || 'base').toLowerCase();
       
-      if (c === 'solana') {
-        const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Solana RPC URL:', rpcUrl);
-        const provider = new SolanaAnchorProvider({ rpcUrl });
-        const r = await provider.verify(traceRoot, txHash);
-        if (process.env.ATEL_DEBUG) console.error('[DEBUG] Solana verify result:', r);
-        return { checked: true, verified: !!r?.valid, chain: 'solana', detail: r?.detail };
-      }
       if (c === 'base') {
         const rpcUrl = process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org';
         if (process.env.ATEL_DEBUG) console.error('[DEBUG] Base RPC URL:', rpcUrl);
@@ -4303,6 +4275,15 @@ async function cmdStart(port) {
         'urllib.request.urlopen(req, timeout=10).read()',
         'PY',
       ].join('\n'),
+      executor_milestone: [
+        "python3 - <<'PY'",
+        'import json, urllib.request',
+        `result = """Write the final deliverable here"""`,
+        `body = {"dedupeKey": "${dedupeKey}", "status": "done", "eventType": "${eventType}", "orderId": "${payload?.orderId || ''}", "milestoneIndex": ${Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0}, "result": result, "summary": result[:120]}`,
+        `req = urllib.request.Request("${callbackUrl}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})`,
+        'urllib.request.urlopen(req, timeout=10).read()',
+        'PY',
+      ].join('\n'),
       default: [
         "python3 - <<'PY'",
         'import json, urllib.request',
@@ -4323,7 +4304,11 @@ async function cmdStart(port) {
       'PY',
     ].join('\n');
 
-    const callbackDone = eventType === 'milestone_submitted' ? callbackExamples.milestone_submitted : callbackExamples.default;
+    const callbackDone = eventType === 'milestone_submitted'
+      ? callbackExamples.milestone_submitted
+      : (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)
+        ? callbackExamples.executor_milestone
+        : callbackExamples.default);
     const contextFile = join(cwd, 'ORDER_CONTEXT.md');
     const allowRepoAccess = shouldAllowRepoAccess(payload);
     const fileAccessRule = allowRepoAccess
@@ -4371,7 +4356,7 @@ ${callbackFailed}
 `;
   }
 
-  function buildLocalAgentPrompt(eventType, promptText) {
+  function buildLocalAgentPrompt(eventType, promptText, payload = {}) {
     if (eventType === 'milestone_submitted') {
       return `${promptText}
 
@@ -4387,6 +4372,10 @@ For rejection:
     }
 
     if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      const expectedIndex = eventType === 'milestone_plan_confirmed'
+        ? (Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0)
+        : (Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0);
+      const expectedOrderId = String(payload?.orderId || '').trim();
       return `${promptText}
 
 Important: you are not chatting with the user.
@@ -4400,9 +4389,11 @@ You must prefer factual evidence:
 - what concrete output / state / observation you actually got
 - whether that evidence satisfies the current milestone
 If you could not find evidence, say that explicitly in the JSON result, including what you checked.
+The JSON must include the exact current order and milestone identity.
+If you are not certain, fail closed instead of guessing.
 
 Format:
-{"result":"factual deliverable with concrete evidence and observations only"}`;
+{"orderId":"${expectedOrderId}","milestoneIndex":${expectedIndex},"result":"factual deliverable with concrete evidence and observations only"}`;
     }
 
     return promptText;
@@ -4531,7 +4522,7 @@ Format:
         if (isKnownInvalidLocalAgentStdout(cleaned)) {
           return { ok: false, error: 'invalid_local_agent_stdout_known_failure' };
         }
-        return buildAgentCallbackAction(eventType, payload, { result: cleaned, summary: cleaned });
+        return { ok: false, error: 'invalid_local_agent_stdout_requires_json' };
       }
     }
 
@@ -5301,15 +5292,15 @@ Advance the current milestone strictly based on these approved results. Do not i
         return;
       }
       log({ event: 'agent_session_spawn_error', eventType: hookEvent, dedupeKey: hookKey, error: gatewayResult.error, fallback: 'cli' });
-      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg);
+      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg, hookPayload);
     } else if (spawnArgs.length > 0) {
       const promptArg = spawnArgs[spawnArgs.length - 1] || '';
-      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg);
+      spawnArgs[spawnArgs.length - 1] = buildLocalAgentPrompt(hookEvent, promptArg, hookPayload);
     }
 
     const MAX_ATTEMPTS = 5;
     const isMilestoneHook = ['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected', 'milestone_submitted'].includes(hookEvent);
-    const localHookTimeoutMs = isMilestoneHook ? 90000 : 600000;
+    const localHookTimeoutMs = isMilestoneHook ? 240000 : 600000;
     const preparedInvocation = prepareHookInvocation(spawnCmd, spawnArgs, hookKey, Math.ceil(localHookTimeoutMs / 1000));
     const runHook = (attempt, invocation = preparedInvocation) => {
       const hookStartedAt = Date.now();
@@ -5607,7 +5598,7 @@ Advance the current milestone strictly based on these approved results. Do not i
 
     // ── Anchoring Warning ──
     if (!anchor) {
-      log({ event: 'anchor_missing', taskId, warning: 'Proof not anchored on-chain. Set ATEL_SOLANA_PRIVATE_KEY for verifiable trust.', timestamp: new Date().toISOString() });
+      log({ event: 'anchor_missing', taskId, warning: 'Proof not anchored on-chain. Set a supported anchor key for verifiable trust.', timestamp: new Date().toISOString() });
     }
 
 
@@ -7193,22 +7184,32 @@ async function cmdVerifyProof(anchorTx, traceRoot) {
 
   console.log(JSON.stringify({ event: 'verifying_proof', anchor_tx: anchorTx, trace_root: traceRoot }));
 
-  const rpcUrl = process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-  try {
-    const provider = new SolanaAnchorProvider({ rpcUrl });
-    const result = await provider.verify(traceRoot, anchorTx);
-    console.log(JSON.stringify({
-      verified: result.valid,
-      chain: 'solana',
-      anchor_tx: anchorTx,
-      trace_root: traceRoot,
-      detail: result.detail || (result.valid ? 'Memo matches trace_root' : 'Memo does not match'),
-      block: result.blockNumber,
-      timestamp: result.timestamp,
-    }, null, 2));
-  } catch (e) {
-    console.log(JSON.stringify({ verified: false, error: e.message }));
+  const providers = [
+    { chain: 'base', provider: new BaseAnchorProvider({ rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org' }) },
+    { chain: 'bsc', provider: new BSCAnchorProvider({ rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org' }) },
+  ];
+  const attempts = [];
+  for (const entry of providers) {
+    try {
+      const result = await entry.provider.verify(traceRoot, anchorTx);
+      attempts.push({ chain: entry.chain, result });
+      if (result.valid) {
+        console.log(JSON.stringify({
+          verified: true,
+          chain: entry.chain,
+          anchor_tx: anchorTx,
+          trace_root: traceRoot,
+          detail: result.detail || 'Anchor matches trace_root',
+          block: result.blockNumber,
+          timestamp: result.timestamp,
+        }, null, 2));
+        return;
+      }
+    } catch (e) {
+      attempts.push({ chain: entry.chain, error: e.message });
+    }
   }
+  console.log(JSON.stringify({ verified: false, anchor_tx: anchorTx, trace_root: traceRoot, attempts }, null, 2));
 }
 
 async function cmdAudit(targetDidOrUrl, taskId) {
@@ -7320,13 +7321,16 @@ async function cmdRotate() {
 
   // Anchor rotation on-chain if possible
   let anchor = null;
-  const key = process.env.ATEL_SOLANA_PRIVATE_KEY;
+  const chain = detectPreferredChain() || 'base';
+  const key = getChainPrivateKey(chain);
   if (key) {
     try {
-      const s = new SolanaAnchorProvider({ rpcUrl: process.env.ATEL_SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com', privateKey: key });
+      const provider = chain === 'bsc'
+        ? new BSCAnchorProvider({ rpcUrl: process.env.ATEL_BSC_RPC_URL || 'https://bsc-dataseed.binance.org', privateKey: key })
+        : new BaseAnchorProvider({ rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org', privateKey: key, anchorRegistryAddress: process.env.ATEL_ANCHOR_REGISTRY_ADDRESS || undefined });
       const { createHash } = await import('node:crypto');
       const rotationHash = createHash('sha256').update(JSON.stringify(proof)).digest('hex');
-      anchor = await s.anchor(`rotation:${rotationHash}`, { oldDid, newDid: newIdentity.did, type: 'key_rotation' });
+      anchor = await provider.anchor(`rotation:${rotationHash}`, { oldDid, newDid: newIdentity.did, type: 'key_rotation' });
     } catch (e) { console.log(JSON.stringify({ warning: 'On-chain anchor failed', error: e.message })); }
   }
 
@@ -7524,17 +7528,16 @@ async function cmdWithdraw(amount, address, chain) {
   }
   // Smart wallet withdrawal (new flow)
   chain = chain || 'base';
+  if (chain !== 'base' && chain !== 'bsc') {
+    console.error('Unsupported withdrawal chain. Supported chains: base, bsc.');
+    process.exit(1);
+  }
 
   // Validate destination address
   const channel = 'crypto_' + chain;
   if (channel === 'crypto_base' || channel === 'crypto_bsc') {
     if (!address.match(/^0x[0-9a-fA-F]{40}$/)) {
       console.error('Invalid EVM address. Must be 0x followed by 40 hex characters.');
-      process.exit(1);
-    }
-  } else if (channel === 'crypto_solana') {
-    if (!address.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
-      console.error('Invalid Solana address.');
       process.exit(1);
     }
   }
@@ -8232,9 +8235,9 @@ async function cmdComplete(orderId, taskId) {
     console.error('[complete] Anchoring proof on-chain...');
     anchor = await anchorOnChain(proof.trace_root, { proof_id: proof.proof_id, executorDid: id.did, requesterDid, taskId: effectiveTaskId, action: 'cli-complete' });
     if (anchor) {
-      console.error(`[complete] Anchored on Solana: ${anchor.txHash}`);
+      console.error(`[complete] Anchored on-chain: ${anchor.txHash}`);
     } else {
-      console.error('[complete] WARNING: On-chain anchoring failed. Set ATEL_SOLANA_PRIVATE_KEY for verifiable trust.');
+      console.error('[complete] WARNING: On-chain anchoring failed. Set a supported anchor key for verifiable trust.');
     }
   }
 
@@ -10790,8 +10793,6 @@ Environment:
   ATEL_REGISTRY           Registry URL (default: https://api.atelai.org)
   ATEL_PLATFORM           Platform URL (default: ATEL_REGISTRY value)
   ATEL_EXECUTOR_URL       Local executor HTTP endpoint
-  ATEL_SOLANA_PRIVATE_KEY Solana key for on-chain anchoring
-  ATEL_SOLANA_RPC_URL     Solana RPC (default: mainnet-beta)
   ATEL_BASE_PRIVATE_KEY   Base chain key for on-chain anchoring
   ATEL_BSC_PRIVATE_KEY    BSC chain key for on-chain anchoring
 
