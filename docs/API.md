@@ -102,7 +102,6 @@ npm install @lawreneliang/atel-sdk
 - Providers:
   - `BaseAnchorProvider`
   - `BSCAnchorProvider`
-  - `SolanaAnchorProvider`
   - `MockAnchorProvider`
 
 ### 12. Orchestrator

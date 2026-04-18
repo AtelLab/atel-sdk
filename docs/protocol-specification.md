@@ -91,7 +91,7 @@ interpreted as described in [RFC 2119](https://tools.ietf.org/html/rfc2119).
 1. **Decentralized Identity**: Agents generate their own key pairs; no central authority required.
 2. **Auditable Execution**: Every task execution produces a tamper-evident trace and cryptographic proof, enabling post-hoc verification and dispute resolution rather than preventing fraud at execution time.
 3. **Progressive Trust**: Trust is earned through verified collaboration history, not self-declared.
-4. **Chain-Agnostic Anchoring**: Proofs can be anchored on multiple blockchains (Solana, Base, BSC).
+4. **Chain-Agnostic Anchoring**: Proofs can be anchored on multiple blockchains (Base, BSC).
 5. **End-to-End Encryption**: All inter-agent communication can be encrypted after handshake.
 6. **Minimal Overhead**: Protocol messages are compact JSON; on-chain data is hash-only.
 7. **Incremental Adoption**: Each protocol component can be adopted independently.
@@ -350,11 +350,11 @@ The initiator sends a `handshake_init` message:
 | `encPublicKey` | string | REQUIRED | Ephemeral X25519 public key (base64) |
 | `challenge` | string | REQUIRED | Random hex string (default 32 bytes = 64 hex chars) |
 | `capabilities` | string[] | OPTIONAL | Initiator's capability types |
-| `wallets` | object | OPTIONAL | Wallet addresses `{solana?, base?, bsc?}` |
+| `wallets` | object | OPTIONAL | Wallet addresses `{base?, bsc?}` |
 | `walletBundle` | object | OPTIONAL | DID-signed wallet proof (v0.8.3+) |
 
 The `walletBundle` object contains:
-- `addresses`: `{solana?, base?, bsc?}` — wallet addresses
+- `addresses`: `{base?, bsc?}` — wallet addresses
 - `proof`: Ed25519 signature of canonical JSON of `addresses`, signed with DID secret key
 
 **Requirements**:
@@ -381,7 +381,7 @@ The responder verifies the init message and responds:
 | `challenge` | string | REQUIRED | Responder's random challenge |
 | `challengeResponse` | string | REQUIRED | `Ed25519_sign(initiator_challenge, responder_sk)` |
 | `capabilities` | string[] | OPTIONAL | Responder's capability types |
-| `wallets` | object | OPTIONAL | Wallet addresses `{solana?, base?, bsc?}` |
+| `wallets` | object | OPTIONAL | Wallet addresses `{base?, bsc?}` |
 | `walletBundle` | object | OPTIONAL | DID-signed wallet proof (v0.8.3+) |
 
 **Requirements**:
@@ -432,7 +432,7 @@ Upon successful handshake, both parties create a Session:
   "remotePublicKey": "<32 bytes>",
   "encrypted": true,
   "remoteCapabilities": ["translation", "coding"],
-  "remoteWallets": {"solana": "<address>", "base": "<address>"},
+  "remoteWallets": {"base": "<address>", "bsc": "<address>"},
   "createdAt": "<ISO 8601>",
   "expiresAt": "<ISO 8601>",
   "state": "active"
@@ -466,7 +466,6 @@ DID signature proving ownership.
 
 | Field | Format | Example |
 |-------|--------|---------|
-| `solana` | Base58 public key | `7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU` |
 | `base` | Hex EVM address | `0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18` |
 | `bsc` | Hex EVM address | `0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18` |
 
@@ -474,7 +473,7 @@ DID signature proving ownership.
 
 ```json
 {
-  "addresses": { "solana": "<addr>", "base": "<addr>" },
+  "addresses": { "base": "<addr>", "bsc": "<addr>" },
   "proof": "<base64_ed25519_signature>"
 }
 ```
@@ -740,7 +739,7 @@ On the receiver side, incoming tasks pass through a security pipeline:
     "events_count": 8
   },
   "anchor": {
-    "chain": "solana",
+    "chain": "base",
     "txHash": "<base58_tx_hash>"
   },
   "execution": {
@@ -758,7 +757,7 @@ On the receiver side, incoming tasks pass through a security pipeline:
   "status": "failed",
   "result": {"error": "<reason>"},
   "proof": {"proof_id": "...", "trace_root": "..."},
-  "anchor": {"chain": "solana", "txHash": "..."},
+  "anchor": {"chain": "base", "txHash": "..."},
   "rollback": {
     "total": 2,
     "succeeded": 2,
@@ -871,7 +870,7 @@ ATEL supports two trust assessment modes:
 - New agents always start at Level 0.
 
 **Chain-verified mode** (`--chain`):
-- Queries the target agent's wallet addresses on Solana/Base/BSC.
+- Queries the target agent's wallet addresses on Base/BSC.
 - Verifies anchor transactions on-chain via RPC.
 - Can assess agents never directly interacted with.
 - Updates local trust history with verified chain data.
@@ -906,14 +905,13 @@ ATEL supports two trust assessment modes:
 ### 7.6 On-Chain Trust Verification
 
 In chain-verified mode, the verifier queries the target's wallet addresses
-across all three chains:
+across the supported chains:
 
 1. Agent registers wallet addresses to Registry during startup (auto-derived
    from private keys).
 2. Verifier queries Registry for target's wallet addresses.
 3. For each chain, verifier queries the blockchain directly:
-   - **Solana**: `getSignaturesForAddress` → parse Memo Program instructions
-   - **Base/BSC**: Etherscan-compatible API → filter self-transactions with
+   - **Base/BSC**: RPC or explorer APIs → filter self-transactions with
      ATEL data prefix
 4. Parse Memo v2 content to confirm DID matches.
 5. Aggregate results into a chain verification report.
@@ -934,7 +932,6 @@ off-chain. This provides independent verifiability at minimal cost.
 
 | Chain | Provider Class | Mechanism | Typical Cost |
 |-------|---------------|-----------|-------------|
-| Solana | `SolanaAnchorProvider` | Memo Program instruction | ~$0.001 |
 | Base (L2) | `BaseAnchorProvider` (extends `EvmAnchorProvider`) | Zero-value self-tx with data | ~$0.001–$0.005 |
 | BSC | `BSCAnchorProvider` (extends `EvmAnchorProvider`) | Zero-value self-tx with data | ~$0.005–$0.02 |
 
@@ -971,23 +968,6 @@ joining the appropriate segments:
 - Segment 8: taskId
 - Segments 9+: trace_root
 
-### 8.4 Solana Anchoring
-
-**Anchor**:
-1. Encode the memo using `SolanaAnchorProvider.encodeMemo(hash, metadata)`.
-2. Create a `TransactionInstruction` targeting the Memo Program
-   (`MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`).
-3. Sign and send the transaction with `confirmed` commitment.
-4. Return `AnchorRecord` with `txHash` (base58 signature) and `blockNumber` (slot).
-
-**Verify**:
-1. Fetch the transaction via `getTransaction(txHash)`.
-2. Iterate compiled instructions; find the Memo Program instruction.
-3. Decode the memo data and extract the hash.
-4. Compare with the expected hash.
-5. Fallback: check `logMessages` for memo content.
-
-**Wallet Query**:
 1. Call `getSignaturesForAddress(walletPubkey, {limit})`.
 2. For each signature, fetch the transaction.
 3. Parse Memo Program instructions for ATEL v2 memos.
@@ -1033,7 +1013,7 @@ The `AnchorManager` provides a unified API across chains:
 {
   "hash": "<anchored_hash>",
   "txHash": "<on-chain_tx_hash>",
-  "chain": "solana | base | bsc",
+  "chain": "base | bsc",
   "timestamp": 1708000000000,
   "blockNumber": 12345678,
   "metadata": { ... }
@@ -1047,7 +1027,7 @@ The `AnchorManager` provides a unified API across chains:
   "valid": true,
   "hash": "<checked_hash>",
   "txHash": "<tx_hash>",
-  "chain": "solana",
+  "chain": "base",
   "blockTimestamp": 1708000000000,
   "detail": "Hash matches on-chain memo"
 }
@@ -1936,7 +1916,7 @@ offchain | onchain | credit
 
 **ChainId**:
 ```
-solana | base | bsc | mock
+base | bsc | mock
 ```
 
 **CandidateType**:
@@ -1964,7 +1944,6 @@ allow_all | allow_low_risk | deny
 | `DEFAULT_CHALLENGE_BYTES` | 32 | Handshake challenge size |
 | `DEFAULT_CHECKPOINT_INTERVAL` | 50 | Events between checkpoints |
 | `GENESIS_PREV` | `"0x00"` | First event's prev hash |
-| `MEMO_PROGRAM_ID` | `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr` | Solana Memo Program |
 | `ANCHOR_PREFIX` | `"ATEL_ANCHOR:"` | Legacy memo prefix |
 | `ANCHOR_V2_PREFIX` | `"ATEL:1:"` | V2 memo prefix |
 | `KDF_CONTEXT` | `"atel-session-key-v1"` | Key derivation context |
@@ -2009,7 +1988,7 @@ Agent A (Requester)                         Agent B (Executor)
        │         [B executes task via executor]     │
        │         [B generates Trace]                │
        │         [B generates Proof Bundle]         │
-       │         [B anchors trace_root on Solana]   │
+       │         [B anchors trace_root on Base]     │
        │                                           │
   8.   │◀── proof_response (encrypted) ───────────│
        │   {taskId, result, proof, anchor}         │
@@ -2026,12 +2005,12 @@ Agent A (Requester)                         Agent B (Executor)
 Verifier                                    Blockchain
     │                                           │
  1. │── Query Registry for target's wallets ───▶│ Registry
-    │◀── {wallets: {solana: "...", base: "..."}}│
+    │◀── {wallets: {base: "...", bsc: "..."}}   │
     │                                           │
- 2. │── getSignaturesForAddress(wallet) ───────▶│ Solana RPC
+ 2. │── getLogs / explorer query ───────────────▶│ Base/BSC RPC
     │◀── [sig1, sig2, sig3, ...]               │
     │                                           │
- 3. │── getTransaction(sig1) ─────────────────▶│ Solana RPC
+ 3. │── getTransaction(tx1) ───────────────────▶│ Base/BSC RPC
     │◀── {memo: "ATEL:1:did_exec:did_req:task:root"}│
     │                                           │
  4. │── Parse Memo v2, confirm DID matches      │
