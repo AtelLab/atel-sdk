@@ -28,7 +28,11 @@ describe('notification direct actions', () => {
   });
 
   it('builds milestone submit action from gateway callback result', () => {
-    expect(buildAgentCallbackAction('milestone_plan_confirmed', { orderId: 'ord-1', milestoneIndex: 0 }, { result: '完成的M0内容' })).toEqual({
+    expect(buildAgentCallbackAction(
+      'milestone_plan_confirmed',
+      { orderId: 'ord-1', milestoneIndex: 0 },
+      { orderId: 'ord-1', milestoneIndex: 0, result: '完成的M0内容' },
+    )).toEqual({
       ok: true,
       action: {
         type: 'cli',

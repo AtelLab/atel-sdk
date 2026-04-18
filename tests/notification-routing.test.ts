@@ -2,11 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from '../bin/notification-action-helpers.mjs';
 
 describe('notification routing', () => {
-  it('routes milestone work events to local structured fallback, not gateway', () => {
-    expect(shouldUseGatewaySession('milestone_plan_confirmed')).toBe(false);
+  it('routes executor milestone work events to isolated gateway sessions', () => {
+    expect(shouldUseGatewaySession('milestone_plan_confirmed')).toBe(true);
     expect(shouldUseGatewaySession('milestone_submitted')).toBe(false);
-    expect(shouldUseGatewaySession('milestone_verified')).toBe(false);
-    expect(shouldUseGatewaySession('milestone_rejected')).toBe(false);
+    expect(shouldUseGatewaySession('milestone_verified')).toBe(true);
+    expect(shouldUseGatewaySession('milestone_rejected')).toBe(true);
     expect(shouldUseGatewaySession('p2p_task')).toBe(true);
   });
 
