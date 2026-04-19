@@ -5222,11 +5222,14 @@ Advance the current milestone strictly based on these approved results. Do not i
           amount: Number(payload?.priceAmount || 0),
           reason: skipReason,
         });
-        pushTradeNotification('order_created_auto_accept_skipped', {
-          ...payload,
-          orderId: payload?.orderId || body?.orderId || '',
-          reasonCode: skipReason,
-        }, body).catch(e => log({ event: 'trade_notify_error', error: e.message }));
+        const internalOnlySkipReasons = new Set(['missing_recommended_actions', 'missing_accept_action']);
+        if (!internalOnlySkipReasons.has(skipReason)) {
+          pushTradeNotification('order_created_auto_accept_skipped', {
+            ...payload,
+            orderId: payload?.orderId || body?.orderId || '',
+            reasonCode: skipReason,
+          }, body).catch(e => log({ event: 'trade_notify_error', error: e.message }));
+        }
       }
     }
     if (rejectLimitReached) {
