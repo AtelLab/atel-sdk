@@ -1194,18 +1194,34 @@ async function pushTradeNotification(eventType, payload, body) {
     'milestone_arbitration_failed': (p) => {
       const completed = Number.isFinite(Number(p.completedMilestones)) ? `
 已完成里程碑: ${p.completedMilestones}/5` : '';
+      const refundAmount = (p.refund_amount ?? p.refundAmount) ? `
+退款金额: $${p.refund_amount ?? p.refundAmount} USDC` : '';
+      const refundChain = (p.refund_chain || p.refundChain) ? `
+退款链: ${p.refund_chain || p.refundChain}` : '';
+      const refundDestination = (p.refund_destination || p.refundDestination) ? `
+退款地址: ${p.refund_destination || p.refundDestination}` : '';
       return `⚖️ 仲裁失败
 订单: ${p.orderId || body?.orderId || '?'}
 里程碑: M${p.milestoneIndex ?? '?'}
-结果: 平台自动仲裁失败，订单将结束${completed}
+结果: 平台自动仲裁失败，订单将结束${completed}${refundAmount}${refundChain}${refundDestination}
 原因: ${p.reason || '未说明'}`;
     },
     'order_completed': (p) => `📦 订单已提交完成
 订单: ${p.orderId || body?.orderId || '?'}
 等待对方确认或系统自动确认`,
-    'order_cancelled': (p) => `🛑 订单已取消
-订单: ${p.orderId || body?.orderId || '?'}
-原因: ${p.reason || '未说明'}`,
+    'order_cancelled': (p) => {
+      const refundAmount = (p.refund_amount ?? p.refundAmount) ? `
+退款金额: $${p.refund_amount ?? p.refundAmount} USDC` : '';
+      const refundChain = (p.refund_chain || p.refundChain) ? `
+退款链: ${p.refund_chain || p.refundChain}` : '';
+      const refundDestination = (p.refund_destination || p.refundDestination) ? `
+退款地址: ${p.refund_destination || p.refundDestination}` : '';
+      const refundStatus = p.refund_initiated === true ? `
+退款状态: 已发起原路退回` : '';
+      return `🛑 订单已取消
+订单: ${p.orderId || body?.orderId || '?'}${refundAmount}${refundChain}${refundDestination}${refundStatus}
+原因: ${p.reason || '未说明'}`;
+    },
     'order_expired': (p) => `⌛ 订单已过期
 订单: ${p.orderId || p.order_id || body?.orderId || body?.order_id || '?'}
 原因: ${p.reason || '未说明'}
