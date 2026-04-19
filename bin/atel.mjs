@@ -1128,11 +1128,15 @@ async function pushTradeNotification(eventType, payload, body) {
   };
 
   const templates = {
-    'order_created': (p) => `📥 收到新订单
+    'order_created': (p) => {
+      const requester = p.requesterDid || p.requester_did || body?.requesterDid || body?.requester_did || '';
+      const requesterLine = requester ? `
+来自: ${requester}` : '';
+      return `📥 收到新订单
 订单: ${p.orderId || body?.orderId || '?'}
-金额: $${p.priceAmount ?? '?'} USDC
-来自: ${p.requesterDid || '未知请求方'}
-请审核后决定是否接单`,
+金额: $${p.priceAmount ?? '?'} USDC${requesterLine}
+请审核后决定是否接单`;
+    },
     'order_created_auto_accept_skipped': (p) => `⏸️ 未自动接单
 订单: ${p.orderId || body?.orderId || '?'}
 原因: ${autoAcceptReasonText(p.reasonCode)}
