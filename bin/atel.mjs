@@ -1176,11 +1176,29 @@ async function pushTradeNotification(eventType, payload, body) {
       const submitCount = Number(p.submitCount || 0);
       const arbitrationNote = submitCount >= 3 || p.maxReached
         ? `
-由于连续 3 次被拒，已进入仲裁待决状态，等待人工决定是否发起仲裁`
+由于连续 3 次被拒，平台已自动发起仲裁，请等待仲裁结果`
         : '';
       return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝
 订单: ${p.orderId || body?.orderId || '?'}${desc}
 原因: ${p.rejectReason || '未说明'}${arbitrationNote}`;
+    },
+    'milestone_arbitration_passed': (p) => {
+      const progress = Number.isFinite(Number(p.currentMilestone)) ? `
+当前进度: ${p.currentMilestone}/5` : '';
+      return `⚖️ 仲裁通过
+订单: ${p.orderId || body?.orderId || '?'}
+里程碑: M${p.milestoneIndex ?? '?'}
+结果: 平台自动仲裁已通过，订单继续推进${progress}
+原因: ${p.reason || '未说明'}`;
+    },
+    'milestone_arbitration_failed': (p) => {
+      const completed = Number.isFinite(Number(p.completedMilestones)) ? `
+已完成里程碑: ${p.completedMilestones}/5` : '';
+      return `⚖️ 仲裁失败
+订单: ${p.orderId || body?.orderId || '?'}
+里程碑: M${p.milestoneIndex ?? '?'}
+结果: 平台自动仲裁失败，订单将结束${completed}
+原因: ${p.reason || '未说明'}`;
     },
     'order_completed': (p) => `📦 订单已提交完成
 订单: ${p.orderId || body?.orderId || '?'}
