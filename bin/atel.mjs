@@ -1244,11 +1244,18 @@ async function pushTradeNotification(eventType, payload, body) {
 USDC 已支付`;
     },
   };
+  const withSourceLabel = (text) => {
+    const label = String(payload?.sourceLabel || body?.sourceLabel || '').trim();
+    if (!label) return text;
+    if (typeof text !== 'string' || !text) return `[${label}]`;
+    return text.startsWith(`[${label}]`) ? text : `[${label}]
+${text}`;
+  };
   const tmpl = templates[eventType];
   const orderIdText = orderId || '?';
-  const message = tmpl ? tmpl(payload) : `🔔 平台事件更新
+  const message = withSourceLabel(tmpl ? tmpl(payload) : `🔔 平台事件更新
 事件: ${eventType}
-订单: ${orderIdText}`;
+订单: ${orderIdText}`);
 
   for (const target of enabled) {
     try {
