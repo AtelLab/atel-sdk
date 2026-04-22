@@ -330,6 +330,31 @@ function isKnownInvalidLocalAgentStdout(text) {
     || lowered.includes('session locked');
 }
 
+function looksLikeMetaMilestoneResult(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  const lowered = value.toLowerCase();
+  return lowered.includes('i checked the current prompt only')
+    || lowered.includes('prompt does not provide the current orderid')
+    || lowered.includes('it does not provide the current orderid')
+    || lowered.includes('no orderid was supplied')
+    || lowered.includes('missing orderid')
+    || lowered.includes('could not run')
+    || lowered.includes('could not submit')
+    || lowered.includes('no callback submission was made')
+    || lowered.includes('callback')
+    || value.includes('只检查了当前 prompt')
+    || value.includes('只检查当前 prompt')
+    || value.includes('未提供当前订单号')
+    || value.includes('未提供当前 orderId')
+    || value.includes('没有提供当前订单号')
+    || value.includes('无法运行')
+    || value.includes('无法执行')
+    || value.includes('无法提交')
+    || value.includes('没有进行回调提交')
+    || value.includes('回调');
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Notification Target System — auto-discover gateway, manage targets
 // ═══════════════════════════════════════════════════════════════════
@@ -4435,6 +4460,9 @@ ${stageRule}
 Do not return a plan-only answer.
 Do not return vague wording like “可定义为/应当/建议/可以/后续将”.
 Deliver the current milestone itself, not meta commentary about how you would do it.
+Never mention the prompt, callback mechanics, submission mechanics, missing orderId, or what you would have done next.
+Do not write process narration such as “I checked...”, “I could not...”, “未提供...”, “无法...”, or similar meta explanations inside result unless the milestone explicitly asks for a failure report.
+For writing, revision, compression, or final-delivery milestones, the result field should normally be only the sentence, paragraph, or body text that satisfies the milestone.
 Base your result on the order description, the current milestone goal, and any previously approved outputs already included in the prompt.
 Do not claim file reads, commands, paths, interfaces, or external evidence you did not actually use.
 If the current milestone can be completed from the provided task context alone, complete it directly.
@@ -4587,6 +4615,7 @@ Format:
           if (!parsedOrderId || !Number.isFinite(parsedIndex) || !parsedResult) continue;
           if (expectedOrderId && parsedOrderId !== expectedOrderId) return { ok: false, error: 'mismatched_result_order_id' };
           if (Number.isFinite(expectedIndex) && parsedIndex !== expectedIndex) return { ok: false, error: 'mismatched_result_milestone_index' };
+          if (looksLikeMetaMilestoneResult(parsedResult)) return { ok: false, error: 'meta_milestone_result_not_allowed' };
           return {
             ok: true,
             action: {
@@ -4692,6 +4721,9 @@ Format:
           }
           if (Number.isFinite(expectedIndex) && parsedIndex !== expectedIndex) {
             return { ok: false, error: 'mismatched_result_milestone_index' };
+          }
+          if (looksLikeMetaMilestoneResult(parsedResult)) {
+            return { ok: false, error: 'meta_milestone_result_not_allowed' };
           }
           return {
             ok: true,
