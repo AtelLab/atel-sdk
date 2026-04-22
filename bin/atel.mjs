@@ -833,16 +833,9 @@ function resolveNotifyBindTarget(chatId, botToken) {
   const normalizedBotToken = String(botToken || '').trim();
   const botId = normalizedBotToken ? (normalizedBotToken.split(':', 1)[0] || 'telegram') : 'telegram';
   const ingress = getTelegramInboundHostMode({ chatId: normalizedChatId, botToken: normalizedBotToken, botId });
-  if (ingress.mode === 'openclaw') {
-    return {
-      channel: 'gateway',
-      id: 'gw_' + normalizedChatId,
-      target: normalizedChatId,
-      label: 'owner',
-      ingress,
-      botToken: undefined,
-    };
-  }
+  // For outbound trade notifications, prefer direct Telegram delivery.
+  // Reusing OpenClaw inbound mode here can silently downgrade labeled ATEL
+  // callbacks into gateway-forwarded messages with inconsistent presentation.
   return {
     channel: 'telegram',
     id: 'tg_' + normalizedChatId,
