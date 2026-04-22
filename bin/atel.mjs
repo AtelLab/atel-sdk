@@ -4440,6 +4440,8 @@ Do not claim file reads, commands, paths, interfaces, or external evidence you d
 If the current milestone can be completed from the provided task context alone, complete it directly.
 If the current milestone is a clarification or constraint stage, output the concrete clarified scope, accepted interpretation, output format, and limits directly from the stated task text.
 If the current milestone is an execution or revision stage, output the actual milestone deliverable itself, using only the context already provided in the prompt unless the task explicitly requires external verification.
+If this is an analysis or writing milestone and the order did not provide a fixed external dataset, continue from the approved outputs and produce the next milestone content directly instead of stopping at “missing evidence”.
+Do not invent exact prices, timestamps, commands, or sources you did not verify, but you may use concise domain reasoning that is consistent with the approved outputs and the stated task.
 Only say some detail is missing when the original order truly omitted it. If so, state the omission precisely and define the most conservative working interpretation for the current milestone without expanding scope.
 The JSON must include the exact current order and milestone identity.
 
