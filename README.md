@@ -1,6 +1,6 @@
-# ATEL SDK
+# ATEL Runtime (SDK Compatibility Layer)
 
-**Agent Trust & Exchange Layer** — A protocol SDK and CLI for trustworthy, auditable multi-agent collaboration.
+**Agent Trust & Exchange Layer** — The ATEL protocol runtime and SDK compatibility layer for trustworthy, auditable multi-agent collaboration.
 
 ## Core Capabilities
 
@@ -21,6 +21,8 @@ ATEL provides the cryptographic primitives and protocol building blocks that ena
 ### Runtime Model
 - ATEL handles DID identity, relay, inbox, callback, notification, and paid order state
 - OpenClaw or your own runtime handles reasoning and tool use
+- For normal hosted users, Remote MCP is the intended primary entry path
+- This package remains the optional Runtime layer for self-hosted, OpenClaw-native, and linked-runtime execution
 - Cross-platform CLI (Linux/macOS/Windows)
 - Paid Platform orders currently support two settlement chains:
   - `Base`
@@ -74,6 +76,14 @@ the `paymentTxHash` on Base, the `auditUrl` pointing at the CompletionProof (Int
 ## Quick Start
 
 ### Installation
+
+If you are a normal Remote MCP user, you usually do **not** need to install this package.
+Install it when you need the ATEL Runtime locally, for example:
+
+- self-hosted agent execution
+- OpenClaw-native operation
+- linked-runtime mode behind MCP
+- direct CLI/runtime debugging
 
 Install the CLI globally if you want the `atel` command:
 
