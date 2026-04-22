@@ -1321,9 +1321,16 @@ async function pushP2PNotification(eventType, payload = {}) {
 来自: ${p.peerDid || '?'}${p.alias ? `
 备注: ${p.alias}` : ''}`,
   };
+  const withSourceLabel = (text) => {
+    const label = String(payload?.sourceLabel || '').trim();
+    if (!label) return text;
+    if (typeof text !== 'string' || !text) return `[${label}]`;
+    return text.startsWith(`[${label}]`) ? text : `[${label}]
+${text}`;
+  };
   const tmpl = templates[eventType];
   if (!tmpl) return;
-  const message = tmpl(payload);
+  const message = withSourceLabel(tmpl(payload));
 
   for (const target of enabled) {
     try {
@@ -4994,9 +5001,9 @@ Advance the current milestone strictly based on these approved results. Do not i
     });
 
     if (kind === 'contact_added') {
-      pushP2PNotification('p2p_contact_added', { peerDid: messageSenderDid || senderDid, alias: body.alias || '', text }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+      pushP2PNotification('p2p_contact_added', { peerDid: messageSenderDid || senderDid, alias: body.alias || '', text, sourceLabel: body.sourceLabel || body?.payload?.sourceLabel || '' }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
     } else if (kind !== 'telegram_message') {
-      pushP2PNotification('p2p_message_received', { peerDid: messageSenderDid || senderDid, text, images: body.images, attachments: body.attachments }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
+      pushP2PNotification('p2p_message_received', { peerDid: messageSenderDid || senderDid, text, images: body.images, attachments: body.attachments, sourceLabel: body.sourceLabel || body?.payload?.sourceLabel || '' }).catch((e) => log({ event: 'p2p_notify_error', kind, error: e.message }));
     }
 
     res.json({ status: 'ok', kind });
@@ -5743,7 +5750,7 @@ Advance the current milestone strictly based on these approved results. Do not i
 
     log({ event: 'result_push_starting', taskId, hasSenderEndpoint: !!task.senderEndpoint, hasSenderCandidates: !!(task.senderCandidates?.length) });
     appendP2PTaskStatus({ taskId, role: 'executor', peerDid: task.from, status: 'result_submitted', result });
-    pushP2PNotification('p2p_result_submitted', { taskId, peerDid: task.from, result }).catch(() => {});
+    pushP2PNotification('p2p_result_submitted', { taskId, peerDid: task.from, result, sourceLabel: task.payload?.sourceLabel || task.payload?._taskRequest?.sourceLabel || '' }).catch(() => {});
 
     // Push result back to sender
     // Re-lookup sender if we don't have their endpoint (e.g., lookup failed at accept time)
@@ -5810,6 +5817,7 @@ Advance the current milestone strictly based on these approved results. Do not i
       peerDid: task.from,
       result,
       reason: success === false ? (result?.error || 'execution_failed') : null,
+      sourceLabel: task.payload?.sourceLabel || task.payload?._taskRequest?.sourceLabel || '',
     }).catch(() => {});
     delete pendingTasks[taskId]; saveTasks(pendingTasks);
     res.json({ status: 'ok', proof_id: proof.proof_id, anchor_tx: anchor?.txHash || null });
@@ -6017,7 +6025,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         text,
         timestamp: new Date().toISOString(),
       });
-      pushP2PNotification('p2p_message_received', { peerDid: message.from, text, images: payload.images, attachments: payload.attachments }).catch((e) => log({ event: 'p2p_notify_error', kind: 'portal_message', error: e.message }));
+      pushP2PNotification('p2p_message_received', { peerDid: message.from, text, images: payload.images, attachments: payload.attachments, sourceLabel: payload.sourceLabel || '' }).catch((e) => log({ event: 'p2p_notify_error', kind: 'portal_message', error: e.message }));
       return {
         status: 'ok',
         kind: 'portal_message',
@@ -6034,6 +6042,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         peerDid: message.from,
         result: payload.result || null,
         reason: payload.error || payload.result?.error || null,
+        sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '',
       }).catch(() => {});
       return { status: 'ok', message: 'Result received' };
     }
@@ -6151,7 +6160,7 @@ Advance the current milestone strictly based on these approved results. Do not i
         };
       savePending(pending);
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
-      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
       
       log({ 
         event: 'task_queued', 
@@ -6214,7 +6223,7 @@ Advance the current milestone strictly based on these approved results. Do not i
       };
       savePending(pending);
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_received' });
-      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
       log({ event: 'task_queued', taskId, from: message.from, action, reason: taskMode === 'confirm' ? 'task_mode_confirm' : 'autoAcceptP2P_off', timestamp: new Date().toISOString() });
       return { status: 'queued', taskId, message: 'Task queued for manual confirmation. Use: atel approve ' + taskId };
     }
@@ -6252,15 +6261,15 @@ Advance the current milestone strictly based on these approved results. Do not i
     // Forward to executor, gateway session, or echo fallback
     if (EXECUTOR_URL) {
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
-      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
-      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
       fetch(EXECUTOR_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ taskId, from: message.from, action, payload, encrypted: !!session?.encrypted, toolProxy: `http://127.0.0.1:${toolProxyPort}` }) }).catch(e => log({ event: 'executor_forward_failed', taskId, error: e.message }));
       return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
     } else {
       const p2pPrompt = `You are the ATEL executor agent and received a P2P task.\nTask type: ${action}\nTask payload: ${JSON.stringify(payload?.payload || payload || {}, null, 2)}\nComplete the task carefully and return the final result via the callback.`;
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_started' });
-      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from }).catch(() => {});
-      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from }).catch(() => {});
+      pushP2PNotification('p2p_task_received', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
+      pushP2PNotification('p2p_task_started', { taskId, peerDid: message.from, sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
       const queued = queueAgentHook('p2p_task', `p2p:${taskId}`, p2pPrompt, process.cwd(), { taskId });
       if (queued) {
         return { status: 'accepted', taskId, message: 'Task accepted. Result will be pushed when ready.' };
@@ -6279,7 +6288,7 @@ Advance the current milestone strictly based on these approved results. Do not i
       const echoAcceptedAt = pendingTasks[taskId]?.acceptedAt;
       delete pendingTasks[taskId]; saveTasks(pendingTasks);
       appendP2PTaskStatus({ taskId, role: 'executor', peerDid: message.from, status: 'task_failed', reason: 'no_executor' });
-      pushP2PNotification('p2p_task_failed', { taskId, peerDid: message.from, reason: 'no_executor' }).catch(() => {});
+      pushP2PNotification('p2p_task_failed', { taskId, peerDid: message.from, reason: 'no_executor', sourceLabel: payload.sourceLabel || payload._taskRequest?.sourceLabel || '' }).catch(() => {});
 
       // ── Trust Score + Graph Update (echo mode) ──
       try {
@@ -6945,7 +6954,8 @@ async function cmdTask(target, taskJson) {
     // Embed taskRequest and signature into payload
     const enhancedPayload = {
       ...payload,
-      _taskRequest: taskRequest,
+      sourceLabel: payload?.sourceLabel || payload?.payload?.sourceLabel || '',
+      _taskRequest: { ...taskRequest, sourceLabel: payload?.sourceLabel || payload?.payload?.sourceLabel || '' },
       _taskSignature: taskSignature
     };
     
@@ -6956,7 +6966,7 @@ async function cmdTask(target, taskJson) {
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: 'relay', relay_ack: relayAck, note: 'Relay mode is async. Waiting for result (up to 120s)...' }));
     const relayTaskId = relayAck?.result?.taskId || msg.id || msg.payload?.taskId;
     appendP2PTaskStatus({ taskId: relayTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
-    pushP2PNotification('p2p_task_sent', { taskId: relayTaskId, peerDid: remoteDid }).catch(() => {});
+    pushP2PNotification('p2p_task_sent', { taskId: relayTaskId, peerDid: remoteDid, sourceLabel: enhancedPayload.sourceLabel || '' }).catch(() => {});
 
     // Wait for result to arrive in inbox (poll for task-result)
     // Extract taskId from relay ack (assigned by remote agent), fallback to msg fields
@@ -7033,7 +7043,8 @@ async function cmdTask(target, taskJson) {
     // Embed taskRequest and signature into payload
     const enhancedPayload = {
       ...payload,
-      _taskRequest: taskRequest,
+      sourceLabel: payload?.sourceLabel || payload?.payload?.sourceLabel || '',
+      _taskRequest: { ...taskRequest, sourceLabel: payload?.sourceLabel || payload?.payload?.sourceLabel || '' },
       _taskSignature: taskSignature
     };
 
@@ -7042,7 +7053,7 @@ async function cmdTask(target, taskJson) {
     console.log(JSON.stringify({ status: 'task_sent', remoteDid, via: remoteEndpoint, result }, null, 2));
     const directTaskId = result?.taskId || taskRequest.taskId || msg.id || msg.payload?.taskId;
     appendP2PTaskStatus({ taskId: directTaskId, role: 'requester', peerDid: remoteDid, status: 'task_sent' });
-    pushP2PNotification('p2p_task_sent', { taskId: directTaskId, peerDid: remoteDid }).catch(() => {});
+    pushP2PNotification('p2p_task_sent', { taskId: directTaskId, peerDid: remoteDid, sourceLabel: enhancedPayload.sourceLabel || '' }).catch(() => {});
 
     // Update local trust history
     const success = result?.status !== 'rejected' && result?.status !== 'failed';
