@@ -4421,24 +4421,30 @@ For rejection:
         ? (Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0)
         : (Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0);
       const expectedOrderId = String(payload?.orderId || '').trim();
+      const stageRule = eventType === 'milestone_plan_confirmed'
+        ? 'This is the kickoff milestone. Usually it is a clarification or constraint-definition step. Do not jump to the final answer unless the milestone itself explicitly asks for it.'
+        : (eventType === 'milestone_rejected'
+          ? 'This is a revision milestone after rejection. Fix only the current rejected step and keep the scope narrow.'
+          : 'This is the next execution milestone after a previous approval. Continue from the already approved context and complete only the current step.');
       return `${promptText}
 
 Important: you are not chatting with the user.
 Do not output markdown, headings, bullet points, explanations, or your reasoning.
 You must output exactly one line of JSON.
+${stageRule}
 Do not return a plan-only answer.
 Do not return vague wording like “可定义为/应当/建议/可以/后续将”.
-You must prefer factual evidence:
-- what you actually checked
-- what command or file/path or interface you actually touched
-- what concrete output / state / observation you actually got
-- whether that evidence satisfies the current milestone
-If you could not find evidence, say that explicitly in the JSON result, including what you checked.
+Deliver the current milestone itself, not meta commentary about how you would do it.
+Base your result on the order description, the current milestone goal, and any previously approved outputs already included in the prompt.
+Do not claim file reads, commands, paths, interfaces, or external evidence you did not actually use.
+If the current milestone can be completed from the provided task context alone, complete it directly.
+If the current milestone is a clarification or constraint stage, output the concrete clarified scope, accepted interpretation, output format, and limits directly from the stated task text.
+If the current milestone is an execution or revision stage, output the actual milestone deliverable itself, using only the context already provided in the prompt unless the task explicitly requires external verification.
+Only say some detail is missing when the original order truly omitted it. If so, state the omission precisely and define the most conservative working interpretation for the current milestone without expanding scope.
 The JSON must include the exact current order and milestone identity.
-If you are not certain, fail closed instead of guessing.
 
 Format:
-{"orderId":"${expectedOrderId}","milestoneIndex":${expectedIndex},"result":"factual deliverable with concrete evidence and observations only"}`;
+{"orderId":"${expectedOrderId}","milestoneIndex":${expectedIndex},"result":"milestone-appropriate deliverable only"}`;
     }
 
     return promptText;
@@ -4454,6 +4460,13 @@ Format:
           const candidate = String(item?.text || '').trim();
           if (candidate) return candidate;
         }
+      }
+      if (typeof parsed?.orderId === 'string' && Number.isFinite(Number(parsed?.milestoneIndex)) && typeof parsed?.result === 'string' && parsed.result.trim()) {
+        return JSON.stringify({
+          orderId: parsed.orderId.trim(),
+          milestoneIndex: Number(parsed.milestoneIndex),
+          result: parsed.result.trim(),
+        });
       }
       if (typeof parsed?.text === 'string' && parsed.text.trim()) return parsed.text.trim();
       if (typeof parsed?.result === 'string' && parsed.result.trim()) return JSON.stringify({ result: parsed.result.trim() });
@@ -4472,6 +4485,13 @@ Format:
               const nested = String(item?.text || '').trim();
               if (nested) return nested;
             }
+          }
+          if (typeof parsed?.orderId === 'string' && Number.isFinite(Number(parsed?.milestoneIndex)) && typeof parsed?.result === 'string' && parsed.result.trim()) {
+            return JSON.stringify({
+              orderId: parsed.orderId.trim(),
+              milestoneIndex: Number(parsed.milestoneIndex),
+              result: parsed.result.trim(),
+            });
           }
           if (typeof parsed?.text === 'string' && parsed.text.trim()) return parsed.text.trim();
           if (typeof parsed?.result === 'string' && parsed.result.trim()) return JSON.stringify({ result: parsed.result.trim() });
@@ -4540,35 +4560,152 @@ Format:
   }
 
   function buildLocalAgentActionFromStdout(eventType, payload, stdout) {
-    const cleaned = normalizeLocalAgentStdout(stdout);
-    if (!cleaned) return { ok: false, error: 'empty_local_agent_stdout' };
-
-    if (eventType === 'milestone_submitted') {
-      try {
-        const parsed = JSON.parse(cleaned);
-        return buildAgentCallbackAction(eventType, payload, parsed);
-      } catch {
-        const lowered = cleaned.toLowerCase();
-        if (lowered.startsWith('pass') || cleaned.includes('\u901a\u8fc7')) {
-          return buildAgentCallbackAction(eventType, payload, { decision: 'pass', summary: cleaned });
+    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      const rawStdout = String(stdout || '').trim();
+      const structuredCandidates = [];
+      const directMatch = rawStdout.match(/\{[\s\S]*?"orderId"\s*:\s*"ord-[^"]+"[\s\S]*?"milestoneIndex"\s*:\s*\d+[\s\S]*?"result"\s*:\s*"[\s\S]*"\s*\}/);
+      if (directMatch?.[0]) structuredCandidates.push(directMatch[0]);
+      const rawLines = rawStdout.split('\n').map((line) => line.trim()).filter(Boolean);
+      for (let i = rawLines.length - 1; i >= 0; i -= 1) {
+        const candidate = rawLines[i];
+        if (candidate.includes('"orderId"') && candidate.includes('"milestoneIndex"') && candidate.includes('"result"')) {
+          structuredCandidates.push(candidate);
         }
-        if (lowered.startsWith('reject') || cleaned.includes('\u62d2\u7edd')) {
-          return buildAgentCallbackAction(eventType, payload, { decision: 'reject', reason: cleaned, summary: cleaned });
-        }
-        return { ok: false, error: 'invalid_local_review_stdout' };
+      }
+      for (const candidate of structuredCandidates) {
+        try {
+          const parsed = JSON.parse(candidate);
+          const parsedOrderId = typeof parsed?.orderId === 'string' ? parsed.orderId.trim() : '';
+          const parsedIndex = Number.parseInt(String(parsed?.milestoneIndex), 10);
+          const parsedResult = typeof parsed?.result === 'string' ? parsed.result.trim() : '';
+          const expectedOrderId = String(payload?.orderId || '').trim();
+          const expectedIndex = eventType === 'milestone_plan_confirmed'
+            ? (Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0)
+            : (Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0);
+          if (!parsedOrderId || !Number.isFinite(parsedIndex) || !parsedResult) continue;
+          if (expectedOrderId && parsedOrderId !== expectedOrderId) return { ok: false, error: 'mismatched_result_order_id' };
+          if (Number.isFinite(expectedIndex) && parsedIndex !== expectedIndex) return { ok: false, error: 'mismatched_result_milestone_index' };
+          return {
+            ok: true,
+            action: {
+              type: 'cli',
+              action: eventType === 'milestone_rejected' ? 'resubmit' : 'submit_milestone',
+              command: ['atel', 'milestone-submit', parsedOrderId, String(parsedIndex), '--result', parsedResult],
+            },
+          };
+        } catch {}
       }
     }
 
-    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
-      try {
-        const parsed = JSON.parse(cleaned);
-        return buildAgentCallbackAction(eventType, payload, parsed);
-      } catch {
-        if (isKnownInvalidLocalAgentStdout(cleaned)) {
-          return { ok: false, error: 'invalid_local_agent_stdout_known_failure' };
+    const cleaned = normalizeLocalAgentStdout(stdout);
+    if (!cleaned) {
+      if (eventType === 'milestone_submitted') {
+        const submission = String(payload?.resultSummary || '').trim();
+        const orderId = String(payload?.orderId || '').trim();
+        const milestoneIndex = Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0;
+        const looksFailed = /could not|fail closed|no callback submission was made|did not submit|未完成|无法|没有提交|只说明|缺少/i.test(submission);
+        if (submission && orderId && looksFailed) {
+          const reason = submission.slice(0, 180);
+          return {
+            ok: true,
+            action: {
+              type: 'cli',
+              action: 'reject',
+              command: ['atel', 'milestone-verify', orderId, String(milestoneIndex), '--reject', reason],
+            },
+          };
         }
-        return { ok: false, error: 'invalid_local_agent_stdout_requires_json' };
       }
+      return { ok: false, error: 'empty_local_agent_stdout' };
+    }
+    const parseStructuredJson = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return null;
+      try {
+        return JSON.parse(raw);
+      } catch {}
+      const jsonObjects = raw.match(/\{[\s\S]*\}/g);
+      if (jsonObjects?.length) {
+        for (let i = jsonObjects.length - 1; i >= 0; i -= 1) {
+          try {
+            return JSON.parse(jsonObjects[i]);
+          } catch {}
+        }
+      }
+      const jsonLines = raw.split('\n').map((line) => line.trim()).filter(Boolean);
+      for (let i = jsonLines.length - 1; i >= 0; i -= 1) {
+        const candidate = jsonLines[i];
+        if (!(candidate.startsWith('{') && candidate.endsWith('}'))) continue;
+        try {
+          return JSON.parse(candidate);
+        } catch {}
+      }
+      return null;
+    };
+
+    if (eventType === 'milestone_submitted') {
+      const parsed = parseStructuredJson(cleaned);
+      if (parsed) {
+        return buildAgentCallbackAction(eventType, payload, parsed);
+      }
+      const lowered = cleaned.toLowerCase();
+      if (lowered.startsWith('pass') || cleaned.includes('\u901a\u8fc7')) {
+        return buildAgentCallbackAction(eventType, payload, { decision: 'pass', summary: cleaned });
+      }
+      if (lowered.startsWith('reject') || cleaned.includes('\u62d2\u7edd')) {
+        return buildAgentCallbackAction(eventType, payload, { decision: 'reject', reason: cleaned, summary: cleaned });
+      }
+      const submission = String(payload?.resultSummary || '').trim();
+      const orderId = String(payload?.orderId || '').trim();
+      const milestoneIndex = Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0;
+      const fallbackText = cleaned || submission;
+      const looksFailed = /could not|fail closed|no callback submission was made|did not submit|未完成|无法|没有提交|只说明|缺少/i.test(fallbackText);
+      if (fallbackText && orderId && looksFailed) {
+        const reason = fallbackText.slice(0, 180);
+        return {
+          ok: true,
+          action: {
+            type: 'cli',
+            action: 'reject',
+            command: ['atel', 'milestone-verify', orderId, String(milestoneIndex), '--reject', reason],
+          },
+        };
+      }
+      return { ok: false, error: 'invalid_local_review_stdout' };
+    }
+
+    if (['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected'].includes(eventType)) {
+      const parsed = parseStructuredJson(cleaned);
+      if (parsed) {
+        const parsedOrderId = typeof parsed?.orderId === 'string' ? parsed.orderId.trim() : '';
+        const parsedIndex = Number.parseInt(String(parsed?.milestoneIndex), 10);
+        const parsedResult = typeof parsed?.result === 'string' ? parsed.result.trim() : '';
+        const expectedOrderId = String(payload?.orderId || '').trim();
+        const expectedIndex = eventType === 'milestone_plan_confirmed'
+          ? (Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0)
+          : (Number.isFinite(Number(payload?.currentMilestone)) ? Number(payload.currentMilestone) : Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0);
+        if (parsedOrderId && Number.isFinite(parsedIndex) && parsedResult) {
+          if (expectedOrderId && parsedOrderId !== expectedOrderId) {
+            return { ok: false, error: 'mismatched_result_order_id' };
+          }
+          if (Number.isFinite(expectedIndex) && parsedIndex !== expectedIndex) {
+            return { ok: false, error: 'mismatched_result_milestone_index' };
+          }
+          return {
+            ok: true,
+            action: {
+              type: 'cli',
+              action: eventType === 'milestone_rejected' ? 'resubmit' : 'submit_milestone',
+              command: ['atel', 'milestone-submit', parsedOrderId || expectedOrderId, String(parsedIndex), '--result', parsedResult],
+            },
+          };
+        }
+        return buildAgentCallbackAction(eventType, payload, parsed);
+      }
+      if (isKnownInvalidLocalAgentStdout(cleaned)) {
+        return { ok: false, error: 'invalid_local_agent_stdout_known_failure' };
+      }
+      return { ok: false, error: 'invalid_local_agent_stdout_requires_json' };
     }
 
     return buildAgentCallbackAction(eventType, payload, { result: cleaned, summary: cleaned });
@@ -4712,6 +4849,46 @@ Format:
     return await resp.json();
   }
 
+  async function reconcileCreatedTradeOrder(order) {
+    const orderId = order?.orderId || order?.OrderID || '';
+    if (!orderId) return false;
+
+    const executorDid = order?.executorDid || order?.ExecutorDID || '';
+    if (executorDid !== id.did) return false;
+
+    const currentPolicy = loadPolicy();
+    const payload = {
+      orderId,
+      priceAmount: Number(order?.priceAmount ?? order?.PriceAmount ?? 0),
+      priceCurrency: order?.priceCurrency || order?.PriceCurrency || '',
+      capabilityType: order?.capabilityType || order?.CapabilityType || '',
+      requesterDid: order?.requesterDid || order?.RequesterDID || '',
+      description: order?.description || order?.Description || order?.taskRequest?.description || order?.TaskRequest?.description || '',
+      chain: order?.chain || order?.Chain || '',
+    };
+    const acceptAction = { type: 'cli', action: 'accept', command: ['atel', 'accept', orderId] };
+    const directActions = getDirectExecutableActions('order_created', [acceptAction], payload, currentPolicy);
+
+    if (directActions.length === 0) {
+      const reason = explainDirectExecutionSkip('order_created', [acceptAction], payload, currentPolicy);
+      if (reason) {
+        log({ event: 'trade_reconcile_created_skip', orderId, amount: payload.priceAmount, reason });
+      }
+      return true;
+    }
+
+    log({ event: 'trade_reconcile_created', orderId, amount: payload.priceAmount });
+    let accepted = false;
+    for (const action of directActions) {
+      const result = await executeRecommendedActionDirect('order_created', action, getAtelWorkspaceRoot(), `reconcile:${orderId}:accept`);
+      if (result.ok) accepted = true;
+    }
+    if (accepted) {
+      log({ event: 'trade_reconcile_created_done', orderId });
+    }
+    return true;
+  }
+
   async function reconcileSingleTradeOrder(order) {
     const orderId = order?.orderId || order?.OrderID;
     if (!orderId) return;
@@ -4724,6 +4901,11 @@ Format:
 
     if (['cancelled', 'settled', 'rejected', 'expired'].includes(orderStatus)) {
       untrackOrder(orderId);
+      return;
+    }
+
+    if (orderStatus === 'created') {
+      await reconcileCreatedTradeOrder(order);
       return;
     }
 
@@ -4852,7 +5034,7 @@ Advance the current milestone strictly based on these approved results. Do not i
   }
 
   async function reconcileActiveTradeOrders() {
-    const reconcileStatuses = ['milestone_review', 'executing'];
+    const reconcileStatuses = ['created', 'milestone_review', 'executing'];
     const seenOrderIds = new Set();
     for (const status of reconcileStatuses) {
       let listed;
@@ -4862,12 +5044,28 @@ Advance the current milestone strictly based on these approved results. Do not i
         log({ event: 'trade_reconcile_list_error', status, error: e.message });
         continue;
       }
-      const orders = Array.isArray(listed?.orders) ? listed.orders : [];
+      const orders = (Array.isArray(listed?.orders) ? listed.orders : []).slice().sort((a, b) => {
+        const parseTs = (item) => Date.parse(
+          item?.updatedAt || item?.UpdatedAt
+          || item?.acceptedAt || item?.AcceptedAt
+          || item?.createdAt || item?.CreatedAt
+          || item?.submittedAt || item?.SubmittedAt
+          || 0,
+        ) || 0;
+        return parseTs(b) - parseTs(a);
+      });
+      if (status === 'created' && orders.length > 0) {
+        log({ event: 'trade_reconcile_created_scan', count: orders.length });
+      }
       for (const order of orders) {
         try {
           const orderId = order?.orderId;
           if (!orderId) continue;
           seenOrderIds.add(orderId);
+          if (status === 'created') {
+            await reconcileSingleTradeOrder(order);
+            continue;
+          }
           // The list endpoint returns a slim projection that omits
           // `description` / `taskRequest`. Re-fetch the full order so
           // reconcileSingleTradeOrder has the authoritative order
