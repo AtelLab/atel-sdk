@@ -4675,6 +4675,19 @@ Format:
     };
 
     if (eventType === 'milestone_submitted') {
+      const submission = String(payload?.resultSummary || '').trim();
+      const orderId = String(payload?.orderId || '').trim();
+      const milestoneIndex = Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0;
+      if (submission && orderId && looksLikeMetaMilestoneResult(submission)) {
+        return {
+          ok: true,
+          action: {
+            type: 'cli',
+            action: 'reject',
+            command: ['atel', 'milestone-verify', orderId, String(milestoneIndex), '--reject', '提交内容包含 prompt、callback、缺少 orderId 或无法提交等元叙述，没有只交付当前里程碑正文，不能通过。'],
+          },
+        };
+      }
       const parsed = parseStructuredJson(cleaned);
       if (parsed) {
         return buildAgentCallbackAction(eventType, payload, parsed);
@@ -4686,9 +4699,6 @@ Format:
       if (lowered.startsWith('reject') || cleaned.includes('\u62d2\u7edd')) {
         return buildAgentCallbackAction(eventType, payload, { decision: 'reject', reason: cleaned, summary: cleaned });
       }
-      const submission = String(payload?.resultSummary || '').trim();
-      const orderId = String(payload?.orderId || '').trim();
-      const milestoneIndex = Number.isFinite(Number(payload?.milestoneIndex)) ? Number(payload.milestoneIndex) : 0;
       const fallbackText = cleaned || submission;
       const looksFailed = /could not|fail closed|no callback submission was made|did not submit|未完成|无法|没有提交|只说明|缺少/i.test(fallbackText);
       if (fallbackText && orderId && looksFailed) {
