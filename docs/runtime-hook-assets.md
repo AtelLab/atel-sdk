@@ -13,6 +13,12 @@ Current mirrored assets:
 - `ops/systemd/atel-auto-requester-3921.service.d/atel-openclaw.conf`
 - `ops/systemd/atel-180-3300.service.d/hook.conf`
 
+Sync helper:
+- `scripts/sync-runtime-hook-assets.sh`
+- `bash scripts/sync-runtime-hook-assets.sh --check --role auto`
+- `sudo bash scripts/sync-runtime-hook-assets.sh --apply --role requester --restart`
+- `sudo bash scripts/sync-runtime-hook-assets.sh --apply --role executor --restart`
+
 Operational notes:
 - Requester node 129 currently uses hook concurrency `4`.
 - Executor node 180 currently uses hook concurrency `1` to avoid OpenClaw session lock contention.
@@ -22,5 +28,6 @@ Expected workflow:
 - Make source changes in `129 deploy` first.
 - Mirror runtime hook changes into this repo when they become part of the intended deployment baseline.
 - Sync 180 from Git instead of editing 180 repo code directly.
+- Use `scripts/sync-runtime-hook-assets.sh` to check or apply runtime hook drift instead of copying files by hand.
 
 This document exists to keep the repository baseline and the machine runtime baseline aligned.
