@@ -123,11 +123,19 @@ def coerce_review_json(text: str):
 
 
 def extract_review_submission() -> str:
-    match = re.search(r"Submission:\s*([\s\S]*?)\s*Review based on", raw_prompt)
-    if match:
-        return match.group(1).strip()
-    match = re.search(r"Submission:\s*([\s\S]*)", raw_prompt)
-    return match.group(1).strip() if match else ""
+    patterns = (
+        r"Submission:\s*([\s\S]*?)\s*Review based on",
+        r"Submission:\s*([\s\S]*)",
+        r"##\s*执行方提交(?:（[^）]*）|\([^)]*\))?\s*\n([\s\S]*?)\n\s*请基于",
+        r"##\s*执行方提交(?:（[^）]*）|\([^)]*\))?\s*\n([\s\S]*)",
+        r"Executor submission(?:\s*\([^)]*\))?:\s*([\s\S]*?)\n\s*(?:Please|Review based on)",
+        r"Executor submission(?:\s*\([^)]*\))?:\s*([\s\S]*)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw_prompt, re.I)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def fallback_review_decision():
