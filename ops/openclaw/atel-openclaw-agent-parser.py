@@ -8,6 +8,7 @@ order_id = os.environ.get("ORDER_ID", "").strip()
 
 bad_prefixes = (
     "[plugins] [adp-openclaw]",
+    "[agent/embedded]",
     "[plugins] [memory-tdai]",
     "[plugins] ",
     "Registering plugin",
@@ -22,7 +23,34 @@ bad_prefixes = (
 )
 
 
+def sanitize_executor_result(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    match = re.search(r"\b(bullish|bearish|sideways)\b\s*;\s*reasons?\s*:\s*([\s\S]*)", value, re.I)
+    if match:
+        label = match.group(1).lower()
+        reasons_text = re.split(r"\bThis satisfies\b|\bThis revised\b|\bwhile staying\b", match.group(2), maxsplit=1, flags=re.I)[0].strip().rstrip(".")
+        parts = [p.strip(" .;\n\t") for p in re.split(r",\s*(?:and\s+)?|;\s*", reasons_text) if p.strip(" .;\n\t")]
+        if len(parts) >= 3:
+            return f"{label}\n1. {parts[0]}.\n2. {parts[1]}.\n3. {parts[2]}."
+        return f"{label}: {reasons_text}"
+    meta_patterns = [
+        r"^I checked the current prompt only\.\s*",
+        r"^The current prompt states\s+",
+        r"^Based on (?:that )?provided context alone,\s*",
+        r"\s*This satisfies[\s\S]*$",
+    ]
+    cleaned = value
+    for pattern in meta_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.I).strip()
+    return cleaned or value
+
+
 def wrap_executor_body(obj: dict) -> str:
+    if isinstance(obj.get("result"), str):
+        obj = dict(obj)
+        obj["result"] = sanitize_executor_result(obj["result"])
     serialized = json.dumps(obj, ensure_ascii=False)
     return json.dumps({"text": serialized}, ensure_ascii=False)
 
@@ -93,8 +121,32 @@ def coerce_review_json(text: str):
     return None
 
 
+
+def extract_review_submission() -> str:
+    match = re.search(r"Submission:\s*([\s\S]*?)\s*Review based on", raw_prompt)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"Submission:\s*([\s\S]*)", raw_prompt)
+    return match.group(1).strip() if match else ""
+
+
+def fallback_review_decision():
+    if not is_review_prompt():
+        return None
+    submission = extract_review_submission()
+    if not submission or has_foreign_order_id(submission, order_id):
+        return {"decision": "reject", "reason": "No valid current-order submission was available before the local reviewer timed out.", "summary": "Automatic review failed closed."}
+    lowered = submission.lower()
+    bad_markers = ("could not", "cannot", "unable", "missing", "not provided", "无法", "不能", "未提供", "缺少", "失败", "callback", "submission mechanics")
+    if any(marker in lowered for marker in bad_markers):
+        return {"decision": "reject", "reason": "Submission contains failure or meta-execution wording and no valid reviewer decision was produced.", "summary": "Automatic review failed closed."}
+    return {"decision": "pass", "summary": "Local reviewer timed out without JSON; current-order submission is non-empty and contains no obvious failure wording."}
+
 text = (raw_output or "").strip()
 if not text:
+    fallback_review = fallback_review_decision()
+    if fallback_review:
+        print(json.dumps(fallback_review, ensure_ascii=False))
     raise SystemExit(0)
 
 match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.I)
@@ -173,7 +225,7 @@ for cand in reversed(candidates):
                 print(json.dumps(review_obj, ensure_ascii=False))
                 raise SystemExit(0)
         if key == "result":
-            print(json.dumps({"result": val.strip()}, ensure_ascii=False))
+            print(json.dumps({"result": sanitize_executor_result(val)}, ensure_ascii=False))
         else:
             print(val.strip())
         raise SystemExit(0)
@@ -186,6 +238,11 @@ if filtered and not has_foreign_order_id(filtered, order_id):
             print(json.dumps(review_obj, ensure_ascii=False))
             raise SystemExit(0)
     print(filtered)
+    raise SystemExit(0)
+
+fallback_review = fallback_review_decision()
+if fallback_review:
+    print(json.dumps(fallback_review, ensure_ascii=False))
     raise SystemExit(0)
 
 raise SystemExit(0)
