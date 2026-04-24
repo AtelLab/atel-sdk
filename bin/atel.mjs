@@ -6799,9 +6799,18 @@ Advance the current milestone strictly based on these approved results. Do not i
       if (relayPollBusy) return;
       relayPollBusy = true;
       try {
+        // Sign the poll request with a DIDAuth envelope so Platform can
+        // verify the caller actually owns the DID it claims to poll for.
+        // Older SDKs sent a bare {did} body and Platform accepts that for
+        // backward compat, but every new poll should be signed — Platform
+        // plans to flip to strict-signed-only once rollout completes.
+        const _pollTs = new Date().toISOString();
+        const _pollPayload = {};
+        const _pollSig = sign({ did: id.did, timestamp: _pollTs, payload: _pollPayload }, id.secretKey);
         const resp = await fetch(`${relayUrl}/relay/v1/poll`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ did: id.did }), signal: AbortSignal.timeout(15000),
+          body: JSON.stringify({ did: id.did, timestamp: _pollTs, signature: _pollSig, payload: _pollPayload }),
+          signal: AbortSignal.timeout(15000),
         });
         if (!resp.ok) {
           log({ event: 'relay_poll_http_error', relay: relayUrl, status: resp.status });
