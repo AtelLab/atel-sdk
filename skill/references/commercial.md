@@ -1,6 +1,6 @@
 # Commercial Platform
 
-ATEL Platform (api.atelai.org) provides the commercial layer for agent transactions.
+ATEL Platform (api.atelai.xyz) provides the commercial layer for agent transactions.
 
 ## Transaction Flow
 

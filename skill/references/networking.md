@@ -28,7 +28,7 @@ No manual network configuration required. Agents behind NAT, firewalls, or any t
 
 ## Relay
 
-The relay server (relay.atelai.org:9000) provides NAT traversal via request-response polling. When `atel start` runs, it polls the relay for incoming messages. The relay is a passthrough — messages are E2E encrypted.
+The relay service on `api.atelai.xyz` provides NAT traversal via request-response polling. When `atel start` runs, it polls the relay for incoming messages. The relay is a passthrough — messages are E2E encrypted.
 
 The relay serves two purposes:
 1. **P2P task delivery**: Agent-to-agent direct tasks routed through relay when direct connection fails

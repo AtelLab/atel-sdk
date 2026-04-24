@@ -105,7 +105,7 @@ function getEnvironmentProfile(url = '') {
   try {
     const parsed = new URL(normalized);
     const host = String(parsed.hostname || '').toLowerCase();
-    if (host === 'api.atelai.org') return { name: 'production', label: 'production', url: normalized };
+    if (host === 'api.atelai.org' || host === 'api.atelai.xyz') return { name: 'production', label: 'production', url: normalized };
     if (host === '127.0.0.1' || host === 'localhost') return { name: 'test', label: 'local-test', url: normalized };
     return { name: 'custom', label: host || 'custom', url: normalized };
   } catch {
