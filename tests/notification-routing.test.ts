@@ -4,7 +4,7 @@ import { normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } fr
 describe('notification routing', () => {
   it('routes executor milestone work events to isolated gateway sessions', () => {
     expect(shouldUseGatewaySession('milestone_plan_confirmed')).toBe(true);
-    expect(shouldUseGatewaySession('milestone_submitted')).toBe(false);
+    expect(shouldUseGatewaySession('milestone_submitted')).toBe(true);
     expect(shouldUseGatewaySession('milestone_verified')).toBe(true);
     expect(shouldUseGatewaySession('milestone_rejected')).toBe(true);
     expect(shouldUseGatewaySession('p2p_task')).toBe(true);

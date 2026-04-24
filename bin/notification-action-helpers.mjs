@@ -57,7 +57,7 @@ export function shouldSkipAgentHook(eventType, directExecutionSucceeded) {
   return eventType === 'order_accepted' && directExecutionSucceeded;
 }
 
-const EXECUTOR_MILESTONE_EVENTS = new Set(['milestone_plan_confirmed', 'milestone_verified', 'milestone_rejected']);
+const EXECUTOR_MILESTONE_EVENTS = new Set(['milestone_plan_confirmed', 'milestone_submitted', 'milestone_verified', 'milestone_rejected']);
 
 export function shouldUseGatewaySession(eventType) {
   // Use isolated gateway sub-sessions for milestone executor turns so each
