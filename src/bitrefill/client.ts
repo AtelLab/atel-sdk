@@ -5,7 +5,7 @@ import nacl from 'tweetnacl';
 import { AgentIdentity, serializePayload } from '../identity/index.js';
 
 export interface ClientConfig {
-  platformUrl?: string; // default: process.env.ATEL_PLATFORM_URL or https://api.atelai.org
+  platformUrl?: string; // default: process.env.ATEL_PLATFORM_URL or https://api.atelai.xyz
 }
 
 export function resolvePlatformUrl(cfg?: ClientConfig): string {
@@ -18,7 +18,7 @@ export function resolvePlatformUrl(cfg?: ClientConfig): string {
       || process.env.ATEL_REGISTRY;
     if (envUrl) return envUrl;
   }
-  return 'https://api.atelai.org';
+  return 'https://api.atelai.xyz';
 }
 
 export async function signedPost<T = any>(

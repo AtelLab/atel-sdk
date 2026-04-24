@@ -19,7 +19,7 @@ const MISSING_PLATFORM_DID_GUIDANCE = [
 
 const ATEL_DIR = process.env.ATEL_DIR || join(process.env.HOME || '/root', '.atel');
 const HUB_CONFIG_PATH = join(ATEL_DIR, 'hub.json');
-const DEFAULT_BASE = 'https://api.atelai.org/tokenhub/v1';
+const DEFAULT_BASE = 'https://api.atelai.xyz/tokenhub/v1';
 
 function getHubConfigPath() {
   return HUB_CONFIG_PATH;
@@ -148,7 +148,7 @@ async function cmdHubSwap(direction, amountStr, flags) {
   }
   const did = hubCfg.did;
   const secretKey = Buffer.from(hubCfg.secretKey, 'hex');
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.org';
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.xyz';
 
   function sortObj(x) {
     if (Array.isArray(x)) return x.map(sortObj);
@@ -212,7 +212,7 @@ async function cmdHubBalance() {
   const did = hubCfg.did;
   const nacl = await import('tweetnacl');
   const secretKey = Buffer.from(hubCfg.secretKey, 'hex');
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.org';
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.xyz';
   function sortObj(x) {
     if (Array.isArray(x)) return x.map(sortObj);
     if (x && typeof x === 'object') { const o = {}; for (const k of Object.keys(x).sort()) o[k] = sortObj(x[k]); return o; }
@@ -278,7 +278,7 @@ async function createHubKeyViaDidBootstrap(name) {
   const did = identity.did;
   const secretKeyHex = identity.secretKey;
   const secretKey = Buffer.from(secretKeyHex, 'hex');
-  const platformBase = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.org';
+  const platformBase = process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.xyz';
   const timestamp = new Date().toISOString();
   const payload = { name };
   const signInput = JSON.stringify({ did, payload, timestamp });
@@ -347,7 +347,7 @@ async function cmdHubKeyCreate(flags) {
   if (existsSync(identityPath)) {
     try {
       const identity = JSON.parse(readFileSync(identityPath, "utf-8"));
-      extras = { did: identity.did, secretKey: identity.secretKey, platform: process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || "https://api.atelai.org" };
+      extras = { did: identity.did, secretKey: identity.secretKey, platform: process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || "https://api.atelai.xyz" };
     } catch {}
   }
   saveConfig(data.key, base, extras);
@@ -505,7 +505,7 @@ async function cmdHubLedger(flags) {
   const did = hubCfg.did;
   const nacl = await import('tweetnacl');
   const secretKey = Buffer.from(hubCfg.secretKey, 'hex');
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.org';
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.xyz';
   function sortObj(x) {
     if (Array.isArray(x)) return x.map(sortObj);
     if (x && typeof x === 'object') { const o = {}; for (const k of Object.keys(x).sort()) o[k] = sortObj(x[k]); return o; }
@@ -566,7 +566,7 @@ async function cmdHubSwapHistory(flags) {
   const did = hubCfg.did;
   const nacl = await import('tweetnacl');
   const secretKey = Buffer.from(hubCfg.secretKey, 'hex');
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.org';
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.xyz';
   function sortObj(x) {
     if (Array.isArray(x)) return x.map(sortObj);
     if (x && typeof x === 'object') { const o = {}; for (const k of Object.keys(x).sort()) o[k] = sortObj(x[k]); return o; }
@@ -722,7 +722,7 @@ export async function cmdTransfer(toDID, amountStr, rawArgs) {
   }
   const did = hubCfg.did;
   const secretKey = Buffer.from(hubCfg.secretKey, 'hex');
-  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.org';
+  const PLATFORM_URL = process.env.ATEL_PLATFORM || hubCfg.platform || 'https://api.atelai.xyz';
 
   function sortObj(x) {
     if (Array.isArray(x)) return x.map(sortObj);

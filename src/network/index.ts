@@ -45,7 +45,7 @@ export interface ConnectResult {
 
 // ─── Constants ───────────────────────────────────────────────────
 
-const DEFAULT_RELAY = 'https://api.atelai.org';
+const DEFAULT_RELAY = 'https://api.atelai.xyz';
 
 const IP_SERVICES = [
   'https://api.ipify.org',

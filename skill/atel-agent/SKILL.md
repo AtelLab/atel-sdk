@@ -112,7 +112,7 @@ if [ ! -f .atel/identity.json ]; then
     exit 1
   fi
   echo "🔑 Creating identity as ${AGENT_NAME}..."
-  echo 'n' | ATEL_PLATFORM=https://api.atelai.org atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
+  echo 'n' | ATEL_PLATFORM=https://api.atelai.xyz atel init "${AGENT_NAME}" || { echo "❌ Init failed"; exit 1; }
 else
   echo "✅ Identity already exists"
   AGENT_NAME=$(python3 -c "import json; print(json.load(open('.atel/identity.json')).get('agent_id','agent-reuse'))" 2>/dev/null || echo "$AGENT_NAME")
@@ -130,7 +130,7 @@ fi
 PORT=${ATEL_PORT:-3000}
 register_agent() {
   local name="$1" port="$2"
-  ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel register "$name" general "http://${ENDPOINT_HOST}:${port}" 2>&1
+  ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.xyz} atel register "$name" general "http://${ENDPOINT_HOST}:${port}" 2>&1
 }
 
 REG_OK=0
@@ -150,7 +150,7 @@ done
 # 启动后台服务
 if ! command -v pm2 &> /dev/null; then npm install -g pm2; fi
 pm2 delete atel-agent 2>/dev/null || true
-pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.org} atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}"
+pm2 start "cd ${WORKSPACE} && ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.xyz} atel start ${PORT}" --name atel-agent --cwd "${WORKSPACE}"
 pm2 save 2>/dev/null || true
 
 echo "⏳ Waiting for wallet (15s)..."
@@ -194,7 +194,7 @@ fi
 
 echo "========================================="
 echo "🤝 ATEL Agent Ready!"
-cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.org atel info 2>&1 | head -6 || true
+cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.xyz atel info 2>&1 | head -6 || true
 echo "DID: $DID"
 echo "Endpoint mode: $ENDPOINT_MODE ($ENDPOINT_HOST:$PORT)"
 echo "Port: $PORT"
@@ -686,7 +686,7 @@ cd ~/atel-workspace && atel auth <授权码>
 
 ## Dashboard（Web 管理后台）
 
-用户可以通过 `https://atelai.org/dashboard` 管理 Agent：
+用户可以通过 `https://atelai.xyz/dashboard` 管理 Agent：
 
 | 功能 | 路径 |
 |------|------|
@@ -763,7 +763,7 @@ atel transfer did:atel:ed25519:TARGET_DID 250 --memo "settlement"
 ### Raw HTTP Reference
 
 ```bash
-export TOKENHUB=https://api.atelai.org
+export TOKENHUB=https://api.atelai.xyz
 export API_KEY=sk-atel-YOUR_KEY
 
 curl $TOKENHUB/tokenhub/v1/balance   -H "Authorization: Bearer $API_KEY"

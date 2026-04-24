@@ -87,7 +87,7 @@ function readDefaultPlatformBase() {
       if (candidate) return String(candidate).trim().replace(/\/+$/, '');
     }
   } catch {}
-  return 'https://api.atelai.org';
+  return 'https://api.atelai.xyz';
 }
 
 const DEFAULT_PLATFORM_BASE = readDefaultPlatformBase();
@@ -133,8 +133,8 @@ function ensureProductionAuthTarget() {
   if (env.platform.name === 'production') return env;
   console.error(`Authorization blocked: current ATEL_DIR is targeting ${env.platform.label} (${env.platform.url || 'unknown'}), not production.`);
   console.error(`ATEL_DIR: ${env.atelDir}`);
-  console.error('To authorize a code from https://atelai.org/login, run with explicit production endpoints:');
-  console.error('  ATEL_PLATFORM=https://api.atelai.org ATEL_REGISTRY=https://api.atelai.org ATEL_RELAY=https://api.atelai.org atel auth <code>');
+  console.error('To authorize a code from https://atelai.xyz/login, run with explicit production endpoints:');
+  console.error('  ATEL_PLATFORM=https://api.atelai.xyz ATEL_REGISTRY=https://api.atelai.xyz ATEL_RELAY=https://api.atelai.xyz atel auth <code>');
   process.exit(1);
 }
 const ATEL_NOTIFY_GATEWAY = process.env.ATEL_NOTIFY_GATEWAY || process.env.OPENCLAW_GATEWAY_URL || '';
@@ -11084,7 +11084,7 @@ Notification Commands:
 
 Environment:
   ATEL_DIR                Identity directory (default: .atel)
-  ATEL_REGISTRY           Registry URL (default: https://api.atelai.org)
+  ATEL_REGISTRY           Registry URL (default: https://api.atelai.xyz)
   ATEL_PLATFORM           Platform URL (default: ATEL_REGISTRY value)
   ATEL_EXECUTOR_URL       Local executor HTTP endpoint
   ATEL_BASE_PRIVATE_KEY   Base chain key for on-chain anchoring

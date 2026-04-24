@@ -19,7 +19,7 @@ export interface AttachmentConfig {
 }
 
 const DEFAULT_CONFIG: AttachmentConfig = {
-  platformURL: process.env.ATEL_PLATFORM || 'https://api.atelai.org',
+  platformURL: process.env.ATEL_PLATFORM || 'https://api.atelai.xyz',
   inlineThreshold: parseInt(process.env.ATEL_IMAGE_INLINE_MAX_SIZE || '262144'), // 256KB
   maxImages: parseInt(process.env.ATEL_MAX_IMAGES_PER_MESSAGE || '9'),
   maxAttachments: parseInt(process.env.ATEL_MAX_ATTACHMENTS_PER_MESSAGE || '5'),
