@@ -19,7 +19,22 @@ const MISSING_PLATFORM_DID_GUIDANCE = [
 
 const ATEL_DIR = process.env.ATEL_DIR || join(process.env.HOME || '/root', '.atel');
 const HUB_CONFIG_PATH = join(ATEL_DIR, 'hub.json');
-const DEFAULT_BASE = 'https://api.atelai.xyz/tokenhub/v1';
+
+function normalizeBaseURL(value = '') {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function readDefaultPlatformBase() {
+  return normalizeBaseURL(process.env.ATEL_PLATFORM || process.env.ATEL_API || process.env.ATEL_REGISTRY || 'https://api.atelai.xyz') || 'https://api.atelai.xyz';
+}
+
+function readDefaultHubBase() {
+  const explicit = normalizeBaseURL(process.env.ATEL_HUB_BASE || '');
+  if (explicit) return explicit;
+  return `${readDefaultPlatformBase()}/tokenhub/v1`;
+}
+
+const DEFAULT_BASE = readDefaultHubBase();
 
 function getHubConfigPath() {
   return HUB_CONFIG_PATH;
@@ -63,7 +78,7 @@ function readHubConfig(requiredFields = []) {
 
 function getConfig() {
   const envKey = process.env.ATEL_HUB_KEY;
-  const envBase = process.env.ATEL_HUB_BASE || DEFAULT_BASE;
+  const envBase = normalizeBaseURL(process.env.ATEL_HUB_BASE || '') || DEFAULT_BASE;
   if (envKey) return { key: envKey, base: envBase };
   return readHubConfig(['key', 'base']);
 }
@@ -71,7 +86,7 @@ function getConfig() {
 function saveConfig(key, base, extras = {}) {
   mkdirSync(ATEL_DIR, { recursive: true, mode: 0o700 });
   const existing = existsSync(HUB_CONFIG_PATH) ? (JSON.parse(readFileSync(HUB_CONFIG_PATH, "utf-8")) || {}) : {};
-  const next = { ...existing, ...extras, key, base: base || DEFAULT_BASE };
+  const next = { ...existing, ...extras, key, base: normalizeBaseURL(base || '') || DEFAULT_BASE };
   writeFileSync(
     HUB_CONFIG_PATH,
     JSON.stringify(next),
