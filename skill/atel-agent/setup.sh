@@ -109,7 +109,7 @@ echo ""
 echo "========================================="
 echo "🤝 ATEL Agent Ready!"
 echo "========================================="
-cd "$WORKSPACE" && ATEL_PLATFORM=https://api.atelai.xyz atel info 2>&1 | head -6 || true
+cd "$WORKSPACE" && ATEL_PLATFORM=${ATEL_PLATFORM:-https://api.atelai.xyz} atel info 2>&1 | head -6 || true
 # Telegram 通知默认改为显式同意（opt-in）
 SESSION_FILE="$HOME/.openclaw/agents/main/sessions/sessions.json"
 CHAT_ID=""

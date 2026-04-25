@@ -649,7 +649,11 @@ atel notify test                       # 发送测试通知
 用户可能会发给你一个 6 位授权码（如 `A7K3M9`），要求你连接 Dashboard。收到后直接执行：
 
 ```bash
-cd ~/atel-workspace && atel auth <授权码>
+cd ~/atel-workspace && \
+ATEL_PLATFORM=https://api.atelai.xyz \
+ATEL_REGISTRY=https://api.atelai.xyz \
+ATEL_RELAY=https://api.atelai.xyz \
+atel auth <授权码>
 ```
 
 成功后告诉用户"Dashboard 已连接"。
@@ -701,7 +705,11 @@ cd ~/atel-workspace && atel auth <授权码>
 | TokenHub | `/dashboard/hub` |
 | AI 对话 | `/dashboard/hub/chat` |
 
-Dashboard 登录方式：用户在网页点"Connect Agent"获取授权码，然后执行 `atel auth <码>`。
+Dashboard 登录方式：用户在网页点"Connect Agent"获取授权码。
+
+- 默认生产流程使用 `https://atelai.xyz/login`
+- 兼容流程仍可使用 `https://atelai.org/login`
+- CLI 必须使用同一域名族对应的 API 端点，不要把 `xyz` 登录码和 `org` API 混用
 
 ---
 
