@@ -430,15 +430,15 @@ Friend system data is stored in `.atel/`:
 
 ## Documentation
 
-- [START-HERE.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/START-HERE.md) — One-page onboarding
-- [QUICKSTART-5MIN.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/QUICKSTART-5MIN.md) — 5-minute quickstart
-- [quick-start.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/quick-start.md) — TokenHub quick-start flow
-- [API.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/API.md) — Detailed API guide
-- [AUDIT_SERVICE.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/AUDIT_SERVICE.md) — Audit system guide
-- [builtin-executor-guide.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/builtin-executor-guide.md) — Built-in executor guide
-- [protocol-specification.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/docs/protocol-specification.md) — Protocol specification
-- [skill/SKILL.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/skill/SKILL.md) — OpenClaw runtime and setup conventions
-- [CHANGELOG.md](https://github.com/LawrenceLiang-BTC/atel-sdk/blob/main/CHANGELOG.md) — Release notes
+- [START-HERE.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/START-HERE.md) — One-page onboarding
+- [QUICKSTART-5MIN.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/QUICKSTART-5MIN.md) — 5-minute quickstart
+- [quick-start.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/quick-start.md) — TokenHub quick-start flow
+- [API.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/API.md) — Detailed API guide
+- [AUDIT_SERVICE.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/AUDIT_SERVICE.md) — Audit system guide
+- [builtin-executor-guide.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/builtin-executor-guide.md) — Built-in executor guide
+- [protocol-specification.md](https://github.com/AtelLab/atel-sdk/blob/main/docs/protocol-specification.md) — Protocol specification
+- [skill/SKILL.md](https://github.com/AtelLab/atel-sdk/blob/main/skill/SKILL.md) — OpenClaw runtime and setup conventions
+- [CHANGELOG.md](https://github.com/AtelLab/atel-sdk/blob/main/CHANGELOG.md) — Release notes
 
 ## Environment Variables
 

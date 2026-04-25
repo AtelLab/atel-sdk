@@ -27,7 +27,7 @@ pm2 restart atel-agent atel-executor
 
 **First-time setup:**
 ```bash
-git clone https://github.com/LawrenceLiang-BTC/atel-sdk.git
+git clone https://github.com/AtelLab/atel-sdk.git
 cd atel-sdk
 npm install
 npm run build
