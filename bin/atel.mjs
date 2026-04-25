@@ -64,7 +64,7 @@ import {
   discoverPublicIP, checkReachable, verifyPortReachable, ContentAuditor, TrustScoreClient,
   RollbackManager, rotateKey, verifyKeyRotation, ToolGateway, PolicyEngine, mintConsentToken, sign,
   TrustGraph, calculateTaskWeight,
-} from '@lawrenceliang-btc/atel-sdk';
+} from '@atel-ai/atel-sdk';
 import { TunnelManager, HeartbeatManager } from './tunnel-manager.mjs';
 import { buildAgentCallbackAction, explainDirectExecutionSkip, getDirectExecutableActions, normalizeGatewayBind, shouldSkipAgentHook, shouldUseGatewaySession } from './notification-action-helpers.mjs';
 import { parseOrderCancelArgs, preflightOrderCancel } from './order-cancel-helpers.mjs';
@@ -5849,7 +5849,7 @@ Advance the current milestone strictly based on these approved results. Do not i
 
       // Update score on Registry
       try {
-        const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+        const { serializePayload } = await import('@atel-ai/atel-sdk');
         const ts = new Date().toISOString();
         const scorePayload = { did: id.did, trustScore: scoreReport.trust_score };
         const signable = serializePayload({ payload: scorePayload, did: id.did, timestamp: ts });
@@ -7694,7 +7694,7 @@ async function syncAllFriendsToPlatform() {
 async function signedFetch(method, path, payload = {}) {
   const id = requireIdentity();
   const { default: nacl } = await import('tweetnacl');
-  const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+  const { serializePayload } = await import('@atel-ai/atel-sdk');
   const ts = new Date().toISOString();
   const signable = serializePayload({ payload, did: id.did, timestamp: ts });
   const sig = Buffer.from(nacl.sign.detached(Buffer.from(signable), id.secretKey)).toString('base64');
@@ -7718,7 +7718,7 @@ async function cmdAuth(code) {
   ensureProductionAuthTarget();
   const id = requireIdentity();
   const { default: nacl } = await import('tweetnacl');
-  const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+  const { serializePayload } = await import('@atel-ai/atel-sdk');
 
   const ts = new Date().toISOString();
   const payload = { code: normalizedCode, did: id.did, timestamp: ts };
@@ -7992,7 +7992,7 @@ async function cmdOrder(executorDid, capType, price) {
     
     // ── AVIP: Create signed Intent ──
     const { default: nacl } = await import('tweetnacl');
-    const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+    const { serializePayload } = await import('@atel-ai/atel-sdk');
     const intentConstraints = {
       maxAmount: parseFloat(price),
       milestoneCount: 5,
@@ -8573,7 +8573,7 @@ async function cmdComplete(orderId, taskId) {
 
     // ── Push score to Registry ──
     try {
-      const { serializePayload } = await import('@lawrenceliang-btc/atel-sdk');
+      const { serializePayload } = await import('@atel-ai/atel-sdk');
       const ts = new Date().toISOString();
       const scorePayload = { did: id.did, trustScore: scoreReport.trust_score };
       const signable = serializePayload({ payload: scorePayload, did: id.did, timestamp: ts });
@@ -11144,7 +11144,7 @@ async function cmdBitrefill(sub, subArgs) {
   }
 
   const id = requireIdentity();
-  const { bitrefill } = await import('@lawrenceliang-btc/atel-sdk');
+  const { bitrefill } = await import('@atel-ai/atel-sdk');
   const num = (name, def) => {
     const v = flag(name, def);
     return v === undefined ? undefined : Number(v);

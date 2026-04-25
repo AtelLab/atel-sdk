@@ -9,7 +9,7 @@
 ## Install
 
 ```bash
-npm install -g @lawrenceliang-btc/atel-sdk
+npm install -g @atel-ai/atel-sdk
 ```
 
 ## Recommended Runtime Model

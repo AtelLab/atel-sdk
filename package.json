@@ -1,5 +1,5 @@
 {
-  "name": "@lawrenceliang-btc/atel-sdk",
+  "name": "@atel-ai/atel-sdk",
   "version": "1.2.16",
   "description": "ATEL Protocol SDK - Agent Trust & Exchange Layer",
   "repository": {

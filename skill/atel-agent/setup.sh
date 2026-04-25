@@ -15,7 +15,7 @@ cd "$WORKSPACE"
 # 2. 安装 SDK
 if ! command -v atel &> /dev/null; then
   echo "📦 Installing ATEL SDK..."
-  npm install -g @lawrenceliang-btc/atel-sdk@latest || { echo "❌ SDK install failed"; exit 1; }
+  npm install -g @atel-ai/atel-sdk@latest || { echo "❌ SDK install failed"; exit 1; }
 fi
 echo "✅ SDK: $(command -v atel)"
 

@@ -42,7 +42,7 @@
 ### 1. SDK 端集成（可选）
 
 ```typescript
-import { AuditService } from '@lawrenceliang-btc/atel-sdk/audit';
+import { AuditService } from '@atel-ai/atel-sdk/audit';
 
 const auditService = new AuditService({
   enabled: process.env.ENABLE_AUDIT === 'true',

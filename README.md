@@ -88,13 +88,13 @@ Install it when you need the ATEL Runtime locally, for example:
 Install the CLI globally if you want the `atel` command:
 
 ```bash
-npm install -g @lawrenceliang-btc/atel-sdk
+npm install -g @atel-ai/atel-sdk
 ```
 
 Install the package locally if you want to embed the SDK in your own runtime or app:
 
 ```bash
-npm install @lawrenceliang-btc/atel-sdk
+npm install @atel-ai/atel-sdk
 ```
 
 ### Initialize Your Agent
@@ -316,7 +316,7 @@ Notes:
 ### Identity & Signing
 
 ```typescript
-import { AgentIdentity } from '@lawrenceliang-btc/atel-sdk';
+import { AgentIdentity } from '@atel-ai/atel-sdk';
 
 const agent = new AgentIdentity();
 console.log(agent.did);           // "did:atel:ed25519:..."
@@ -327,7 +327,7 @@ const ok = agent.verify(payload, sig);
 ### Policy Enforcement
 
 ```typescript
-import { mintConsentToken, PolicyEngine } from '@lawrenceliang-btc/atel-sdk';
+import { mintConsentToken, PolicyEngine } from '@atel-ai/atel-sdk';
 
 const token = mintConsentToken(
   issuer.did, executor.did,
@@ -344,7 +344,7 @@ const decision = engine.evaluate(action);  // 'allow' | 'deny' | 'needs_confirm'
 ### Execution Tracing
 
 ```typescript
-import { ExecutionTrace } from '@lawrenceliang-btc/atel-sdk';
+import { ExecutionTrace } from '@atel-ai/atel-sdk';
 
 const trace = new ExecutionTrace(taskId, agentIdentity);
 trace.append('TASK_ACCEPTED', { ... });
@@ -357,7 +357,7 @@ const { valid, errors } = trace.verify();
 ### Proof Generation
 
 ```typescript
-import { ProofGenerator, ProofVerifier } from '@lawrenceliang-btc/atel-sdk';
+import { ProofGenerator, ProofVerifier } from '@atel-ai/atel-sdk';
 
 const gen = new ProofGenerator(trace, identity);
 const bundle = gen.generate(policyRef, consentRef, resultRef);
@@ -369,7 +369,7 @@ const report = ProofVerifier.verify(bundle, { trace });
 ### On-Chain Anchoring
 
 ```typescript
-import { BaseAnchorProvider } from '@lawrenceliang-btc/atel-sdk';
+import { BaseAnchorProvider } from '@atel-ai/atel-sdk';
 
 const base = new BaseAnchorProvider({ 
   rpcUrl: process.env.ATEL_BASE_RPC_URL || 'https://mainnet.base.org',

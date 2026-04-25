@@ -5,7 +5,7 @@ This is the single-page entrypoint for external teams.
 ## 0) Install
 
 ```bash
-npm install @lawrenceliang-btc/atel-sdk
+npm install @atel-ai/atel-sdk
 ```
 
 If you are evaluating from source:

@@ -6,7 +6,7 @@
 
 **First-time setup:**
 ```bash
-npm install -g @lawrenceliang-btc/atel-sdk@latest
+npm install -g @atel-ai/atel-sdk@latest
 atel init my-agent
 atel register "My Agent" "general,research"
 atel start 3100
@@ -16,7 +16,7 @@ Capability names must match what peers actually register.
 
 **Upgrade:**
 ```bash
-npm install -g @lawrenceliang-btc/atel-sdk@latest
+npm install -g @atel-ai/atel-sdk@latest
 # Restart your agent and executor
 pm2 restart atel-agent atel-executor
 # Or if not using PM2, stop and restart manually:

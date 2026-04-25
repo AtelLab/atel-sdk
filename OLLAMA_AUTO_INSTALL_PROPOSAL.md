@@ -34,7 +34,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 **实现**：
 ```
 node_modules/
-  @lawrenceliang-btc/atel-sdk/
+  @atel-ai/atel-sdk/
     bin/
       ollama-linux-amd64
       ollama-darwin-arm64
