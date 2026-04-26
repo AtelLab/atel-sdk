@@ -6799,9 +6799,18 @@ Advance the current milestone strictly based on these approved results. Do not i
       if (relayPollBusy) return;
       relayPollBusy = true;
       try {
+        // Sign the poll request with a DIDAuth envelope so Platform can
+        // verify the caller actually owns the DID it claims to poll for.
+        // Older SDKs sent a bare {did} body and Platform accepts that for
+        // backward compat, but every new poll should be signed — Platform
+        // plans to flip to strict-signed-only once rollout completes.
+        const _pollTs = new Date().toISOString();
+        const _pollPayload = {};
+        const _pollSig = sign({ did: id.did, timestamp: _pollTs, payload: _pollPayload }, id.secretKey);
         const resp = await fetch(`${relayUrl}/relay/v1/poll`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ did: id.did }), signal: AbortSignal.timeout(15000),
+          body: JSON.stringify({ did: id.did, timestamp: _pollTs, signature: _pollSig, payload: _pollPayload }),
+          signal: AbortSignal.timeout(15000),
         });
         if (!resp.ok) {
           log({ event: 'relay_poll_http_error', relay: relayUrl, status: resp.status });
@@ -6867,11 +6876,16 @@ Advance the current milestone strictly based on these approved results. Do not i
         }
 
         // ACK only successfully persisted messages
+        // Platform /relay/v1/ack is wrapped by middleware.DIDAuth — the body
+        // must be a signed SignedRequest envelope, not a plain { did, ids }.
         if (ackedIds.length > 0) {
           try {
+            const timestamp = new Date().toISOString();
+            const payload = { ids: ackedIds };
+            const signature = sign({ did: id.did, timestamp, payload }, id.secretKey);
             const ackResp = await fetch(`${relayUrl}/relay/v1/ack`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ did: id.did, ids: ackedIds }),
+              body: JSON.stringify({ did: id.did, timestamp, signature, payload }),
               signal: AbortSignal.timeout(10000),
             });
             if (!ackResp.ok) {
@@ -10542,13 +10556,6 @@ async function submitFastDeliverable(orderId, identity) {
     const chain = orderInfo.chain || orderInfo.Chain || '';
     if (chain !== 'fast-coop') return;
 
-    // 2. Find escrow job_id from chain-records
-    const recordsResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}`, {
-      signal: AbortSignal.timeout(10000),
-    });
-    // The job_id is stored in the on_chain_records by the Platform.
-    // We need to get it from the order or from the chain-records endpoint.
-    // For now, compute it the same way Platform does: keccak256(orderId)
     const { createHash } = await import('node:crypto');
 
     // 3. Get the agent's Fast account info
@@ -10562,24 +10569,31 @@ async function submitFastDeliverable(orderId, identity) {
     const accountData = (await accountResp.json()).data;
     const nonce = accountData.next_nonce;
 
-    // 4. Find escrow job for this order (query by provider)
-    const jobsResp = await fetch(`${FAST_RPC}/v1/escrow-jobs?provider=${pubKeyHex}&status=Funded`, {
+    // 4. Find escrow job for this order via Platform's chain-records endpoint.
+    // Previous implementation queried Fast `?provider=<pubKeyHex>&status=Funded`
+    // directly, but Fast expects the provider in bech32 form (fast1...) not
+    // raw hex, so the filter always returned empty. Platform already stores
+    // the jobID in on_chain_records.tx_hash for the confirmed escrow_create
+    // record — pull it from there instead.
+    const recordsResp = await fetch(`${PLATFORM_URL}/trade/v1/order/${orderId}/chain-records`, {
       signal: AbortSignal.timeout(10000),
     });
-    if (!jobsResp.ok) throw new Error(`escrow jobs query failed: ${jobsResp.status}`);
-    const jobs = (await jobsResp.json()).data || [];
-    const job = jobs.find(j => j.description && j.description.includes(orderId));
-    if (!job) {
-      log({ event: 'fast_submit_no_job', orderId, note: 'no Funded escrow job found for this order' });
+    if (!recordsResp.ok) throw new Error(`chain-records query failed: ${recordsResp.status}`);
+    const recordsData = await recordsResp.json();
+    const escrowRecord = (recordsData.records || []).find(r =>
+      r.operationType === 'escrow_create' && r.status === 'confirmed');
+    if (!escrowRecord || !escrowRecord.txHash) {
+      log({ event: 'fast_submit_no_job', orderId, note: 'no confirmed escrow_create record for this order' });
       return;
     }
+    const jobIdHex = escrowRecord.txHash;
 
     // 5. Build Escrow::Submit transaction
     // deliverable = keccak256(orderId) as 32-byte hash
     const deliverableHash = createHash('sha3-256').update(orderId).digest('hex');
 
     // BCS encode: Operation::Escrow(12) → Escrow::Submit(2) → jobId(32) + deliverable(32)
-    const jobIdBytes = Buffer.from(job.job_id, 'hex');
+    const jobIdBytes = Buffer.from(jobIdHex, 'hex');
     const deliverableBytes = Buffer.from(deliverableHash, 'hex');
 
     // Build minimal BCS by hand (matching Go implementation):
@@ -10645,8 +10659,8 @@ async function submitFastDeliverable(orderId, identity) {
       throw new Error(`Fast submit failed: ${submitResult.error.message || JSON.stringify(submitResult.error)}`);
     }
 
-    log({ event: 'fast_submit_success', orderId, jobId: job.job_id, nonce });
-    console.log(`⚡ [Fast] Deliverable submitted for ${orderId} (job: ${job.job_id.substring(0, 16)}...)`);
+    log({ event: 'fast_submit_success', orderId, jobId: jobIdHex, nonce });
+    console.log(`⚡ [Fast] Deliverable submitted for ${orderId} (job: ${jobIdHex.substring(0, 16)}...)`);
   } catch (e) {
     log({ event: 'fast_submit_error', orderId, error: e.message });
     console.error(`⚠️  [Fast] Submit failed for ${orderId}: ${e.message}`);
