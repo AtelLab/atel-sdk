@@ -1123,18 +1123,242 @@ async function pollTelegramInboundUpdates(targetDid) {
 }
 
 // Send notification to all enabled targets (fire-and-forget, never blocks)
+function notificationValue(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function appendNotificationLine(lines, label, value) {
+  const text = notificationValue(value);
+  if (text) lines.push(`${label}: ${text}`);
+}
+
+function appendNotificationSection(lines, title, value) {
+  const text = notificationValue(value);
+  if (!text) return;
+  lines.push(`${title}:`);
+  lines.push(text);
+}
+
+function splitTelegramText(text, maxLength = 3500) {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) return [];
+  if (normalized.length <= maxLength) return [normalized];
+
+  const chunks = [];
+  let current = '';
+  const pushCurrent = () => {
+    const trimmed = current.trim();
+    if (trimmed) chunks.push(trimmed);
+    current = '';
+  };
+  const pushLine = (line) => {
+    if (!line) {
+      if (current && !current.endsWith('\n')) current += '\n';
+      return;
+    }
+    if (line.length > maxLength) {
+      const pieces = line.match(new RegExp(`.{1,${maxLength - 32}}`, 'g')) || [line];
+      for (const piece of pieces) {
+        pushLine(piece);
+      }
+      return;
+    }
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > maxLength) {
+      pushCurrent();
+      current = line;
+      return;
+    }
+    current = candidate;
+  };
+
+  for (const line of normalized.split('\n')) {
+    pushLine(line);
+  }
+  pushCurrent();
+  return chunks.length > 0 ? chunks : [normalized];
+}
+
+function buildTradeNotificationMessage(eventType, payload = {}, body = {}) {
+  const orderId = notificationValue(payload?.orderId, body?.orderId, payload?.order_id, body?.order_id, '?');
+  const milestoneLabel = payload?.milestoneIndex ?? body?.milestoneIndex;
+  const currentMilestone = payload?.currentMilestone ?? body?.currentMilestone;
+  const totalMilestones = payload?.totalMilestones ?? body?.totalMilestones;
+  const progressText = Number.isFinite(Number(currentMilestone)) && Number.isFinite(Number(totalMilestones))
+    ? `${Number(currentMilestone)}/${Number(totalMilestones)}`
+    : '';
+  const submitCount = notificationValue(payload?.submitCount, body?.submitCount);
+  const maxAttempts = notificationValue(payload?.maxAttempts, body?.maxAttempts, submitCount ? '3' : '');
+  const priceAmount = payload?.priceAmount ?? body?.priceAmount;
+  const chain = notificationValue(payload?.chain, body?.chain);
+  const orderDescription = notificationValue(payload?.orderDescription, body?.orderDescription, payload?.description, body?.description);
+  const resultSummary = notificationValue(payload?.resultSummary, body?.resultSummary);
+  const milestoneDescription = notificationValue(payload?.milestoneDescription, body?.milestoneDescription);
+  const nextMilestoneDescription = notificationValue(payload?.nextMilestoneDescription, body?.nextMilestoneDescription);
+  const requesterDid = notificationValue(payload?.requesterDid, payload?.requester_did, body?.requesterDid, body?.requester_did);
+  const rejectReason = notificationValue(payload?.rejectReason, body?.rejectReason, payload?.reason, body?.reason);
+  const refundAmount = notificationValue(payload?.refund_amount, payload?.refundAmount, body?.refund_amount, body?.refundAmount);
+  const refundChain = notificationValue(payload?.refund_chain, payload?.refundChain, body?.refund_chain, body?.refundChain);
+  const refundDestination = notificationValue(payload?.refund_destination, payload?.refundDestination, body?.refund_destination, body?.refundDestination);
+  const sourceLabel = notificationValue(payload?.sourceLabel, body?.sourceLabel);
+  const lines = [];
+
+  const addHeader = (header) => lines.push(sourceLabel ? `[${sourceLabel}]
+${header}` : header);
+
+  switch (eventType) {
+    case 'order_created':
+      addHeader('📥 收到新订单');
+      appendNotificationLine(lines, '订单', orderId);
+      if (priceAmount !== undefined && priceAmount !== null && String(priceAmount) !== '') {
+        appendNotificationLine(lines, '金额', `$${priceAmount} USDC`);
+      }
+      appendNotificationLine(lines, '链', chain || 'base');
+      appendNotificationLine(lines, '来自', requesterDid);
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      lines.push('下一步: 审核后决定是否接单');
+      break;
+    case 'order_created_auto_accept_skipped':
+      addHeader('⏸️ 未自动接单');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '原因', payload?.reasonCode || body?.reasonCode || '未说明');
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      lines.push('下一步: 请人工判断是否接单');
+      break;
+    case 'order_accepted':
+      addHeader('📋 订单已被接单');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '链', chain);
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      lines.push('执行方已开始处理，进入里程碑阶段');
+      break;
+    case 'escrow_confirmed':
+      addHeader('🔒 托管已确认');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '链', chain);
+      appendNotificationLine(lines, '金额', priceAmount !== undefined && priceAmount !== null && String(priceAmount) !== '' ? `$${priceAmount} USDC` : '');
+      lines.push('链上托管已完成，等待里程碑方案确认');
+      break;
+    case 'milestone_plan_confirmed':
+      addHeader('🚀 里程碑方案已确认');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '当前里程碑', milestoneDescription);
+      appendNotificationLine(lines, '进度', `1/${totalMilestones || 5}`);
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      break;
+    case 'milestone_submitted':
+      addHeader(`📝 里程碑 M${milestoneLabel ?? '?'} 已提交`);
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '目标', milestoneDescription);
+      appendNotificationLine(lines, '提交次数', submitCount && maxAttempts ? `${submitCount}/${maxAttempts}` : submitCount);
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '提交内容', resultSummary);
+      lines.push('下一步: 等待审核');
+      break;
+    case 'milestone_verified':
+      addHeader(`✅ 里程碑 M${milestoneLabel ?? '?'} 审核通过`);
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '目标', milestoneDescription);
+      appendNotificationLine(lines, '进度', progressText || (totalMilestones ? `${Number(milestoneLabel ?? 0) + 1}/${totalMilestones}` : ''));
+      if (payload?.arbitrated === true || body?.arbitrated === true) {
+        lines.push('结果: 本次通过来自平台自动仲裁后的继续推进');
+      }
+      appendNotificationSection(lines, '本次提交内容', resultSummary);
+      appendNotificationLine(lines, '下一里程碑', nextMilestoneDescription);
+      break;
+    case 'milestone_rejected':
+      addHeader(`❌ 里程碑 M${milestoneLabel ?? '?'} 被拒绝`);
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '目标', milestoneDescription);
+      appendNotificationLine(lines, '拒绝次数', submitCount && maxAttempts ? `${submitCount}/${maxAttempts}` : submitCount);
+      appendNotificationLine(lines, '原因', rejectReason || '未说明');
+      appendNotificationSection(lines, '订单要求', orderDescription);
+      if (Number(payload?.submitCount || body?.submitCount || 0) >= 3 || payload?.maxReached || body?.maxReached) {
+        lines.push('仲裁状态: 由于连续 3 次被拒，平台已自动发起仲裁');
+      }
+      break;
+    case 'milestone_arbitration_passed':
+      addHeader('⚖️ 仲裁通过');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '里程碑', milestoneLabel === undefined ? '' : `M${milestoneLabel}`);
+      appendNotificationLine(lines, '当前进度', progressText || notificationValue(payload?.currentMilestone, body?.currentMilestone));
+      appendNotificationLine(lines, '原因', rejectReason || '未说明');
+      lines.push('结果: 平台自动仲裁已通过，订单继续推进');
+      break;
+    case 'milestone_arbitration_failed':
+      addHeader('⚖️ 仲裁失败');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '里程碑', milestoneLabel === undefined ? '' : `M${milestoneLabel}`);
+      appendNotificationLine(lines, '已完成里程碑', notificationValue(payload?.completedMilestones, body?.completedMilestones));
+      appendNotificationLine(lines, '原因', rejectReason || '未说明');
+      appendNotificationLine(lines, '退款金额', refundAmount ? `$${refundAmount} USDC` : '');
+      appendNotificationLine(lines, '退款链', refundChain);
+      appendNotificationLine(lines, '退款地址', refundDestination);
+      lines.push('结果: 平台自动仲裁失败，订单将结束');
+      break;
+    case 'order_completed':
+      addHeader('📦 订单已提交完成');
+      appendNotificationLine(lines, '订单', orderId);
+      lines.push('等待对方确认或系统自动确认');
+      break;
+    case 'order_cancelled':
+      addHeader('🛑 订单已取消');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '原因', rejectReason || '未说明');
+      appendNotificationLine(lines, '退款金额', refundAmount ? `$${refundAmount} USDC` : '');
+      appendNotificationLine(lines, '退款链', refundChain);
+      appendNotificationLine(lines, '退款地址', refundDestination);
+      if (payload?.refund_initiated === true || body?.refund_initiated === true) {
+        lines.push('退款状态: 已发起原路退回');
+      }
+      break;
+    case 'order_expired':
+      addHeader('⌛ 订单已过期');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '原因', rejectReason || '未说明');
+      lines.push('系统已自动结束该订单');
+      break;
+    case 'dispute_created':
+      addHeader('⚖️ 争议已创建');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '原因', rejectReason);
+      lines.push('请尽快补充证据');
+      break;
+    case 'dispute_resolved':
+      addHeader('🧾 争议已处理完成');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '结果', notificationValue(payload?.result, payload?.resolution, body?.result, body?.resolution, '已裁定'));
+      break;
+    case 'order_settled':
+      addHeader('💰 订单已结算完成');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '金额', priceAmount !== undefined && priceAmount !== null && String(priceAmount) !== '' ? `$${priceAmount} USDC` : '');
+      lines.push('USDC 已支付');
+      break;
+    default:
+      addHeader('🔔 平台事件更新');
+      appendNotificationLine(lines, '事件', eventType);
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationSection(lines, 'payload', JSON.stringify(payload, null, 2));
+      break;
+  }
+
+  return lines.filter((line, index, arr) => {
+    if (!line && !arr[index - 1]) return false;
+    return true;
+  }).join('\n').trim();
+}
+
 async function pushTradeNotification(eventType, payload, body) {
   const orderId = payload?.orderId || body?.orderId || '';
   const { targets, enabled } = resolveNotifyTargets(orderId);
   if (enabled.length === 0) return;
 
-  const chainLabel = (p) => {
-    const c = p?.chain || body?.chain || '';
-    // NOTE: fast-coop 分支为与合作方集成预留,合作推进中未开放正式路径,保留仅为避免订单链路解析失败
-    if (c === 'fast-coop') return ' (Fast)';
-    if (c === 'bsc') return ' (BSC)';
-    return '';
-  };
   const autoAcceptReasonText = (reason) => {
     if (reason === 'missing_recommended_actions') return '平台未提供可执行接单动作';
     if (reason === 'missing_accept_action') return '事件里没有 accept 动作';
@@ -1145,135 +1369,15 @@ async function pushTradeNotification(eventType, payload, body) {
     return reason || '未说明';
   };
 
-  const templates = {
-    'order_created': (p) => {
-      const requester = p.requesterDid || p.requester_did || body?.requesterDid || body?.requester_did || '';
-      const requesterLine = requester ? `
-来自: ${requester}` : '';
-      return `📥 收到新订单
-订单: ${p.orderId || body?.orderId || '?'}
-金额: $${p.priceAmount ?? '?'} USDC${requesterLine}
-请审核后决定是否接单`;
-    },
-    'order_created_auto_accept_skipped': (p) => `⏸️ 未自动接单
-订单: ${p.orderId || body?.orderId || '?'}
-原因: ${autoAcceptReasonText(p.reasonCode)}
-请人工判断是否接单`,
-    'order_accepted': (p) => `📋 订单已被接单
-订单: ${p.orderId || body?.orderId || '?'}
-执行方已开始处理，进入里程碑阶段`,
-    'escrow_confirmed': (p) => `🔒 托管已确认
-订单: ${p.orderId || body?.orderId || '?'}
-链上托管已完成，等待里程碑方案确认`,
-    'milestone_plan_confirmed': (p) => {
-      const desc = p.milestoneDescription || p.nextMilestoneDescription || '';
-      const progress = p.totalMilestones ? `
-进度: 1/${p.totalMilestones}` : '';
-      return `🚀 里程碑方案已确认
-订单: ${p.orderId || body?.orderId || '?'}${desc ? `
-当前里程碑: ${desc}` : ''}${progress}`;
-    },
-    'milestone_submitted': (p) => {
-      const desc = p.milestoneDescription ? `
-目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `
-提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      return `📝 里程碑 M${p.milestoneIndex ?? '?'} 已提交
-订单: ${p.orderId || body?.orderId || '?'}${desc}${content}
-等待审核`;
-    },
-    'milestone_verified': (p) => {
-      const desc = p.milestoneDescription ? `
-目标: ${p.milestoneDescription}` : '';
-      const content = p.resultSummary ? `
-提交内容: ${String(p.resultSummary).substring(0, 200)}` : '';
-      const progress = p.totalMilestones ? `
-进度: ${(p.milestoneIndex ?? 0) + 1}/${p.totalMilestones}` : '';
-      return `✅ 里程碑 M${p.milestoneIndex ?? '?'} 审核通过
-订单: ${p.orderId || body?.orderId || '?'}${desc}${content}${progress}`;
-    },
-    'milestone_rejected': (p) => {
-      const desc = p.milestoneDescription ? `
-目标: ${p.milestoneDescription}` : '';
-      const submitCount = Number(p.submitCount || 0);
-      const arbitrationNote = submitCount >= 3 || p.maxReached
-        ? `
-由于连续 3 次被拒，平台已自动发起仲裁，请等待仲裁结果`
-        : '';
-      return `❌ 里程碑 M${p.milestoneIndex ?? '?'} 被拒绝
-订单: ${p.orderId || body?.orderId || '?'}${desc}
-原因: ${p.rejectReason || '未说明'}${arbitrationNote}`;
-    },
-    'milestone_arbitration_passed': (p) => {
-      const progress = Number.isFinite(Number(p.currentMilestone)) ? `
-当前进度: ${p.currentMilestone}/5` : '';
-      return `⚖️ 仲裁通过
-订单: ${p.orderId || body?.orderId || '?'}
-里程碑: M${p.milestoneIndex ?? '?'}
-结果: 平台自动仲裁已通过，订单继续推进${progress}
-原因: ${p.reason || '未说明'}`;
-    },
-    'milestone_arbitration_failed': (p) => {
-      const completed = Number.isFinite(Number(p.completedMilestones)) ? `
-已完成里程碑: ${p.completedMilestones}/5` : '';
-      const refundAmount = (p.refund_amount ?? p.refundAmount) ? `
-退款金额: $${p.refund_amount ?? p.refundAmount} USDC` : '';
-      const refundChain = (p.refund_chain || p.refundChain) ? `
-退款链: ${p.refund_chain || p.refundChain}` : '';
-      const refundDestination = (p.refund_destination || p.refundDestination) ? `
-退款地址: ${p.refund_destination || p.refundDestination}` : '';
-      return `⚖️ 仲裁失败
-订单: ${p.orderId || body?.orderId || '?'}
-里程碑: M${p.milestoneIndex ?? '?'}
-结果: 平台自动仲裁失败，订单将结束${completed}${refundAmount}${refundChain}${refundDestination}
-原因: ${p.reason || '未说明'}`;
-    },
-    'order_completed': (p) => `📦 订单已提交完成
-订单: ${p.orderId || body?.orderId || '?'}
-等待对方确认或系统自动确认`,
-    'order_cancelled': (p) => {
-      const refundAmount = (p.refund_amount ?? p.refundAmount) ? `
-退款金额: $${p.refund_amount ?? p.refundAmount} USDC` : '';
-      const refundChain = (p.refund_chain || p.refundChain) ? `
-退款链: ${p.refund_chain || p.refundChain}` : '';
-      const refundDestination = (p.refund_destination || p.refundDestination) ? `
-退款地址: ${p.refund_destination || p.refundDestination}` : '';
-      const refundStatus = p.refund_initiated === true ? `
-退款状态: 已发起原路退回` : '';
-      return `🛑 订单已取消
-订单: ${p.orderId || body?.orderId || '?'}${refundAmount}${refundChain}${refundDestination}${refundStatus}
-原因: ${p.reason || '未说明'}`;
-    },
-    'order_expired': (p) => `⌛ 订单已过期
-订单: ${p.orderId || p.order_id || body?.orderId || body?.order_id || '?'}
-原因: ${p.reason || '未说明'}
-系统已自动结束该订单`,
-    'dispute_created': (p) => `⚖️ 争议已创建
-订单: ${p.orderId || body?.orderId || '?'}
-请尽快补充证据`,
-    'dispute_resolved': (p) => `🧾 争议已处理完成
-订单: ${p.orderId || body?.orderId || '?'}
-结果: ${p.result || p.resolution || '已裁定'}`,
-    'order_settled': (p) => {
-      const amount = p.priceAmount ? `
-金额: $${p.priceAmount} USDC` : '';
-      return `💰 订单已结算完成
-订单: ${p.orderId || body?.orderId || '?'}${amount}
-USDC 已支付`;
-    },
+  const normalizedPayload = {
+    ...payload,
+    reasonCodeText: payload?.reasonCode ? autoAcceptReasonText(payload.reasonCode) : undefined,
   };
-  const withSourceLabel = (text) => {
-    const label = String(payload?.sourceLabel || body?.sourceLabel || '').trim();
-    if (!label) return text;
-    if (typeof text !== 'string' || !text) return `[${label}]`;
-    return text.startsWith(`[${label}]`) ? text : `[${label}]
-${text}`;
-  };
-  const tmpl = templates[eventType];
-  const orderIdText = orderId || '?';
-  const message = withSourceLabel(tmpl ? tmpl(payload) : `🔔 平台事件更新
-事件: ${eventType}
-订单: ${orderIdText}`);
+  if (eventType === 'order_created_auto_accept_skipped' && normalizedPayload.reasonCodeText) {
+    normalizedPayload.reasonCode = normalizedPayload.reasonCodeText;
+  }
+  const message = buildTradeNotificationMessage(eventType, normalizedPayload, body);
+  const chunks = splitTelegramText(message);
 
   for (const target of enabled) {
     try {
@@ -1282,27 +1386,31 @@ ${text}`;
           log({ event: 'trade_notify_target_skipped', eventType, channel: 'telegram', target: target.id || target.target, reason: 'missing_bot_token' });
           continue;
         }
-        const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: target.target, text: message }),
-          signal: AbortSignal.timeout(5000),
-        });
-        const data = await resp.json().catch(() => null);
-        if (!resp.ok || data?.ok === false) {
-          log({ event: 'trade_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
-          continue;
+        for (const chunk of chunks) {
+          const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: target.target, text: chunk, disable_web_page_preview: true }),
+            signal: AbortSignal.timeout(5000),
+          });
+          const data = await resp.json().catch(() => null);
+          if (!resp.ok || data?.ok === false) {
+            log({ event: 'trade_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
+            continue;
+          }
         }
       } else if (target.channel === 'gateway') {
-        const delivery = await invokeGatewayTelegramMessage(target.target, message, 5000);
-        if (!delivery.ok) {
-          log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
-          continue;
+        for (const chunk of chunks) {
+          const delivery = await invokeGatewayTelegramMessage(target.target, chunk, 5000);
+          if (!delivery.ok) {
+            log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
+            continue;
+          }
         }
       }
       target.lastUsedAt = new Date().toISOString();
       markNotifyTargetUsed(targets, target, target.lastUsedAt);
-      log({ event: 'trade_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt });
+      log({ event: 'trade_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt, chunkCount: chunks.length });
     } catch (e) {
       log({ event: 'trade_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
     }
