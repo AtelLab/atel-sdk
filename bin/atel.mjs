@@ -153,6 +153,7 @@ const RESULT_PUSH_QUEUE_FILE = resolve(ATEL_DIR, 'pending-result-pushes.json');
 const NOTIFY_TARGETS_FILE = resolve(ATEL_DIR, 'notify-targets.json');
 const NOTIFY_ROUTES_FILE = resolve(ATEL_DIR, 'notify-routes.json');
 const NOTIFY_CONSENTS_FILE = resolve(ATEL_DIR, 'notify-consents.json');
+const NOTIFY_PROGRESS_FILE = resolve(ATEL_DIR, 'notify-progress.json');
 const TELEGRAM_UPDATES_STATE_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-updates.json');
 const TELEGRAM_BINDINGS_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'deploy', 'sdk-telegram-bindings.json');
 const OPENCLAW_CONFIG_FILE = resolve(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
@@ -457,6 +458,83 @@ function loadNotifyRoutes() {
 function saveNotifyRoutes(data) {
   ensureDir();
   writeFileSync(NOTIFY_ROUTES_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadNotifyProgress() {
+  try {
+    const data = JSON.parse(readFileSync(NOTIFY_PROGRESS_FILE, 'utf-8'));
+    if (!data || typeof data !== 'object') return { version: 1, a2b: {}, deliveries: {} };
+    if (!data.a2b || typeof data.a2b !== 'object') data.a2b = {};
+    if (!data.deliveries || typeof data.deliveries !== 'object') data.deliveries = {};
+    return data;
+  } catch {
+    return { version: 1, a2b: {}, deliveries: {} };
+  }
+}
+
+function saveNotifyProgress(data) {
+  ensureDir();
+  writeFileSync(NOTIFY_PROGRESS_FILE, JSON.stringify(data, null, 2));
+}
+
+function buildTradeNotifyDeliverySlot(eventType, dedupeKey, channel, target) {
+  const normalizedEventType = String(eventType || '').trim();
+  const normalizedDedupeKey = String(dedupeKey || '').trim();
+  const normalizedChannel = String(channel || '').trim();
+  const normalizedTarget = String(target || '').trim();
+  if (!normalizedEventType || !normalizedDedupeKey || !normalizedChannel || !normalizedTarget) return '';
+  return `${normalizedEventType}:${normalizedDedupeKey}:${normalizedChannel}:${normalizedTarget}`;
+}
+
+function hashTradeNotificationChunks(chunks = []) {
+  const hash = crypto.createHash('sha1');
+  hash.update(JSON.stringify(Array.isArray(chunks) ? chunks : [String(chunks || '')]));
+  return hash.digest('hex');
+}
+
+function getTradeNotifyDelivery(progress, eventType, dedupeKey, channel, target) {
+  const slot = buildTradeNotifyDeliverySlot(eventType, dedupeKey, channel, target);
+  if (!slot) return null;
+  return progress?.deliveries?.[slot] || null;
+}
+
+function setTradeNotifyDelivery(progress, eventType, dedupeKey, channel, target, patch = {}) {
+  const slot = buildTradeNotifyDeliverySlot(eventType, dedupeKey, channel, target);
+  if (!slot) return null;
+  if (!progress.deliveries || typeof progress.deliveries !== 'object') progress.deliveries = {};
+  const next = {
+    ...(progress.deliveries[slot] || {}),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  progress.deliveries[slot] = next;
+  return next;
+}
+
+function getA2BProgressBinding(progress, orderId, channel, target) {
+  const normalizedOrderId = String(orderId || '').trim();
+  const normalizedChannel = String(channel || '').trim();
+  const normalizedTarget = String(target || '').trim();
+  if (!normalizedOrderId || !normalizedChannel || !normalizedTarget) return null;
+  const key = `${normalizedChannel}:${normalizedTarget}`;
+  return progress?.a2b?.[normalizedOrderId]?.[key] || null;
+}
+
+function setA2BProgressBinding(progress, orderId, channel, target, patch = {}) {
+  const normalizedOrderId = String(orderId || '').trim();
+  const normalizedChannel = String(channel || '').trim();
+  const normalizedTarget = String(target || '').trim();
+  if (!normalizedOrderId || !normalizedChannel || !normalizedTarget) return null;
+  if (!progress.a2b || typeof progress.a2b !== 'object') progress.a2b = {};
+  if (!progress.a2b[normalizedOrderId] || typeof progress.a2b[normalizedOrderId] !== 'object') progress.a2b[normalizedOrderId] = {};
+  const key = `${normalizedChannel}:${normalizedTarget}`;
+  const next = {
+    ...(progress.a2b[normalizedOrderId][key] || {}),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  progress.a2b[normalizedOrderId][key] = next;
+  return next;
 }
 
 function getPrimaryTelegramTarget() {
@@ -1144,6 +1222,13 @@ function appendNotificationSection(lines, title, value) {
   lines.push(text);
 }
 
+function summarizeNotificationText(value, maxLength = 220) {
+  const text = notificationValue(value).replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1).trim()}…`;
+}
+
 function splitTelegramText(text, maxLength = 3500) {
   const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
   if (!normalized) return [];
@@ -1184,7 +1269,7 @@ function splitTelegramText(text, maxLength = 3500) {
   return chunks.length > 0 ? chunks : [normalized];
 }
 
-function buildTradeNotificationMessage(eventType, payload = {}, body = {}) {
+function buildTradeNotificationMessage(eventType, payload = {}, body = {}, currentDid = '') {
   const orderId = notificationValue(payload?.orderId, body?.orderId, payload?.order_id, body?.order_id, '?');
   const milestoneLabel = payload?.milestoneIndex ?? body?.milestoneIndex;
   const currentMilestone = payload?.currentMilestone ?? body?.currentMilestone;
@@ -1196,19 +1281,55 @@ function buildTradeNotificationMessage(eventType, payload = {}, body = {}) {
   const maxAttempts = notificationValue(payload?.maxAttempts, body?.maxAttempts, submitCount ? '3' : '');
   const priceAmount = payload?.priceAmount ?? body?.priceAmount;
   const chain = notificationValue(payload?.chain, body?.chain);
+  const intentId = notificationValue(payload?.intentId, body?.intentId);
+  const productId = notificationValue(payload?.productId, body?.productId);
+  const invoiceId = notificationValue(payload?.invoiceId, body?.invoiceId);
+  const paymentAddress = notificationValue(payload?.paymentAddress, body?.paymentAddress);
+  const amountUsdc = notificationValue(payload?.amountUsdc, body?.amountUsdc, payload?.paymentAmount, body?.paymentAmount);
+  const contractTx = notificationValue(payload?.contractTx, body?.contractTx, payload?.confirmTx, body?.confirmTx, payload?.commitTx, body?.commitTx, payload?.txHash, body?.txHash);
+  const approveTx = notificationValue(payload?.approveTx, body?.approveTx);
+  const depositTx = notificationValue(payload?.depositTx, body?.depositTx);
+  const auditRoot = notificationValue(payload?.auditRoot, body?.auditRoot);
+  const deliveryCode = notificationValue(payload?.code, body?.code);
+  const deliveryPin = notificationValue(payload?.pin, body?.pin);
+  const deliveryLink = notificationValue(payload?.link, body?.link);
+  const deliveryInstructions = notificationValue(payload?.instructions, body?.instructions);
+  const deliveryExpiresAt = notificationValue(payload?.expiresAt, body?.expiresAt);
+  const deliveryOther = notificationValue(payload?.other, body?.other);
   const orderDescription = notificationValue(payload?.orderDescription, body?.orderDescription, payload?.description, body?.description);
+  const shortOrderDescription = summarizeNotificationText(orderDescription, 180);
   const resultSummary = notificationValue(payload?.resultSummary, body?.resultSummary);
+  const shortResultSummary = summarizeNotificationText(resultSummary, 200);
   const milestoneDescription = notificationValue(payload?.milestoneDescription, body?.milestoneDescription);
   const nextMilestoneDescription = notificationValue(payload?.nextMilestoneDescription, body?.nextMilestoneDescription);
   const requesterDid = notificationValue(payload?.requesterDid, payload?.requester_did, body?.requesterDid, body?.requester_did);
+  const executorDid = notificationValue(payload?.executorDid, payload?.executor_did, body?.executorDid, body?.executor_did);
   const rejectReason = notificationValue(payload?.rejectReason, body?.rejectReason, payload?.reason, body?.reason);
   const refundAmount = notificationValue(payload?.refund_amount, payload?.refundAmount, body?.refund_amount, body?.refundAmount);
   const refundChain = notificationValue(payload?.refund_chain, payload?.refundChain, body?.refund_chain, body?.refundChain);
   const refundDestination = notificationValue(payload?.refund_destination, payload?.refundDestination, body?.refund_destination, body?.refundDestination);
   const sourceLabel = notificationValue(payload?.sourceLabel, body?.sourceLabel);
+  const searchQuery = notificationValue(payload?.query, body?.query);
+  const searchCountry = notificationValue(payload?.country, body?.country);
+  const productName = notificationValue(payload?.productName, body?.productName, payload?.name, body?.name);
+  const estimatedPriceUsdc = notificationValue(payload?.estimatedPriceUsdc, body?.estimatedPriceUsdc);
+  const quotedPriceUsdc = notificationValue(payload?.quotedPriceUsdc, body?.quotedPriceUsdc);
+  const recommendedMaxAmountUsdc = notificationValue(payload?.recommendedMaxAmountUsdc, body?.recommendedMaxAmountUsdc);
+  const previewInvoiceId = notificationValue(payload?.previewInvoiceId, body?.previewInvoiceId);
+  const invoiceStatus = notificationValue(payload?.invoiceStatus, body?.invoiceStatus, payload?.previewInvoiceStatus, body?.previewInvoiceStatus);
+  const searchTotal = notificationValue(payload?.total, body?.total);
+  const searchReturned = notificationValue(payload?.returned, body?.returned);
+  const searchProducts = Array.isArray(payload?.products) ? payload.products : (Array.isArray(body?.products) ? body.products : []);
+  const warningList = Array.isArray(payload?.warnings) ? payload.warnings : (Array.isArray(body?.warnings) ? body.warnings : []);
   const lines = [];
 
-  const addHeader = (header) => lines.push(sourceLabel ? `[${sourceLabel}]
+  const currentHostRaw = String(process.env.ATEL_NODE_LABEL || process.env.HOSTNAME || process.env.COMPUTERNAME || '').trim();
+  const currentHostTag = currentHostRaw === 'VM-0-7-ubuntu' ? '129' : (currentHostRaw === 'VM-0-10-ubuntu' ? '180' : currentHostRaw);
+  const currentRoleTag = currentDid && requesterDid && currentDid === requesterDid
+    ? 'Requester'
+    : (currentDid && executorDid && currentDid === executorDid ? 'Executor' : '');
+  const sourcePrefix = [sourceLabel, currentHostTag, currentRoleTag].filter(Boolean).join(' ');
+  const addHeader = (header) => lines.push(sourcePrefix ? `[${sourcePrefix}]
 ${header}` : header);
 
   switch (eventType) {
@@ -1220,21 +1341,21 @@ ${header}` : header);
       }
       appendNotificationLine(lines, '链', chain || 'base');
       appendNotificationLine(lines, '来自', requesterDid);
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
       lines.push('下一步: 审核后决定是否接单');
       break;
     case 'order_created_auto_accept_skipped':
       addHeader('⏸️ 未自动接单');
       appendNotificationLine(lines, '订单', orderId);
       appendNotificationLine(lines, '原因', payload?.reasonCode || body?.reasonCode || '未说明');
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
       lines.push('下一步: 请人工判断是否接单');
       break;
     case 'order_accepted':
       addHeader('📋 订单已被接单');
       appendNotificationLine(lines, '订单', orderId);
       appendNotificationLine(lines, '链', chain);
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
       lines.push('执行方已开始处理，进入里程碑阶段');
       break;
     case 'escrow_confirmed':
@@ -1249,14 +1370,22 @@ ${header}` : header);
       appendNotificationLine(lines, '订单', orderId);
       appendNotificationLine(lines, '当前里程碑', milestoneDescription);
       appendNotificationLine(lines, '进度', `1/${totalMilestones || 5}`);
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
+      break;
+    case 'task_start':
+      addHeader('▶️ 订单已开始执行');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '当前里程碑', milestoneDescription);
+      appendNotificationLine(lines, '进度', milestoneLabel !== undefined && totalMilestones ? `${Number(milestoneLabel) + 1}/${totalMilestones}` : progressText);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
+      lines.push('状态: 执行方已经开始处理当前阶段');
       break;
     case 'milestone_submitted':
       addHeader(`📝 里程碑 M${milestoneLabel ?? '?'} 已提交`);
       appendNotificationLine(lines, '订单', orderId);
       appendNotificationLine(lines, '目标', milestoneDescription);
       appendNotificationLine(lines, '提交次数', submitCount && maxAttempts ? `${submitCount}/${maxAttempts}` : submitCount);
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
       appendNotificationSection(lines, '提交内容', resultSummary);
       lines.push('下一步: 等待审核');
       break;
@@ -1277,7 +1406,7 @@ ${header}` : header);
       appendNotificationLine(lines, '目标', milestoneDescription);
       appendNotificationLine(lines, '拒绝次数', submitCount && maxAttempts ? `${submitCount}/${maxAttempts}` : submitCount);
       appendNotificationLine(lines, '原因', rejectReason || '未说明');
-      appendNotificationSection(lines, '订单要求', orderDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
       if (Number(payload?.submitCount || body?.submitCount || 0) >= 3 || payload?.maxReached || body?.maxReached) {
         lines.push('仲裁状态: 由于连续 3 次被拒，平台已自动发起仲裁');
       }
@@ -1340,11 +1469,112 @@ ${header}` : header);
       appendNotificationLine(lines, '金额', priceAmount !== undefined && priceAmount !== null && String(priceAmount) !== '' ? `$${priceAmount} USDC` : '');
       lines.push('USDC 已支付');
       break;
+    case 'a2b_search_completed':
+      addHeader('🔎 已找到可选商品');
+      appendNotificationLine(lines, '搜索词', searchQuery);
+      appendNotificationLine(lines, '国家', searchCountry);
+      appendNotificationLine(lines, '结果', searchReturned && searchTotal ? `${searchReturned}/${searchTotal}` : (searchTotal || searchReturned));
+      if (searchProducts.length > 0) {
+        lines.push('可选商品:');
+        for (const [index, item] of searchProducts.slice(0, 5).entries()) {
+          const itemName = notificationValue(item?.name, item?.productName, item?.productId, '未命名商品');
+          const itemId = notificationValue(item?.productId);
+          const itemEstimate = notificationValue(item?.estimatedStartingPriceUsdc, item?.estimatedPriceUsdc, item?.quotedPriceUsdc);
+          let line = `${index + 1}. ${itemName}`;
+          if (itemEstimate) line += ` 约 $${itemEstimate} USDC`;
+          if (itemId) line += ` (${itemId})`;
+          lines.push(line);
+        }
+      }
+      lines.push('下一步: 选一个商品，再查看实时报价');
+      break;
+    case 'a2b_quote_previewed':
+      addHeader('💬 已生成实时报价');
+      appendNotificationLine(lines, '商品', productName || productId);
+      appendNotificationLine(lines, '面额', notificationValue(payload?.value, body?.value));
+      appendNotificationLine(lines, '参考价', estimatedPriceUsdc ? `$${estimatedPriceUsdc} USDC` : '');
+      appendNotificationLine(lines, '实时报价', quotedPriceUsdc ? `$${quotedPriceUsdc} USDC` : '');
+      appendNotificationLine(lines, '建议上限', recommendedMaxAmountUsdc ? `$${recommendedMaxAmountUsdc} USDC` : '');
+      appendNotificationLine(lines, '支付链', chain || 'base');
+      appendNotificationLine(lines, '支付单', previewInvoiceId || invoiceId);
+      appendNotificationLine(lines, '支付地址', paymentAddress);
+      appendNotificationLine(lines, '状态', invoiceStatus || 'unpaid');
+      if (warningList.length > 0) appendNotificationSection(lines, '提醒', warningList.join('\n'));
+      lines.push('下一步: 确认后再创建订单并支付');
+      break;
+    case 'a2b_order_created':
+      addHeader('🛒 买卡订单已创建');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '商品类型', notificationValue(payload?.category, body?.category));
+      appendNotificationLine(lines, '商户', notificationValue(payload?.merchant, body?.merchant, 'Bitrefill'));
+      const maxBudget = notificationValue(payload?.maxAmountUsdc, body?.maxAmountUsdc);
+      appendNotificationLine(lines, '预算上限', amountUsdc ? `$${amountUsdc} USDC` : (maxBudget ? `$${maxBudget} USDC` : ''));
+      appendNotificationLine(lines, '链', chain || 'base');
+      appendNotificationLine(lines, '链上交易', contractTx);
+      lines.push('下一步: 平台将继续锁仓并生成支付单');
+      break;
+    case 'a2b_deposit_confirmed':
+      addHeader('🔒 买卡资金已锁定');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '金额', amountUsdc ? `$${amountUsdc} USDC` : '');
+      appendNotificationLine(lines, '链', chain || 'base');
+      appendNotificationLine(lines, '授权交易', approveTx);
+      appendNotificationLine(lines, '锁仓交易', depositTx);
+      lines.push('下一步: 正在向商户创建支付单');
+      break;
+    case 'a2b_invoice_created':
+      addHeader('🧾 买卡支付单已生成');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '商品', productId);
+      appendNotificationLine(lines, '面额', notificationValue(payload?.value, body?.value));
+      appendNotificationLine(lines, '支付金额', amountUsdc ? `$${amountUsdc} USDC` : '');
+      appendNotificationLine(lines, '支付地址', paymentAddress);
+      appendNotificationLine(lines, '支付单', invoiceId);
+      appendNotificationLine(lines, '提交交易', contractTx);
+      lines.push('下一步: 平台将执行支付');
+      break;
+    case 'a2b_payment_executed':
+      addHeader('💸 买卡支付已发送');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '支付金额', amountUsdc ? `$${amountUsdc} USDC` : '');
+      appendNotificationLine(lines, '链', chain || 'base');
+      appendNotificationLine(lines, '支付交易', contractTx);
+      appendNotificationLine(lines, '审计根', auditRoot);
+      lines.push('下一步: 等待商户返回卡密/兑换信息');
+      break;
+    case 'a2b_delivery_pending':
+      addHeader('⏳ 买卡结果还在等待');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '支付单', invoiceId);
+      appendNotificationLine(lines, '说明', notificationValue(payload?.detail, body?.detail));
+      lines.push('平台会继续等待商户返回结果');
+      break;
+    case 'a2b_delivery_confirmed':
+      addHeader('🎁 买卡结果已送达');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '商品', productId);
+      appendNotificationLine(lines, '支付单', invoiceId);
+      appendNotificationLine(lines, '确认交易', contractTx);
+      appendNotificationLine(lines, '兑换码', deliveryCode);
+      appendNotificationLine(lines, 'PIN', deliveryPin);
+      appendNotificationLine(lines, '链接', deliveryLink);
+      appendNotificationLine(lines, '到期时间', deliveryExpiresAt);
+      appendNotificationSection(lines, '使用说明', deliveryInstructions);
+      appendNotificationSection(lines, '补充信息', deliveryOther);
+      break;
     default:
       addHeader('🔔 平台事件更新');
       appendNotificationLine(lines, '事件', eventType);
       appendNotificationLine(lines, '订单', orderId);
-      appendNotificationSection(lines, 'payload', JSON.stringify(payload, null, 2));
+      appendNotificationLine(lines, '当前里程碑', milestoneDescription);
+      appendNotificationSection(lines, '订单要求', shortOrderDescription);
+      lines.push('详细调试内容已写入后台日志，不再直接发送给用户');
       break;
   }
 
@@ -1352,6 +1582,159 @@ ${header}` : header);
     if (!line && !arr[index - 1]) return false;
     return true;
   }).join('\n').trim();
+}
+
+function isA2BTradeEvent(eventType) {
+  return [
+    'a2b_order_created',
+    'a2b_deposit_confirmed',
+    'a2b_invoice_created',
+    'a2b_payment_executed',
+    'a2b_delivery_pending',
+    'a2b_delivery_confirmed',
+  ].includes(String(eventType || '').trim());
+}
+
+function getA2BProgressMeta(eventType) {
+  switch (eventType) {
+    case 'a2b_order_created':
+      return { done: 1, active: 2, status: '已创建订单，准备锁定资金' };
+    case 'a2b_deposit_confirmed':
+      return { done: 2, active: 3, status: '已锁定资金，正在生成支付单' };
+    case 'a2b_invoice_created':
+      return { done: 3, active: 4, status: '支付单已生成，准备执行支付' };
+    case 'a2b_payment_executed':
+      return { done: 4, active: 5, status: '支付已发送，正在等待商户返回结果' };
+    case 'a2b_delivery_pending':
+      return { done: 4, active: 5, status: '商户处理中，正在等待最终结果' };
+    case 'a2b_delivery_confirmed':
+      return { done: 5, active: 0, status: '购买成功' };
+    default:
+      return { done: 0, active: 1, status: '处理中' };
+  }
+}
+
+function buildA2BProgressCard(eventType, payload = {}, body = {}) {
+  const sourceLabel = notificationValue(payload?.sourceLabel, body?.sourceLabel, 'ATEL A2B');
+  const orderId = notificationValue(payload?.orderId, body?.orderId, payload?.order_id, body?.order_id, '?');
+  const intentId = notificationValue(payload?.intentId, body?.intentId);
+  const product = notificationValue(payload?.productId, body?.productId, payload?.category, body?.category, payload?.merchant, body?.merchant, '礼品卡');
+  const amount = notificationValue(payload?.amountUsdc, body?.amountUsdc, payload?.paymentAmount, body?.paymentAmount, payload?.maxAmountUsdc, body?.maxAmountUsdc);
+  const chain = notificationValue(payload?.chain, body?.chain, 'base');
+  const invoiceId = notificationValue(payload?.invoiceId, body?.invoiceId);
+  const detail = notificationValue(payload?.detail, body?.detail);
+  const meta = getA2BProgressMeta(eventType);
+  const steps = [
+    '已创建订单',
+    '已锁定资金',
+    '已生成支付单',
+    '已完成支付',
+    '已收到结果',
+  ];
+  const lines = [];
+  lines.push(sourceLabel ? `[${sourceLabel}]` : '[ATEL A2B]');
+  lines.push('🛒 买卡进度');
+  appendNotificationLine(lines, '订单', orderId);
+  appendNotificationLine(lines, '意图', intentId);
+  appendNotificationLine(lines, '商品', product);
+  appendNotificationLine(lines, '金额', amount ? `$${amount} USDC` : '');
+  appendNotificationLine(lines, '链', chain);
+  appendNotificationLine(lines, '支付单', invoiceId);
+  appendNotificationLine(lines, '当前状态', meta.status);
+  if (detail) appendNotificationLine(lines, '说明', detail);
+  lines.push('');
+  lines.push('进度:');
+  for (let i = 0; i < steps.length; i += 1) {
+    const stepNo = i + 1;
+    let prefix = '⬜';
+    if (stepNo <= meta.done) prefix = '✅';
+    else if (stepNo === meta.active) prefix = '🔄';
+    lines.push(`${prefix} ${stepNo}. ${steps[i]}`);
+  }
+  return lines.join('\n').trim();
+}
+
+async function sendTelegramText(target, text) {
+  const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: target.target, text, disable_web_page_preview: true }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || data?.ok === false) {
+    throw new Error(data?.description || `http_${resp.status}`);
+  }
+  return data?.result?.message_id || null;
+}
+
+async function editTelegramText(target, messageId, text) {
+  const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: target.target, message_id: messageId, text, disable_web_page_preview: true }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || data?.ok === false) {
+    const description = data?.description || `http_${resp.status}`;
+    if (String(description).toLowerCase().includes('message is not modified')) {
+      return messageId;
+    }
+    throw new Error(description);
+  }
+  return data?.result?.message_id || messageId;
+}
+
+async function deliverTextChunksToTarget(target, chunks) {
+  if (target.channel === 'telegram') {
+    if (!target.botToken) throw new Error('missing_bot_token');
+    let lastMessageId = null;
+    for (const chunk of chunks) {
+      lastMessageId = await sendTelegramText(target, chunk);
+    }
+    return { chunkCount: chunks.length, mode: 'send', messageId: lastMessageId };
+  }
+  if (target.channel === 'gateway') {
+    for (const chunk of chunks) {
+      const delivery = await invokeGatewayTelegramMessage(target.target, chunk, 5000);
+      if (!delivery.ok) throw new Error(delivery.error || delivery.reason || 'gateway_failed');
+    }
+    return { chunkCount: chunks.length, mode: 'send', messageId: null };
+  }
+  throw new Error(`unsupported_channel_${target.channel}`);
+}
+
+async function deliverA2BProgressCard(target, eventType, payload, body) {
+  const orderId = payload?.orderId || body?.orderId || '';
+  const progressText = buildA2BProgressCard(eventType, payload, body);
+  if (target.channel !== 'telegram') {
+    return deliverTextChunksToTarget(target, [progressText]);
+  }
+  if (!target.botToken) throw new Error('missing_bot_token');
+  const progress = loadNotifyProgress();
+  const binding = getA2BProgressBinding(progress, orderId, target.channel, target.target);
+  let mode = 'send';
+  let messageId = binding?.messageId || null;
+  if (messageId) {
+    try {
+      messageId = await editTelegramText(target, messageId, progressText);
+      mode = 'edit';
+    } catch {
+      messageId = null;
+    }
+  }
+  if (!messageId) {
+    messageId = await sendTelegramText(target, progressText);
+    mode = 'send';
+  }
+  setA2BProgressBinding(progress, orderId, target.channel, target.target, {
+    messageId,
+    eventType,
+    status: getA2BProgressMeta(eventType).status,
+  });
+  saveNotifyProgress(progress);
+  return { chunkCount: 1, mode, messageId };
 }
 
 async function pushTradeNotification(eventType, payload, body) {
@@ -1376,46 +1759,48 @@ async function pushTradeNotification(eventType, payload, body) {
   if (eventType === 'order_created_auto_accept_skipped' && normalizedPayload.reasonCodeText) {
     normalizedPayload.reasonCode = normalizedPayload.reasonCodeText;
   }
-  const message = buildTradeNotificationMessage(eventType, normalizedPayload, body);
+  const notificationDedupeKey = String(body?.dedupeKey || normalizedPayload?.dedupeKey || `${eventType}:${orderId}:${normalizedPayload?.milestoneIndex ?? normalizedPayload?.currentMilestone ?? ''}`).trim();
+  const currentDid = String(loadIdentity()?.did || '');
+  const message = buildTradeNotificationMessage(eventType, normalizedPayload, body, currentDid);
   const chunks = splitTelegramText(message);
+  const messageHash = hashTradeNotificationChunks(chunks);
+  const isA2B = isA2BTradeEvent(eventType);
+  const shouldSendA2BFinal = eventType === 'a2b_delivery_confirmed';
+  const progress = loadNotifyProgress();
 
   for (const target of enabled) {
     try {
-      if (target.channel === 'telegram') {
-        if (!target.botToken) {
-          log({ event: 'trade_notify_target_skipped', eventType, channel: 'telegram', target: target.id || target.target, reason: 'missing_bot_token' });
-          continue;
+      const existingDelivery = getTradeNotifyDelivery(progress, eventType, notificationDedupeKey, target.channel, target.target);
+      if (existingDelivery?.messageHash === messageHash) {
+        log({ event: 'trade_notify_dedup', eventType, dedupeKey: notificationDedupeKey, channel: target.channel, target: target.id || target.target, lastDeliveredAt: existingDelivery.updatedAt || existingDelivery.lastUsedAt || null });
+        continue;
+      }
+      let deliveryMeta = null;
+      if (isA2B) {
+        deliveryMeta = await deliverA2BProgressCard(target, eventType, normalizedPayload, body);
+        if (shouldSendA2BFinal) {
+          const finalMeta = await deliverTextChunksToTarget(target, chunks);
+          deliveryMeta.chunkCount += finalMeta.chunkCount;
         }
-        for (const chunk of chunks) {
-          const resp = await fetch(`https://api.telegram.org/bot${target.botToken}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: target.target, text: chunk, disable_web_page_preview: true }),
-            signal: AbortSignal.timeout(5000),
-          });
-          const data = await resp.json().catch(() => null);
-          if (!resp.ok || data?.ok === false) {
-            log({ event: 'trade_notify_delivery_error', eventType, channel: 'telegram', target: target.id || target.target, status: resp.status, error: data?.description || `http_${resp.status}` });
-            continue;
-          }
-        }
-      } else if (target.channel === 'gateway') {
-        for (const chunk of chunks) {
-          const delivery = await invokeGatewayTelegramMessage(target.target, chunk, 5000);
-          if (!delivery.ok) {
-            log({ event: 'trade_notify_delivery_error', eventType, channel: 'gateway', target: target.id || target.target, status: delivery.status || 0, error: delivery.error || delivery.reason || 'gateway_failed', gatewayUrl: delivery.url || null });
-            continue;
-          }
-        }
+      } else {
+        deliveryMeta = await deliverTextChunksToTarget(target, chunks);
       }
       target.lastUsedAt = new Date().toISOString();
       markNotifyTargetUsed(targets, target, target.lastUsedAt);
-      log({ event: 'trade_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt, chunkCount: chunks.length });
+      setTradeNotifyDelivery(progress, eventType, notificationDedupeKey, target.channel, target.target, {
+        orderId,
+        messageHash,
+        chunkCount: deliveryMeta?.chunkCount || chunks.length,
+        mode: deliveryMeta?.mode || 'send',
+        lastUsedAt: target.lastUsedAt,
+      });
+      log({ event: 'trade_notify_delivered', eventType, channel: target.channel, target: target.id || target.target, lastUsedAt: target.lastUsedAt, chunkCount: deliveryMeta?.chunkCount || chunks.length, mode: deliveryMeta?.mode || 'send' });
     } catch (e) {
       log({ event: 'trade_notify_delivery_error', eventType, channel: target.channel, target: target.id || target.target, error: e.message || 'unknown_error' });
     }
   }
   try { saveNotifyTargets(targets); } catch {}
+  try { saveNotifyProgress(progress); } catch {}
 }
 
 function appendP2PTaskStatus(entry) {
