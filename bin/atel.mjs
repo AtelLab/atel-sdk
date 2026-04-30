@@ -2557,10 +2557,15 @@ function loadTasks() { if (!existsSync(TASKS_FILE)) return {}; try { return JSON
 function saveTasks(t) { ensureDir(); writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2)); }
 function loadNetwork() { if (!existsSync(NETWORK_FILE)) return null; try { return JSON.parse(readFileSync(NETWORK_FILE, 'utf-8')); } catch { return null; } }
 function saveNetwork(n) { ensureDir(); writeFileSync(NETWORK_FILE, JSON.stringify(n, null, 2)); }
-function syncNetworkConfigToPort(networkConfig, port) {
+function syncNetworkConfigToPort(networkConfig, port, desiredRelayUrl = '') {
   if (!networkConfig || typeof networkConfig !== 'object') return { config: networkConfig, changed: false };
   let changed = false;
   const next = { ...networkConfig };
+  const normalizedRelayUrl = normalizeUrl(desiredRelayUrl || next.relayUrl || '');
+  if (normalizedRelayUrl && next.relayUrl !== normalizedRelayUrl) {
+    next.relayUrl = normalizedRelayUrl;
+    changed = true;
+  }
   if (next.port !== port) { next.port = port; changed = true; }
   const rewriteUrlPort = (value) => {
     if (typeof value !== 'string' || !value.trim()) return value;
@@ -2576,13 +2581,16 @@ function syncNetworkConfigToPort(networkConfig, port) {
     }
   };
   next.endpoint = rewriteUrlPort(next.endpoint);
+  const relayCandidateTemplate = normalizedRelayUrl ? { type: 'relay', url: normalizedRelayUrl, priority: 10 } : null;
   if (Array.isArray(next.candidates)) {
+    let relaySeen = false;
     next.candidates = next.candidates.map((candidate) => {
       if (!candidate || typeof candidate !== 'object') return candidate;
       const updated = { ...candidate };
       if (updated.type === 'relay') {
-        if (typeof next.relayUrl === 'string' && next.relayUrl.trim() && updated.url !== next.relayUrl) {
-          updated.url = next.relayUrl;
+        relaySeen = true;
+        if (normalizedRelayUrl && normalizeUrl(updated.url) !== normalizedRelayUrl) {
+          updated.url = normalizedRelayUrl;
           changed = true;
         }
         if (updated.port && updated.port !== 18204) {
@@ -2595,6 +2603,13 @@ function syncNetworkConfigToPort(networkConfig, port) {
       updated.url = rewriteUrlPort(updated.url);
       return updated;
     });
+    if (!relaySeen && relayCandidateTemplate) {
+      next.candidates = [...next.candidates, relayCandidateTemplate];
+      changed = true;
+    }
+  } else if (relayCandidateTemplate) {
+    next.candidates = [relayCandidateTemplate];
+    changed = true;
   }
   if (changed) next.configuredAt = new Date().toISOString();
   return { config: next, changed };
@@ -4385,7 +4400,7 @@ async function cmdStart(port) {
     delete networkConfig.steps;
     saveNetwork(networkConfig);
   } else {
-    const synced = syncNetworkConfigToPort(networkConfig, p);
+    const synced = syncNetworkConfigToPort(networkConfig, p, ATEL_RELAY);
     networkConfig = synced.config;
     if (synced.changed) {
       saveNetwork(networkConfig);
@@ -4589,6 +4604,8 @@ async function cmdStart(port) {
   const hookQueue = [];
   const activeRecoveryKeys = new Set();
   const recoveryKeyLogState = new Map();
+  const manualArbitrationCooldownState = new Map();
+  const MANUAL_ARBITRATION_RECONCILE_COOLDOWN_MS = Math.max(60000, Number.parseInt(process.env.ATEL_MANUAL_ARBITRATION_RECONCILE_COOLDOWN_MS || '900000', 10) || 900000);
 
   function logRecoveryKeyActive(eventType, dedupeKey, recoveryKey) {
     if (!recoveryKey) return;
@@ -4603,6 +4620,39 @@ async function cmdStart(port) {
     if (previous.suppressed > 0) payload.suppressed = previous.suppressed;
     log(payload);
     recoveryKeyLogState.set(recoveryKey, { lastLoggedAt: now, suppressed: 0 });
+  }
+
+  function shouldSkipExecutorManualArbitrationReconcile(orderId, currentMilestone, phase, submitCount) {
+    if (!orderId) return false;
+    const now = Date.now();
+    const key = `${orderId}:${currentMilestone}:${phase}`;
+    const fingerprint = `${currentMilestone}:${phase}:${submitCount}`;
+    const previous = manualArbitrationCooldownState.get(key);
+    if (previous && previous.fingerprint !== fingerprint) {
+      manualArbitrationCooldownState.delete(key);
+    }
+    const current = manualArbitrationCooldownState.get(key);
+    if (current && now < current.nextCheckAt) {
+      current.suppressed += 1;
+      manualArbitrationCooldownState.set(key, current);
+      return true;
+    }
+    const payload = {
+      event: 'trade_reconcile_executor_skip_manual_arbitration',
+      orderId,
+      currentMilestone,
+      phase,
+      submitCount,
+      cooldownMs: MANUAL_ARBITRATION_RECONCILE_COOLDOWN_MS,
+    };
+    if (current?.suppressed > 0) payload.suppressed = current.suppressed;
+    log(payload);
+    manualArbitrationCooldownState.set(key, {
+      fingerprint,
+      nextCheckAt: now + MANUAL_ARBITRATION_RECONCILE_COOLDOWN_MS,
+      suppressed: 0,
+    });
+    return true;
   }
 
   endpoint.app?.post?.('/atel/v1/agent-callback', async (req, res) => {
@@ -5508,7 +5558,7 @@ Format:
               previousApprovedOutputs,
             });
       if (isResubmission && Number(currentMilestone.submitCount || 0) >= 3) {
-        log({ event: 'trade_reconcile_executor_skip_manual_arbitration', orderId, currentMilestone: currentIndex, phase: ms.phase, submitCount: Number(currentMilestone.submitCount || 0) });
+        shouldSkipExecutorManualArbitrationReconcile(orderId, currentIndex, ms.phase, Number(currentMilestone.submitCount || 0));
         return;
       }
       const promptText = isResubmission
@@ -7268,13 +7318,30 @@ Advance the current milestone strictly based on these approved results. Do not i
             const timestamp = new Date().toISOString();
             const payload = { ids: ackedIds };
             const signature = sign({ did: id.did, timestamp, payload }, id.secretKey);
+            const signedAckBody = { did: id.did, timestamp, signature, payload };
             const ackResp = await fetch(`${relayUrl}/relay/v1/ack`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ did: id.did, timestamp, signature, payload }),
+              body: JSON.stringify(signedAckBody),
               signal: AbortSignal.timeout(10000),
             });
             if (!ackResp.ok) {
-              log({ event: 'relay_ack_http_error', ids: ackedIds, status: ackResp.status });
+              const ackBody = await ackResp.text().catch(() => '');
+              const shouldFallbackLegacyAck = ackResp.status === 400 && /did and ids required/i.test(ackBody);
+              if (shouldFallbackLegacyAck) {
+                const legacyAckResp = await fetch(`${relayUrl}/relay/v1/ack`, {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ did: id.did, ids: ackedIds }),
+                  signal: AbortSignal.timeout(10000),
+                });
+                if (!legacyAckResp.ok) {
+                  const legacyAckBody = await legacyAckResp.text().catch(() => '');
+                  log({ event: 'relay_ack_http_error', ids: ackedIds, status: legacyAckResp.status, body: legacyAckBody.substring(0, 300), mode: 'legacy_fallback' });
+                } else {
+                  log({ event: 'relay_ack_legacy_fallback_ok', ids: ackedIds });
+                }
+              } else {
+                log({ event: 'relay_ack_http_error', ids: ackedIds, status: ackResp.status, body: ackBody.substring(0, 300) });
+              }
             }
           } catch (e) {
             log({ event: 'relay_ack_error', ids: ackedIds, error: e.message });

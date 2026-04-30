@@ -58,12 +58,14 @@ export function shouldSkipAgentHook(eventType, directExecutionSucceeded) {
 }
 
 const EXECUTOR_MILESTONE_EVENTS = new Set(['milestone_plan_confirmed', 'milestone_submitted', 'milestone_verified', 'milestone_rejected']);
+const GATEWAY_SESSION_EVENTS = new Set(['p2p_task', 'milestone_submitted']);
 
 export function shouldUseGatewaySession(eventType) {
-  // Use isolated gateway sub-sessions for milestone executor turns so each
-  // order+milestone attempt runs in a clean room instead of sharing the main
-  // agent runtime context.
-  return eventType === 'p2p_task' || EXECUTOR_MILESTONE_EVENTS.has(eventType);
+  // Keep requester-side review in isolated sub-sessions, but run executor
+  // milestone drafting locally. The executor flow already has a dedicated
+  // local hook; routing it through sessions_spawn adds a flaky timeout hop
+  // that stalls order progression before the CLI fallback can recover.
+  return GATEWAY_SESSION_EVENTS.has(eventType);
 }
 
 export function normalizeGatewayBind(bind) {
