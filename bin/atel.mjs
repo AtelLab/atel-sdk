@@ -1584,6 +1584,29 @@ ${header}` : header);
       lines.push('余额查询: 跑 `atel balance`');
       break;
     }
+    case 'a2b_didi_quote_previewed':
+      addHeader('🚗 滴滴行程报价已生成');
+      appendNotificationLine(lines, '路线', notificationValue(payload?.route, body?.route));
+      appendNotificationLine(lines, '城市', notificationValue(payload?.city, body?.city));
+      appendNotificationLine(lines, '预估费用', notificationValue(payload?.estimatedFare, body?.estimatedFare) ? `$${notificationValue(payload?.estimatedFare, body?.estimatedFare)} USDC` : '');
+      appendNotificationLine(lines, '有效期', notificationValue(payload?.expiresAt, body?.expiresAt));
+      lines.push('下一步: 确认预算后再发起叫车');
+      break;
+    case 'a2b_didi_ride_confirmed':
+      addHeader('🚕 滴滴叫车已发起');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '路线', notificationValue(payload?.route, body?.route));
+      appendNotificationLine(lines, '预估费用', notificationValue(payload?.estimatedFare, body?.estimatedFare) ? `$${notificationValue(payload?.estimatedFare, body?.estimatedFare)} USDC` : '');
+      appendNotificationLine(lines, '状态', notificationValue(payload?.status, body?.status, 'ride_requested'));
+      lines.push('隐私: 精确地址、手机号、司机信息默认脱敏，不会直接发到群聊。');
+      break;
+    case 'a2b_didi_cancelled':
+      addHeader('🚕 滴滴行程已取消');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '原因', notificationValue(payload?.reason, body?.reason, '未说明'));
+      break;
     default:
       addHeader('🔔 平台事件更新');
       appendNotificationLine(lines, '事件', eventType);
@@ -1608,6 +1631,9 @@ function isA2BTradeEvent(eventType) {
     'a2b_payment_executed',
     'a2b_delivery_pending',
     'a2b_delivery_confirmed',
+    'a2b_didi_quote_previewed',
+    'a2b_didi_ride_confirmed',
+    'a2b_didi_cancelled',
   ].includes(String(eventType || '').trim());
 }
 
@@ -11335,6 +11361,7 @@ const commands = {
   'completion-proof': () => cmdCompletionProof(args[0]),
   'verify-tx': () => cmdVerifyTx(args[0]),
   // AVIP-A2B Bitrefill board (atomic ops)
+  a2b: () => cmdA2B(args[0], args.slice(1)),
   bitrefill: () => cmdBitrefill(args[0], rawArgs),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
@@ -11960,6 +11987,90 @@ async function cmdBitrefill(sub, subArgs) {
       }
       default:
         console.error('Usage: atel bitrefill <intent|search|deposit|create-invoice|pay|redemption|status|verify-intent|audit|proof> ...');
+        process.exit(1);
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ ok: false, error: e.message, code: e.code, data: e.data }));
+    process.exit(2);
+  }
+}
+
+// ─── Generic A2B providers ─────────────────────────────────────────────
+// Current first provider: DiDi ride-hailing mock/provider bridge.
+async function cmdA2B(provider, subArgs = []) {
+  if (provider !== 'didi') {
+    console.error('Usage: atel a2b didi <quote|confirm|status|cancel> ...');
+    process.exit(1);
+  }
+  return cmdA2BDiDi(subArgs[0], subArgs);
+}
+
+async function cmdA2BDiDi(sub, subArgs = []) {
+  const flag = (name, def) => {
+    const i = subArgs.indexOf('--' + name);
+    if (i < 0) return def;
+    return subArgs[i + 1];
+  };
+  const num = (name, def) => {
+    const v = flag(name, def);
+    return v === undefined ? undefined : Number(v);
+  };
+  const positional = subArgs.filter((a, i) => i > 0 && !a.startsWith('--') && !String(subArgs[i - 1] || '').startsWith('--'));
+  const id = requireIdentity();
+  const { didi } = await import('@atel-ai/atel-sdk');
+  try {
+    switch (sub) {
+      case 'quote': {
+        const from = flag('from');
+        const to = flag('to');
+        if (!from || !to) {
+          console.error('Usage: atel a2b didi quote --from "<pickup>" --to "<dropoff>" [--city Beijing] [--ride-type express] [--max-usdc 20]');
+          process.exit(1);
+        }
+        const res = await didi.quote(id, {
+          from,
+          to,
+          city: flag('city'),
+          rideType: flag('ride-type', flag('vehicle', 'express')),
+          maxUsdc: num('max-usdc'),
+        });
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'confirm': {
+        const quoteId = flag('quote') || positional[0];
+        const maxUsdc = num('max-usdc', num('max'));
+        if (!quoteId || !maxUsdc || Number.isNaN(maxUsdc)) {
+          console.error('Usage: atel a2b didi confirm --quote <quoteId> --max-usdc <n>');
+          process.exit(1);
+        }
+        const userSA = process.env.ATEL_USER_SMART_ACCOUNT || (id?.wallets && id.wallets.base) || undefined;
+        const res = await didi.confirm(id, { quoteId, maxUsdc, userSA });
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'status': {
+        const intentId = flag('intent') || positional[0];
+        if (!intentId) {
+          console.error('Usage: atel a2b didi status --intent <intentId>');
+          process.exit(1);
+        }
+        const res = await didi.status(id, intentId);
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      case 'cancel': {
+        const intentId = flag('intent') || positional[0];
+        if (!intentId) {
+          console.error('Usage: atel a2b didi cancel --intent <intentId> [--reason "..."]');
+          process.exit(1);
+        }
+        const res = await didi.cancel(id, intentId, flag('reason', 'cancelled by user'));
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      default:
+        console.error('Usage: atel a2b didi <quote|confirm|status|cancel> ...');
         process.exit(1);
     }
   } catch (e) {

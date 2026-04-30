@@ -40,4 +40,4 @@ export * from './intent/index.js';
 
 // ── A2B Boards ───────────────────────────────────────────────
 export * as bitrefill from './bitrefill/index.js';
-
+export * as didi from './a2b/didi/index.js';
