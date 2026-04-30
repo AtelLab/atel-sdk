@@ -53,6 +53,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, copyFileSync, statSync, readdirSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 import { cmdHub, cmdSwap, cmdTransfer } from './hub-helpers.mjs';
 import { resolve, join, dirname } from 'node:path';
 import crypto from 'node:crypto';
@@ -97,6 +98,19 @@ const ATEL_RELAY = process.env.ATEL_RELAY || DEFAULT_PLATFORM_BASE;
 
 function normalizeUrl(value = '') {
   return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function checkTcpPortAvailable(port, host = '0.0.0.0') {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once('error', (err) => {
+      resolve({ ok: false, port, host, error: err?.code || err?.message || 'listen_failed' });
+    });
+    server.once('listening', () => {
+      server.close(() => resolve({ ok: true, port, host }));
+    });
+    server.listen(port, host);
+  });
 }
 
 function getEnvironmentProfile(url = '') {
@@ -4297,10 +4311,11 @@ async function startToolGatewayProxy(port, identity, policy) {
     res.json({ trace: ctx.trace.export() });
   });
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const server = app.listen(port, '127.0.0.1', () => {
       resolve({ server, port, taskGateways });
     });
+    server.once('error', reject);
   });
 }
 
@@ -4375,6 +4390,20 @@ async function cmdStart(port) {
   }
 
   const p = parseInt(port || '3100');
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) {
+    console.error(`Invalid port: ${port || '3100'}`);
+    process.exit(1);
+  }
+  const endpointPort = await checkTcpPortAvailable(p, '0.0.0.0');
+  if (!endpointPort.ok) {
+    console.error(`Port ${p} is already in use or unavailable (${endpointPort.error}). Choose a free port before registering this agent.`);
+    process.exit(1);
+  }
+  const toolGatewayPort = await checkTcpPortAvailable(p + 1, '127.0.0.1');
+  if (!toolGatewayPort.ok) {
+    console.error(`Tool gateway port ${p + 1} is already in use or unavailable (${toolGatewayPort.error}). Choose a free start port whose +1 port is also free.`);
+    process.exit(1);
+  }
   const startLock = acquireStartInstanceLock(p);
   if (!startLock.ok) {
     console.error(`Another atel start instance is already running for this ATEL_DIR on port ${p} (pid: ${startLock.existing?.pid || 'unknown'}).`);
