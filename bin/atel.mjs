@@ -1568,6 +1568,22 @@ ${header}` : header);
       appendNotificationSection(lines, '使用说明', deliveryInstructions);
       appendNotificationSection(lines, '补充信息', deliveryOther);
       break;
+    case 'transfer_received': {
+      addHeader('💰 收到转账');
+      const fromName = payload?.from_name || payload?.fromName || (payload?.from_did ? String(payload.from_did).slice(0, 25) : '');
+      const amt = payload?.amount ?? body?.amount ?? '';
+      const currency = payload?.currency || body?.currency || 'USDC';
+      const chainTag = payload?.chain ? ` (${String(payload.chain).toUpperCase()})` : '';
+      appendNotificationLine(lines, '来自', fromName);
+      appendNotificationLine(lines, '金额', amt !== '' ? `${amt} ${currency}${chainTag}` : '');
+      const memo = payload?.memo || body?.memo;
+      if (memo) appendNotificationLine(lines, '备注', String(memo).slice(0, 200));
+      const tx = payload?.tx_hash || payload?.txHash || body?.tx_hash;
+      if (tx) appendNotificationLine(lines, 'TX', String(tx));
+      lines.push('');
+      lines.push('余额查询: 跑 `atel balance`');
+      break;
+    }
     default:
       addHeader('🔔 平台事件更新');
       appendNotificationLine(lines, '事件', eventType);
@@ -11119,6 +11135,157 @@ async function submitFastDeliverable(orderId, identity) {
   }
 }
 
+// ── Fast: direct USDC P2P transfer ──────────────────────────────────
+// SDK agents (lobster, OpenClaw, etc.) sign + submit Fast token transfers
+// locally — they hold their own ed25519 key, platform can't sign for them
+// (only TG users have their seed in tg_users.encrypted_seed).
+//
+// Mirrors submitFastDeliverable's BCS-by-hand pattern, but builds a
+// TokenTransfer claim (Operation variant 0) instead of Escrow::Submit (12).
+//
+// Schema (from @fastxyz/fast-schema composite/operations.ts):
+//   Operation::TokenTransfer = ULEB128(0)
+//   Payload = token_id [u8;32] || recipient [u8;32] || amount u256 (32 LE)
+//          || user_data Option<[u8;32]>  (None = 0x00)
+//
+// recipientHex must be 64-char hex (ed25519 pubkey).
+// amount is in user-friendly USDC float (e.g. 0.01) — 6 decimals on mainnet.
+async function submitFastTransfer(identity, recipientHex, amount) {
+  const FAST_RPC = process.env.ATEL_FASTCOOP_RPC_URL || 'https://api.fast.xyz/proxy-rest';
+  const NETWORK = process.env.ATEL_FASTCOOP_NETWORK_ID || 'fast:mainnet';
+  const TOKEN_HEX = process.env.ATEL_FASTCOOP_TOKEN_ID
+    || 'c655a12330da6af361d281b197996d2bc135aaed3b66278e729c2222291e9130';
+
+  recipientHex = String(recipientHex).toLowerCase().replace(/^0x/, '');
+  if (recipientHex.length !== 64) throw new Error(`recipient must be 64-char hex pubkey, got ${recipientHex.length}`);
+  const rawAmount = BigInt(Math.round(amount * 1e6));
+  if (rawAmount <= 0n) throw new Error(`amount must be > 0, got ${amount}`);
+
+  const senderBytes = Buffer.from(identity.publicKey);
+  const senderHex = senderBytes.toString('hex');
+
+  const accountResp = await fetch(`${FAST_RPC}/v1/accounts/${senderHex}`, { signal: AbortSignal.timeout(10000) });
+  if (!accountResp.ok) throw new Error(`Fast account query failed: HTTP ${accountResp.status}`);
+  const nonce = (await accountResp.json()).data.next_nonce;
+
+  // ULEB128 + LE encoders (same as submitFastDeliverable).
+  const uleb128 = (v) => {
+    const buf = [];
+    do { let b = Number(v & 0x7fn); v >>= 7n; if (v > 0n) b |= 0x80; buf.push(b); } while (v > 0n);
+    return Buffer.from(buf.length ? buf : [0]);
+  };
+  const u64le = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+  const u128le = (v) => { const b = Buffer.alloc(16); b.writeBigUInt64LE(v & 0xffffffffffffffffn); b.writeBigUInt64LE(v >> 64n, 8); return b; };
+  const u256le = (v) => { const b = Buffer.alloc(32); for (let i = 0; i < 32; i++) { b[i] = Number((v >> BigInt(8*i)) & 0xffn); } return b; };
+  const bcsString = (s) => { const b = Buffer.from(s, 'utf-8'); return Buffer.concat([uleb128(BigInt(b.length)), b]); };
+
+  const tokenBytes = Buffer.from(TOKEN_HEX, 'hex');
+  const recipBytes = Buffer.from(recipientHex, 'hex');
+  if (tokenBytes.length !== 32 || recipBytes.length !== 32) throw new Error('token_id/recipient must be 32 bytes');
+
+  // Operation::TokenTransfer (variant 0) payload.
+  const claimBytes = Buffer.concat([
+    uleb128(0n),                  // Operation::TokenTransfer
+    tokenBytes.subarray(0, 32),   // token_id
+    recipBytes.subarray(0, 32),   // recipient
+    u256le(rawAmount),            // amount u256 LE
+    Buffer.from([0x00]),          // user_data = None
+  ]);
+
+  const tsNanos = BigInt(Date.now()) * 1000000n;
+  const txBody = Buffer.concat([
+    bcsString(NETWORK),
+    senderBytes.subarray(0, 32),
+    u64le(nonce),
+    u128le(tsNanos),
+    uleb128(1n),                  // claims vec len = 1
+    claimBytes,
+    Buffer.from([0x00]),          // archival = false
+    Buffer.from([0x00]),          // fee_token = None
+  ]);
+  // VersionedTransaction::Release20260407 (variant 1)
+  const versionedTx = Buffer.concat([uleb128(1n), txBody]);
+
+  const { default: nacl } = await import('tweetnacl');
+  const sigMessage = Buffer.concat([Buffer.from('VersionedTransaction::'), versionedTx]);
+  const signature = nacl.sign.detached(sigMessage, identity.secretKey);
+  const bcsSig = Buffer.concat([Buffer.from([0x00]), Buffer.from(signature)]); // SignatureOrMultiSig::Signature
+
+  const submitResp = await fetch(`${FAST_RPC}/v1/submit-transaction`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transaction: versionedTx.toString('hex'), signature: bcsSig.toString('hex') }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const submitResult = await submitResp.json();
+  if (submitResult.error) {
+    throw new Error(`Fast submit failed: ${submitResult.error.message || JSON.stringify(submitResult.error)}`);
+  }
+
+  // Compute deterministic txID = keccak256(sender||nonce_le||opIndex_le).
+  const { createHash } = await import('node:crypto');
+  const idBuf = Buffer.concat([senderBytes.subarray(0, 32), u64le(nonce), u64le(0n)]);
+  const txID = createHash('sha3-256').update(idBuf).digest('hex');
+
+  // Notify platform for audit + recipient relay event. Best-effort; on-chain
+  // tx already submitted, audit failure is non-fatal. Hand-builds DIDAuth
+  // envelope to match platform's auth.SerializePayload (sorted-key JSON).
+  try {
+    const payload = { recipientHex, amount, txId: txID };
+    const ts = new Date().toISOString();
+    const did = identity.did;
+    const sortKeys = (o) => Array.isArray(o) ? o.map(sortKeys) : (o && typeof o === 'object' && o !== null ? Object.fromEntries(Object.keys(o).sort().map(k => [k, sortKeys(o[k])])) : o);
+    const signable = JSON.stringify(sortKeys({ payload, did, timestamp: ts }));
+    const sig = nacl.sign.detached(Buffer.from(signable, 'utf-8'), identity.secretKey);
+    const notifyResp = await fetch(`${PLATFORM_URL}/trade/v1/wallet/fast-notify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload, did, timestamp: ts, signature: Buffer.from(sig).toString('base64') }),
+    });
+    if (!notifyResp.ok) {
+      log({ event: 'fast_notify_http_error', txID, status: notifyResp.status, body: (await notifyResp.text()).slice(0, 200) });
+    }
+  } catch (e) {
+    log({ event: 'fast_notify_error', txID, error: e.message });
+  }
+
+  return { txID, nonce, amount, recipientHex };
+}
+
+async function cmdFastTransfer(recipient, amountStr) {
+  if (!recipient || !amountStr) {
+    console.error('Usage: atel fast-transfer <recipient-hex-or-DID-or-fast1> <amount>');
+    process.exit(1);
+  }
+  const identity = requireIdentity();
+  const amount = parseFloat(amountStr);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    console.error(`Invalid amount: ${amountStr}`);
+    process.exit(1);
+  }
+  // Resolve recipient → 64-char hex pubkey.
+  let recipHex = recipient.trim();
+  if (recipHex.startsWith('did:atel:ed25519:')) {
+    const bs58 = (await import('bs58')).default;
+    const pub = bs58.decode(recipHex.slice('did:atel:ed25519:'.length));
+    if (pub.length !== 32) throw new Error(`bad DID pubkey length: ${pub.length}`);
+    recipHex = Buffer.from(pub).toString('hex');
+  } else if (recipHex.startsWith('fast1')) {
+    console.error('bech32m fast1... addresses not yet supported in CLI; pass DID or hex pubkey');
+    process.exit(1);
+  } else {
+    recipHex = recipHex.toLowerCase().replace(/^0x/, '');
+  }
+  if (recipHex.length !== 64) {
+    console.error(`Recipient must resolve to 64-char hex pubkey, got ${recipHex.length} chars`);
+    process.exit(1);
+  }
+  console.log(`⚡ Fast transfer ${amount} USDC → ${recipHex.slice(0, 16)}...`);
+  const r = await submitFastTransfer(identity, recipHex, amount);
+  console.log(`✅ Submitted. txID=${r.txID}  nonce=${r.nonce}`);
+  console.log(`Explorer: https://explorer.fast.xyz/txs/0x${r.txID}`);
+}
+
 const [,, cmd, ...rawArgs] = process.argv;
 const args = rawArgs.filter(a => !a.startsWith('--'));
 const commands = {
@@ -11143,6 +11310,7 @@ const commands = {
   deposit: () => cmdDeposit(args[0], args[1]),
   withdraw: () => cmdWithdraw(args[0], args[1], args[2]),
   transactions: () => cmdTransactions(),
+  'fast-transfer': () => cmdFastTransfer(args[0], args[1]),
   // Trade
   'trade-task': () => cmdTradeTask(args[0], args.slice(1).join(' ')),
   order: () => cmdOrder(args[0], args[1], args[2]),
