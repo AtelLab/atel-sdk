@@ -8502,11 +8502,21 @@ async function cmdBalance() {
     }
   }
 
-  // Platform ledger balance
+  // Platform ledger balance + Fast Network balance (read from platform — no
+  // direct Fast RPC client in SDK, platform already exposes chainBalances.fast +
+  // chainAddresses.fast in /account/v1/balance).
   try {
     const balResp = await fetch(`${PLATFORM_URL}/account/v1/balance?did=${encodeURIComponent(id.did)}`, { signal: AbortSignal.timeout(5000) });
     if (balResp.ok) {
       const bal = await balResp.json();
+      const cb = bal.chainBalances || bal.chain_balances || {};
+      const ca = bal.chainAddresses || bal.chain_addresses || {};
+      const fastBal = cb.fast;
+      const fastAddr = ca.fast || wallets.fast;
+      if (fastBal !== undefined && fastBal !== null) {
+        console.log(`  FAST: ${parseFloat(fastBal)} USDC`);
+        if (fastAddr) console.log(`    Wallet: ${fastAddr}`);
+      }
       const available = parseFloat(bal.available ?? bal.balance ?? 0).toFixed(2);
       const frozen = parseFloat(bal.frozen ?? 0).toFixed(2);
       const total = (parseFloat(available) + parseFloat(frozen)).toFixed(2);
