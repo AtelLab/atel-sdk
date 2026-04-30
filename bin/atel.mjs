@@ -1656,7 +1656,76 @@ function getA2BProgressMeta(eventType) {
   }
 }
 
+function getDiDiProgressMeta(eventType) {
+  switch (eventType) {
+    case 'a2b_didi_quote_previewed':
+      return { done: 1, active: 2, status: '已生成行程报价，等待确认叫车' };
+    case 'a2b_didi_ride_confirmed':
+      return { done: 2, active: 3, status: '已发起叫车，等待司机接单/到达' };
+    case 'a2b_didi_cancelled':
+      return { done: 0, active: 0, status: '行程已取消' };
+    default:
+      return { done: 0, active: 1, status: '行程处理中' };
+  }
+}
+
+function isDiDiA2BEvent(eventType) {
+  return String(eventType || '').startsWith('a2b_didi_');
+}
+
+function getA2BProgressKey(eventType, payload = {}, body = {}) {
+  if (isDiDiA2BEvent(eventType)) {
+    return notificationValue(payload?.intentId, body?.intentId, payload?.orderId, body?.orderId, payload?.quoteId, body?.quoteId, eventType);
+  }
+  return notificationValue(payload?.orderId, body?.orderId, payload?.intentId, body?.intentId, eventType);
+}
+
+function buildDiDiProgressCard(eventType, payload = {}, body = {}) {
+  const sourceLabel = notificationValue(payload?.sourceLabel, body?.sourceLabel, 'ATEL A2B');
+  const orderId = notificationValue(payload?.orderId, body?.orderId);
+  const intentId = notificationValue(payload?.intentId, body?.intentId);
+  const quoteId = notificationValue(payload?.quoteId, body?.quoteId);
+  const route = notificationValue(payload?.route, body?.route);
+  const city = notificationValue(payload?.city, body?.city);
+  const fare = notificationValue(payload?.estimatedFare, body?.estimatedFare, payload?.fare, body?.fare);
+  const expiresAt = notificationValue(payload?.expiresAt, body?.expiresAt);
+  const reason = notificationValue(payload?.reason, body?.reason);
+  const meta = getDiDiProgressMeta(eventType);
+  const steps = [
+    '已生成报价',
+    '已确认叫车',
+    '等待司机/行程状态',
+    '完成或取消',
+  ];
+  const lines = [];
+  lines.push(sourceLabel ? `[${sourceLabel}]` : '[ATEL A2B]');
+  lines.push('🚕 滴滴行程进度');
+  appendNotificationLine(lines, '订单', orderId);
+  appendNotificationLine(lines, '意图', intentId);
+  appendNotificationLine(lines, '报价', quoteId);
+  appendNotificationLine(lines, '路线', route);
+  appendNotificationLine(lines, '城市', city);
+  appendNotificationLine(lines, '预估费用', fare ? `$${fare} USDC` : '');
+  appendNotificationLine(lines, '有效期', expiresAt);
+  appendNotificationLine(lines, '取消原因', reason);
+  appendNotificationLine(lines, '当前状态', meta.status);
+  lines.push('');
+  lines.push('进度:');
+  for (let i = 0; i < steps.length; i += 1) {
+    const stepNo = i + 1;
+    let prefix = '⬜';
+    if (eventType === 'a2b_didi_cancelled' && stepNo === 4) prefix = '✅';
+    else if (stepNo <= meta.done) prefix = '✅';
+    else if (stepNo === meta.active) prefix = '🔄';
+    lines.push(`${prefix} ${stepNo}. ${steps[i]}`);
+  }
+  lines.push('');
+  lines.push('隐私: 精确地址、手机号、司机信息默认脱敏。');
+  return lines.join('\n').trim();
+}
+
 function buildA2BProgressCard(eventType, payload = {}, body = {}) {
+  if (isDiDiA2BEvent(eventType)) return buildDiDiProgressCard(eventType, payload, body);
   const sourceLabel = notificationValue(payload?.sourceLabel, body?.sourceLabel, 'ATEL A2B');
   const orderId = notificationValue(payload?.orderId, body?.orderId, payload?.order_id, body?.order_id, '?');
   const intentId = notificationValue(payload?.intentId, body?.intentId);
@@ -1748,7 +1817,7 @@ async function deliverTextChunksToTarget(target, chunks) {
 }
 
 async function deliverA2BProgressCard(target, eventType, payload, body) {
-  const orderId = payload?.orderId || body?.orderId || '';
+  const orderId = getA2BProgressKey(eventType, payload, body);
   const progressText = buildA2BProgressCard(eventType, payload, body);
   if (target.channel !== 'telegram') {
     return deliverTextChunksToTarget(target, [progressText]);
@@ -1773,7 +1842,7 @@ async function deliverA2BProgressCard(target, eventType, payload, body) {
   setA2BProgressBinding(progress, orderId, target.channel, target.target, {
     messageId,
     eventType,
-    status: getA2BProgressMeta(eventType).status,
+    status: (isDiDiA2BEvent(eventType) ? getDiDiProgressMeta(eventType) : getA2BProgressMeta(eventType)).status,
   });
   saveNotifyProgress(progress);
   return { chunkCount: 1, mode, messageId };
@@ -11361,7 +11430,7 @@ const commands = {
   'completion-proof': () => cmdCompletionProof(args[0]),
   'verify-tx': () => cmdVerifyTx(args[0]),
   // AVIP-A2B Bitrefill board (atomic ops)
-  a2b: () => cmdA2B(args[0], args.slice(1)),
+  a2b: () => cmdA2B(rawArgs[0], rawArgs.slice(1)),
   bitrefill: () => cmdBitrefill(args[0], rawArgs),
   // Dispute
   dispute: () => cmdDispute(args[0], args[1], args[2]),
