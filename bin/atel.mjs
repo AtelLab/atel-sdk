@@ -1339,7 +1339,8 @@ ${header}` : header);
       if (priceAmount !== undefined && priceAmount !== null && String(priceAmount) !== '') {
         appendNotificationLine(lines, '金额', `$${priceAmount} USDC`);
       }
-      appendNotificationLine(lines, '链', chain || 'base');
+      // chain 不写 fallback — 上游漏传时不显示，避免对 fast/bsc 订单显示成 base 误导
+      appendNotificationLine(lines, '链', chain);
       appendNotificationLine(lines, '来自', requesterDid);
       appendNotificationSection(lines, '订单要求', shortOrderDescription);
       lines.push('下一步: 审核后决定是否接单');
