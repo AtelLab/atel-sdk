@@ -1616,6 +1616,15 @@ ${header}` : header);
       appendNotificationLine(lines, '状态', notificationValue(payload?.status, body?.status, 'ride_requested'));
       lines.push('隐私: 精确地址、手机号、司机信息默认脱敏，不会直接发到群聊。');
       break;
+    case 'a2b_didi_status_updated':
+      addHeader('🚕 滴滴行程状态更新');
+      appendNotificationLine(lines, '订单', orderId);
+      appendNotificationLine(lines, '意图', intentId);
+      appendNotificationLine(lines, '路线', notificationValue(payload?.route, body?.route));
+      appendNotificationLine(lines, '状态', notificationValue(payload?.status, body?.status, 'ride_requested'));
+      appendNotificationLine(lines, '模式', notificationValue(payload?.mode, body?.mode));
+      lines.push('审计: 状态查询已写入 A2B Gateway trace 和 provider timeline。');
+      break;
     case 'a2b_didi_cancelled':
       addHeader('🚕 滴滴行程已取消');
       appendNotificationLine(lines, '订单', orderId);
@@ -1648,6 +1657,7 @@ function isA2BTradeEvent(eventType) {
     'a2b_delivery_confirmed',
     'a2b_didi_quote_previewed',
     'a2b_didi_ride_confirmed',
+    'a2b_didi_status_updated',
     'a2b_didi_cancelled',
   ].includes(String(eventType || '').trim());
 }
@@ -1677,6 +1687,8 @@ function getDiDiProgressMeta(eventType) {
       return { done: 1, active: 2, status: '已生成行程报价，等待确认叫车' };
     case 'a2b_didi_ride_confirmed':
       return { done: 2, active: 3, status: '已发起叫车，等待司机接单/到达' };
+    case 'a2b_didi_status_updated':
+      return { done: 3, active: 4, status: '行程状态已同步，等待完成或取消' };
     case 'a2b_didi_cancelled':
       return { done: 0, active: 0, status: '行程已取消' };
     default:
@@ -1705,6 +1717,8 @@ function buildDiDiProgressCard(eventType, payload = {}, body = {}) {
   const fare = notificationValue(payload?.estimatedFare, body?.estimatedFare, payload?.fare, body?.fare);
   const expiresAt = notificationValue(payload?.expiresAt, body?.expiresAt);
   const reason = notificationValue(payload?.reason, body?.reason);
+  const status = notificationValue(payload?.status, body?.status);
+  const mode = notificationValue(payload?.mode, body?.mode);
   const meta = getDiDiProgressMeta(eventType);
   const steps = [
     '已生成报价',
@@ -1722,6 +1736,8 @@ function buildDiDiProgressCard(eventType, payload = {}, body = {}) {
   appendNotificationLine(lines, '城市', city);
   appendNotificationLine(lines, '预估费用', fare ? `$${fare} USDC` : '');
   appendNotificationLine(lines, '有效期', expiresAt);
+  appendNotificationLine(lines, '行程状态', status);
+  appendNotificationLine(lines, '模式', mode);
   appendNotificationLine(lines, '取消原因', reason);
   appendNotificationLine(lines, '当前状态', meta.status);
   lines.push('');
