@@ -40,7 +40,6 @@ export * from './intent/index.js';
 
 // ── A2B Boards ───────────────────────────────────────────────
 export * as bitrefill from './bitrefill/index.js';
-export * as didi from './a2b/didi/index.js';
 
 // ── MCP (Model Context Protocol) connection helper ───────────
 // Headless agents that need to connect to atel-mcp without OAuth.
