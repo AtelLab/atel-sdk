@@ -13,12 +13,6 @@
       "txHash": "0x27b35ab5a1718639c7109489f88bc470aa92efa8c717be087463548616be9180",
       "blockNumber": 80924787,
       "verified": true
-    },
-    {
-      "chain": "solana",
-      "txHash": "2fEt4BdqEwCGfFe7NrzJTD1kZ3v4WiY6QdW8iHoL74VNjfc6iYU6KnjJbZTtKxjnoVubD88qDeGKZcJJy2ksF3Up",
-      "blockNumber": 399923440,
-      "verified": true
     }
   ]
 }

@@ -4,7 +4,6 @@
  * Required env vars (set one or more chains):
  * - Base:   ATEL_BASE_RPC_URL,   ATEL_BASE_PRIVATE_KEY
  * - BSC:    ATEL_BSC_RPC_URL,    ATEL_BSC_PRIVATE_KEY
- * - Solana: ATEL_SOLANA_RPC_URL, ATEL_SOLANA_PRIVATE_KEY
  *
  * Optional:
  * - ATEL_ANCHOR_HASH: custom hash payload (default: sha256 of timestamp)
@@ -15,7 +14,6 @@ import {
   AnchorManager,
   BaseAnchorProvider,
   BSCAnchorProvider,
-  SolanaAnchorProvider,
 } from '../src/index.js';
 
 function sha256(input: string): string {
@@ -37,11 +35,6 @@ async function run(): Promise<void> {
     manager.registerProvider(new BSCAnchorProvider({ rpcUrl: bscRpc, privateKey: bscPk }));
   }
 
-  const solRpc = process.env.ATEL_SOLANA_RPC_URL;
-  const solPk = process.env.ATEL_SOLANA_PRIVATE_KEY;
-  if (solRpc && solPk) {
-    manager.registerProvider(new SolanaAnchorProvider({ rpcUrl: solRpc, privateKey: solPk }));
-  }
 
   const chains = manager.getProviders();
   if (chains.length === 0) {

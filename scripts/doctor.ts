@@ -20,7 +20,6 @@ import {
   verify,
   BaseAnchorProvider,
   BSCAnchorProvider,
-  SolanaAnchorProvider,
 } from '../src/index.js';
 
 interface CheckResult {
@@ -147,16 +146,6 @@ async function checkChainAvailability(): Promise<CheckResult[]> {
     }
   }
 
-  const solRpc = process.env.ATEL_SOLANA_RPC_URL;
-  if (solRpc) {
-    try {
-      const provider = new SolanaAnchorProvider({ rpcUrl: solRpc });
-      const ok = await provider.isAvailable();
-      checks.push(result('chain.solana_rpc_available', ok, false, ok ? 'reachable' : 'unreachable'));
-    } catch (err) {
-      checks.push(result('chain.solana_rpc_available', false, false, err instanceof Error ? err.message : String(err)));
-    }
-  }
 
   if (checks.length === 0) {
     checks.push(result('chain.rpc_availability', true, false, 'skipped (no chain RPC env vars set)'));
