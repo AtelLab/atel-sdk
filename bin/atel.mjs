@@ -1587,8 +1587,12 @@ ${header}` : header);
       addHeader('💰 收到转账');
       const fromName = payload?.from_name || payload?.fromName || (payload?.from_did ? String(payload.from_did).slice(0, 25) : '');
       const amt = payload?.amount ?? body?.amount ?? '';
-      const currency = payload?.currency || body?.currency || 'USDC';
-      const chainTag = payload?.chain ? ` (${String(payload.chain).toUpperCase()})` : '';
+      const rawCurrency = payload?.currency || body?.currency || payload?.asset || body?.asset || '';
+      const currency = rawCurrency ? String(rawCurrency).toUpperCase() : ((payload?.transfer_id || body?.transfer_id) ? 'ATEL' : 'USDC');
+      const rawChain = String(payload?.chain || body?.chain || '').trim().toLowerCase();
+      const chainTag = currency === 'ATEL'
+        ? ' (平台内部代币)'
+        : (rawChain && rawChain !== 'unknown' ? ` (${rawChain.toUpperCase()})` : '');
       appendNotificationLine(lines, '来自', fromName);
       appendNotificationLine(lines, '金额', amt !== '' ? `${amt} ${currency}${chainTag}` : '');
       const memo = payload?.memo || body?.memo;
