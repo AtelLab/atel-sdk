@@ -1,6 +1,6 @@
 # Claude / AI Working Rules — atel-sdk
 
-**Read this first**: https://github.com/duolaAmengweb3/atel-team-workspace/blob/main/TEAM-PLAYBOOK.md
+**Read this first**: https://github.com/AtelLab/atel-team-workspace/blob/main/TEAM-PLAYBOOK.md
 
 ## This repo
 
