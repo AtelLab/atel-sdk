@@ -1,0 +1,29 @@
+# Cursor rules for atel-sdk
+# Single source of truth: https://github.com/AtelLab/atel-team-workspace/blob/main/TEAM-PLAYBOOK.md
+
+## Project facts — DUAL IDENTITY
+This repo is BOTH:
+1. **npm package `@atel-ai/atel-sdk`** — imported by atel-mcp + atel-portal
+2. **prod daemon `atel-agent.service` :3100** — runs on prod box (`atel start <port>`)
+
+Most people only know about (1). Treat (2) as load-bearing.
+
+## Hard rules
+- ANY change: `npm publish @atel-ai/atel-sdk` after; check both atel-mcp + atel-portal don't break.
+- Backward compatibility is non-negotiable for the npm side. Breaking changes need a major bump + coordinated PRs to all consumers.
+- `src/service/server.ts` is the daemon entry — change with care
+- `src/gateway/` is the P2P relay link layer — production traffic flows through here
+- `src/index.ts` + `bin/atel.mjs` are public entry points — additive only
+
+## Don't touch
+- `dist/`, `node_modules/`
+- `src/service/server.ts`, `src/gateway/*`, `src/index.ts` API surface — without confirming consumer impact
+
+## Test
+- `npm run build` to catch type errors
+- `npm test` if tests present
+- Manual: run `atel start 3100` locally, hit endpoints
+
+## Recently changed
+- DiDi A2B integration removed 2026-05-08 (commit `e09310b`) — may have dead paths
+- MCP connector `src/mcp/index.js` added 2026-05-06 — edge cases still being discovered
