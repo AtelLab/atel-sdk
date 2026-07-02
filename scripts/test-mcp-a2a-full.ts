@@ -96,16 +96,17 @@ async function main() {
   console.log('\n=== Step 2: Balance sanity ===');
   const bal = await callTool(r1, 'atel_balance', {}) as { balance: number; chainBalances: Record<string, number> };
   console.log(`  lobster1 total: ${bal.balance} USDC, base=${bal.chainBalances.base}`);
-  if (bal.chainBalances.base < 0.012) {
-    throw new Error(`lobster1 base balance ${bal.chainBalances.base} insufficient for 0.01 USDC order + buffer`);
+  const PRICE = Number(process.env.E2E_PRICE_USDC ?? 0.001);
+  if (bal.chainBalances.base < PRICE * 1.2) {
+    throw new Error(`lobster1 base balance ${bal.chainBalances.base} insufficient for ${PRICE} USDC order + buffer`);
   }
 
-  console.log('\n=== Step 3: lobster1 creates order ===');
+  console.log(`\n=== Step 3: lobster1 creates order (price ${PRICE} USDC) ===`);
   const order = await callTool(r1, 'atel_order_create', {
     executorDid: LOBSTER2.did,
     capabilityType: 'coding',
     description: 'G1 e2e test: write a small bash one-liner that prints all USB devices on Linux',
-    priceUsdc: 0.01,
+    priceUsdc: PRICE,
   }) as { orderId: string; status: string };
   console.log(`  order: ${order.orderId} status=${order.status}`);
   const orderId = order.orderId;
